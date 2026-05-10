@@ -90,6 +90,59 @@ SLOTS_PAYOUTS = {
     "🍒": 2,
 }
 
+MISSIONS = {
+    "play_roulette": {
+        "name": "🎰 Rulero del Casino",
+        "description": "Juega a la ruleta 3 veces",
+        "goal": 3,
+        "reward": 300,
+        "action": "roulette_played",
+    },
+    "play_slots": {
+        "name": "🎰 Fanático de Slots",
+        "description": "Juega a las tragamonedas 5 veces",
+        "goal": 5,
+        "reward": 500,
+        "action": "slots_played",
+    },
+    "win_blackjack": {
+        "name": "🃏 As del Blackjack",
+        "description": "Gana 2 partidas de blackjack",
+        "goal": 2,
+        "reward": 600,
+        "action": "blackjack_won",
+    },
+    "play_crash": {
+        "name": "📈 Amante del Riesgo",
+        "description": "Juega al Crash 2 veces",
+        "goal": 2,
+        "reward": 400,
+        "action": "crash_played",
+    },
+    "rob_success": {
+        "name": "🦹 Ladrón del Casino",
+        "description": "Roba exitosamente a alguien",
+        "goal": 1,
+        "reward": 350,
+        "action": "rob_success",
+    },
+    "play_daily": {
+        "name": "📅 Constancia",
+        "description": "Usa /daily hoy",
+        "goal": 1,
+        "reward": 100,
+        "action": "daily_used",
+    },
+}
+
+USE_FLAVOR = {
+    "vip_card": "✨ Muestras tu **Tarjeta VIP** en la entrada. El portero te hace una reverencia.",
+    "lucky_charm": "🍀 Frotas tu **Amuleto de la Suerte**. Sientes que hoy es tu día.",
+    "golden_chip": "🪙 Pones tu **Ficha Dorada** sobre la mesa. Todos en el casino guardan silencio.",
+    "cocktail": "🍹 Bebes tu **Cóctel de Casino** de un sorbo. Máxima elegancia, cero monedas extra.",
+    "sunglasses": "🕶️ Te pones las **Gafas de Poker**. Tu cara ahora es completamente ilegible.",
+}
+
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -119,6 +172,16 @@ async def init_db():
                 item_id TEXT,
                 quantity INTEGER DEFAULT 1,
                 UNIQUE(user_id, item_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS missions (
+                user_id TEXT,
+                mission_id TEXT,
+                progress INTEGER DEFAULT 0,
+                completed INTEGER DEFAULT 0,
+                reset_date TEXT,
+                PRIMARY KEY (user_id, mission_id)
             )
         """)
         await db.commit()
@@ -186,6 +249,83 @@ async def remove_from_inventory(user_id: str, item_id: str):
         await db.commit()
 
 
+async def get_today() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+
+async def track_mission(user_id: str, action: str):
+    today = await get_today()
+    async with aiosqlite.connect(DB_PATH) as db:
+        for mission_id, mission in MISSIONS.items():
+            if mission["action"] != action:
+                continue
+            async with db.execute(
+                "SELECT progress, completed, reset_date FROM missions WHERE user_id=? AND mission_id=?",
+                (user_id, mission_id)
+            ) as cursor:
+                row = await cursor.fetchone()
+
+            if row is None:
+                await db.execute(
+                    "INSERT INTO missions (user_id, mission_id, progress, completed, reset_date) VALUES (?,?,0,0,?)",
+                    (user_id, mission_id, today)
+                )
+                progress, completed, reset_date = 0, 0, today
+            else:
+                progress, completed, reset_date = row
+
+            if reset_date != today:
+                progress, completed = 0, 0
+                await db.execute(
+                    "UPDATE missions SET progress=0, completed=0, reset_date=? WHERE user_id=? AND mission_id=?",
+                    (today, user_id, mission_id)
+                )
+
+            if completed:
+                continue
+
+            new_progress = min(progress + 1, mission["goal"])
+            newly_completed = 1 if new_progress >= mission["goal"] else 0
+            await db.execute(
+                "UPDATE missions SET progress=?, completed=?, reset_date=? WHERE user_id=? AND mission_id=?",
+                (new_progress, newly_completed, today, user_id, mission_id)
+            )
+            if newly_completed:
+                await db.execute(
+                    "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+                    (mission["reward"], user_id)
+                )
+        await db.commit()
+
+
+async def get_missions_data(user_id: str) -> list:
+    today = await get_today()
+    results = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        for mission_id, mission in MISSIONS.items():
+            async with db.execute(
+                "SELECT progress, completed, reset_date FROM missions WHERE user_id=? AND mission_id=?",
+                (user_id, mission_id)
+            ) as cursor:
+                row = await cursor.fetchone()
+
+            if row is None or row[2] != today:
+                progress, completed = 0, 0
+            else:
+                progress, completed = row[0], row[1]
+
+            results.append({
+                "id": mission_id,
+                "name": mission["name"],
+                "description": mission["description"],
+                "goal": mission["goal"],
+                "reward": mission["reward"],
+                "progress": progress,
+                "completed": bool(completed),
+            })
+    return results
+
+
 @client.event
 async def on_ready():
     await init_db()
@@ -231,6 +371,7 @@ async def daily(interaction: discord.Interaction):
     bal = await get_balance(user_id)
     embed = discord.Embed(title="🎁 ¡Recompensa Diaria!", color=0x00FF88)
     embed.description = f"¡Recibiste **500** 🪙!\nSaldo actual: **{bal:,}** 🪙"
+    await track_mission(user_id, "daily_used")
     await interaction.response.send_message(embed=embed)
 
 
@@ -386,6 +527,7 @@ async def roulette(interaction: discord.Interaction, cantidad: int, color: str):
             f"Saldo actual: **{new_balance:,}** 🪙"
         )
 
+    await track_mission(user_id, "roulette_played")
     await interaction.response.send_message(embed=embed)
 
 
@@ -462,6 +604,7 @@ async def slots(interaction: discord.Interaction, cantidad: int):
             f"Saldo: **{new_balance:,}** 🪙"
         )
 
+    await track_mission(user_id, "slots_played")
     await interaction.response.send_message(embed=embed)
 
 
@@ -531,6 +674,7 @@ async def rob(interaction: discord.Interaction, usuario: discord.Member):
         stolen = min(stolen, victim_balance)
         await update_balance(victim_id, -stolen)
         await update_balance(robber_id, stolen)
+        await track_mission(robber_id, "rob_success")
         robber_balance = await get_balance(robber_id)
         embed = discord.Embed(title="🦹 ¡Robo Exitoso!", color=0x00FF88)
         embed.description = (
@@ -798,8 +942,10 @@ class BlackjackView(discord.ui.View):
         dealer_total = hand_total(self.dealer_hand)
 
         if dealer_total > 21:
+            await track_mission(self.user_id, "blackjack_won")
             await self.end_game(interaction, f"🎉 ¡El dealer se pasó ({dealer_total})! ¡GANASTE **{self.bet:,}** 🪙!", self.bet)
         elif player_total > dealer_total:
+            await track_mission(self.user_id, "blackjack_won")
             await self.end_game(interaction, f"🎉 ¡GANASTE! {player_total} vs {dealer_total}. +**{self.bet:,}** 🪙", self.bet)
         elif player_total < dealer_total:
             await self.end_game(interaction, f"😔 Perdiste. {player_total} vs {dealer_total}. -**{self.bet:,}** 🪙", 0)
@@ -846,6 +992,7 @@ async def blackjack(interaction: discord.Interaction, cantidad: int):
     if player_total == 21:
         payout = int(cantidad * 1.5)
         await update_balance(user_id, cantidad + payout)
+        await track_mission(user_id, "blackjack_won")
         new_balance = await get_balance(user_id)
         embed = bj_embed(player_hand, dealer_hand, cantidad, reveal_dealer=True,
                          result_msg=f"🃏 ¡BLACKJACK! Ganas **{payout:,}** 🪙 extra!\nSaldo: **{new_balance:,}** 🪙")
@@ -1262,6 +1409,7 @@ async def crash(interaction: discord.Interaction, cantidad: int):
     embed = view.make_embed()
     await interaction.response.send_message(embed=embed, view=view)
     view.message = await interaction.original_response()
+    await track_mission(user_id, "crash_played")
     asyncio.create_task(view.run())
 
 
@@ -1350,6 +1498,104 @@ async def iteminfo(interaction: discord.Interaction, item: str):
 
     embed.set_footer(text=f"ID del objeto: {item}")
     await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="missions", description="Muestra tus misiones diarias y su progreso")
+async def missions(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    await get_or_create_user(user_id, interaction.user.name)
+    data = await get_missions_data(user_id)
+
+    embed = discord.Embed(title="📋 Misiones Diarias", color=0xE67E22)
+    embed.description = "Completa misiones cada día para ganar monedas extra. ¡Se reinician a medianoche!\n"
+
+    total_earned = sum(m["reward"] for m in data if m["completed"])
+    total_available = sum(m["reward"] for m in data)
+
+    for m in data:
+        bar_filled = int((m["progress"] / m["goal"]) * 10)
+        bar = "█" * bar_filled + "░" * (10 - bar_filled)
+        status = "✅ **COMPLETADA**" if m["completed"] else f"`[{bar}]` {m['progress']}/{m['goal']}"
+        embed.add_field(
+            name=f"{m['name']} — +{m['reward']:,} 🪙",
+            value=f"{m['description']}\n{status}",
+            inline=False
+        )
+
+    embed.set_footer(text=f"Ganadas hoy: {total_earned:,} / {total_available:,} 🪙")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="use", description="Usa un objeto de tu inventario")
+@app_commands.describe(item="ID del objeto a usar")
+async def use(interaction: discord.Interaction, item: str):
+    item = item.lower().strip()
+    if item not in SHOP_ITEMS:
+        ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
+        await interaction.response.send_message(
+            f"❌ Objeto no encontrado. IDs válidos:\n{ids}", ephemeral=True
+        )
+        return
+
+    user_id = str(interaction.user.id)
+    await get_or_create_user(user_id, interaction.user.name)
+    qty = await get_item_quantity(user_id, item)
+
+    if qty == 0:
+        embed = discord.Embed(title="❌ Sin Objeto", color=0xFF4444)
+        embed.description = f"No tienes **{SHOP_ITEMS[item]['name']}** en tu inventario.\nCómpralo en `/shop`."
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    item_data = SHOP_ITEMS[item]
+
+    if item_data["category"] == "decorativo":
+        flavor = USE_FLAVOR.get(item, f"Usas **{item_data['name']}**.")
+        embed = discord.Embed(title=f"✨ Usando {item_data['name']}", color=0x9B59B6)
+        embed.description = flavor
+        embed.set_footer(text=f"Tienes {qty} en tu inventario")
+        await interaction.response.send_message(embed=embed)
+
+    elif item == "anti_rob":
+        embed = discord.Embed(title="🛡️ Escudo Anti-Robo", color=0x3498DB)
+        embed.description = (
+            f"Tu escudo está **activo** y listo.\n\n"
+            f"🔒 Se activará automáticamente la próxima vez que alguien intente robarte.\n"
+            f"💡 Es consumible: se gastará 1 unidad por robo bloqueado.\n\n"
+            f"Tienes **{qty}** escudos en tu inventario."
+        )
+        await interaction.response.send_message(embed=embed)
+
+    elif item_data["category"] == "rol":
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT last_collect FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                last_collect = row[0] if row else None
+
+        now = datetime.utcnow()
+        cooldown_hours = item_data["collect_hours"]
+        if last_collect:
+            last_dt = datetime.fromisoformat(last_collect)
+            diff = now - last_dt
+            if diff < timedelta(hours=cooldown_hours):
+                remaining = timedelta(hours=cooldown_hours) - diff
+                hrs, rem = divmod(int(remaining.total_seconds()), 3600)
+                mins = rem // 60
+                next_collect = f"en **{hrs}h {mins}m**"
+            else:
+                next_collect = "**¡Ahora mismo!** Usa `/collect`"
+        else:
+            next_collect = "**¡Ahora mismo!** Usa `/collect`"
+
+        embed = discord.Embed(title=f"👑 {item_data['name']}", color=0xFFD700)
+        embed.description = (
+            f"**Estado:** Activo ✅\n"
+            f"**Bonus de /collect:** +**{item_data['collect_bonus']:,}** 🪙 cada **{cooldown_hours}h**\n"
+            f"**Próximo collect:** {next_collect}\n\n"
+            f"Tienes **{qty}** unidades en inventario.\n"
+            f"💡 Usa `/collect` para reclamar tus ganancias."
+        )
+        await interaction.response.send_message(embed=embed)
 
 
 if __name__ == "__main__":
