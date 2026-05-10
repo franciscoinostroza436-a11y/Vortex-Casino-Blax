@@ -165,6 +165,10 @@ async def init_db():
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
             except Exception:
                 pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN bank INTEGER DEFAULT 0")
+        except Exception:
+            pass
         await db.execute("""
             CREATE TABLE IF NOT EXISTS inventory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -203,6 +207,19 @@ async def get_balance(user_id: str) -> int:
         async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
+
+
+async def get_bank(user_id: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT bank FROM users WHERE user_id = ?", (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+
+async def update_bank(user_id: str, amount: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET bank = bank + ? WHERE user_id = ?", (amount, user_id))
+        await db.commit()
 
 
 async def update_balance(user_id: str, amount: int):
@@ -335,10 +352,16 @@ async def on_ready():
 
 @tree.command(name="balance", description="Muestra tu saldo actual")
 async def balance(interaction: discord.Interaction):
-    row = await get_or_create_user(str(interaction.user.id), interaction.user.name)
+    user_id = str(interaction.user.id)
+    row = await get_or_create_user(user_id, interaction.user.name)
+    bank_bal = await get_bank(user_id)
+    wallet = row[0]
+    total = wallet + bank_bal
     embed = discord.Embed(title="💰 Tu Saldo", color=0xFFD700)
-    embed.add_field(name="Monedas", value=f"**{row[0]:,}** 🪙", inline=False)
-    embed.set_footer(text=f"Casino Bot • {interaction.user.name}")
+    embed.add_field(name="👛 Cartera", value=f"**{wallet:,}** 🪙", inline=True)
+    embed.add_field(name="🏦 Banco", value=f"**{bank_bal:,}** 🪙", inline=True)
+    embed.add_field(name="📊 Total", value=f"**{total:,}** 🪙", inline=True)
+    embed.set_footer(text=f"Casino Bot • {interaction.user.name} • El banco es seguro contra robos")
     await interaction.response.send_message(embed=embed)
 
 
@@ -468,6 +491,81 @@ async def pay(interaction: discord.Interaction, usuario: discord.Member, cantida
 
     embed = discord.Embed(title="💸 Transferencia Exitosa", color=0x00FF88)
     embed.description = f"**{interaction.user.mention}** le envió **{cantidad:,}** 🪙 a **{usuario.mention}**."
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="dep", description="Deposita monedas en el banco (seguras contra robos)")
+@app_commands.describe(cantidad="Cantidad a depositar, o escribe 'all' para depositar todo")
+async def dep(interaction: discord.Interaction, cantidad: str):
+    user_id = str(interaction.user.id)
+    await get_or_create_user(user_id, interaction.user.name)
+    wallet = await get_balance(user_id)
+
+    if cantidad.lower() == "all":
+        amount = wallet
+    else:
+        try:
+            amount = int(cantidad)
+        except ValueError:
+            await interaction.response.send_message("❌ Escribe un número o `all`.", ephemeral=True)
+            return
+
+    if amount <= 0:
+        await interaction.response.send_message("❌ La cantidad debe ser mayor a 0.", ephemeral=True)
+        return
+    if amount > wallet:
+        embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
+        embed.description = f"Solo tienes **{wallet:,}** 🪙 en cartera."
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    await update_balance(user_id, -amount)
+    await update_bank(user_id, amount)
+    new_wallet = await get_balance(user_id)
+    new_bank = await get_bank(user_id)
+
+    embed = discord.Embed(title="🏦 Depósito Exitoso", color=0x3498DB)
+    embed.description = f"Depositaste **{amount:,}** 🪙 en el banco.\n"
+    embed.add_field(name="👛 Cartera", value=f"**{new_wallet:,}** 🪙", inline=True)
+    embed.add_field(name="🏦 Banco", value=f"**{new_bank:,}** 🪙", inline=True)
+    embed.set_footer(text="El banco está protegido contra robos")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="withdraw", description="Retira monedas del banco a tu cartera")
+@app_commands.describe(cantidad="Cantidad a retirar, o escribe 'all' para retirar todo")
+async def withdraw(interaction: discord.Interaction, cantidad: str):
+    user_id = str(interaction.user.id)
+    await get_or_create_user(user_id, interaction.user.name)
+    bank_bal = await get_bank(user_id)
+
+    if cantidad.lower() == "all":
+        amount = bank_bal
+    else:
+        try:
+            amount = int(cantidad)
+        except ValueError:
+            await interaction.response.send_message("❌ Escribe un número o `all`.", ephemeral=True)
+            return
+
+    if amount <= 0:
+        await interaction.response.send_message("❌ La cantidad debe ser mayor a 0.", ephemeral=True)
+        return
+    if amount > bank_bal:
+        embed = discord.Embed(title="❌ Saldo Bancario Insuficiente", color=0xFF4444)
+        embed.description = f"Solo tienes **{bank_bal:,}** 🪙 en el banco."
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    await update_bank(user_id, -amount)
+    await update_balance(user_id, amount)
+    new_wallet = await get_balance(user_id)
+    new_bank = await get_bank(user_id)
+
+    embed = discord.Embed(title="🏦 Retiro Exitoso", color=0x00FF88)
+    embed.description = f"Retiraste **{amount:,}** 🪙 del banco a tu cartera.\n"
+    embed.add_field(name="👛 Cartera", value=f"**{new_wallet:,}** 🪙", inline=True)
+    embed.add_field(name="🏦 Banco", value=f"**{new_bank:,}** 🪙", inline=True)
     await interaction.response.send_message(embed=embed)
 
 
