@@ -1805,6 +1805,178 @@ async def sell(interaction: discord.Interaction, item: str):
     await interaction.response.send_message(embed=embed)
 
 
+class TournamentView(discord.ui.View):
+    MAX_PLAYERS = 8
+
+    def __init__(self, host_id: str, host_name: str, buy_in: int):
+        super().__init__(timeout=90)
+        self.host_id = host_id
+        self.buy_in = buy_in
+        self.host_name = host_name
+        self.players: list[tuple[str, str]] = []
+        self.message: discord.Message | None = None
+        self.started = False
+
+    def roster_text(self):
+        if not self.players:
+            return "_Nadie se ha unido todavía..._"
+        lines = [f"{i+1}. {name}" for i, (_, name) in enumerate(self.players)]
+        return "\n".join(lines)
+
+    def make_embed(self):
+        pot = self.buy_in * len(self.players)
+        embed = discord.Embed(title="🏆 Torneo de Casino — Fase de Inscripción", color=0xE91E63)
+        embed.description = (
+            f"**Entry fee:** {self.buy_in:,} 🪙\n"
+            f"**Bote acumulado:** {pot:,} 🪙\n"
+            f"**Jugadores:** {len(self.players)}/{self.MAX_PLAYERS}\n\n"
+            f"**Inscritos:**\n{self.roster_text()}\n\n"
+            f"⏳ El torneo inicia en **90 segundos** o cuando haya {self.MAX_PLAYERS} jugadores.\n"
+            f"El campeón se lleva **todo el bote**."
+        )
+        embed.set_footer(text=f"Organizado por {self.host_name}")
+        return embed
+
+    @discord.ui.button(label="🎟️ Unirse al Torneo", style=discord.ButtonStyle.primary)
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.started:
+            await interaction.response.send_message("❌ El torneo ya comenzó.", ephemeral=True)
+            return
+        uid = str(interaction.user.id)
+        if any(p[0] == uid for p in self.players):
+            await interaction.response.send_message("❌ Ya estás inscrito.", ephemeral=True)
+            return
+        bal = await get_balance(uid)
+        if bal < self.buy_in:
+            await interaction.response.send_message(
+                f"❌ Necesitas **{self.buy_in:,}** 🪙 para entrar. Tienes **{bal:,}** 🪙.", ephemeral=True
+            )
+            return
+        await get_or_create_user(uid, interaction.user.name)
+        await update_balance(uid, -self.buy_in)
+        self.players.append((uid, interaction.user.display_name))
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+        if len(self.players) >= self.MAX_PLAYERS:
+            self.stop()
+            await self.run_tournament(interaction.channel)
+
+    @discord.ui.button(label="🚀 Iniciar Ya", style=discord.ButtonStyle.success)
+    async def start_now(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.host_id:
+            await interaction.response.send_message("❌ Solo el organizador puede iniciar el torneo.", ephemeral=True)
+            return
+        if len(self.players) < 2:
+            await interaction.response.send_message("❌ Necesitas al menos 2 jugadores para iniciar.", ephemeral=True)
+            return
+        self.stop()
+        await interaction.response.defer()
+        await self.run_tournament(interaction.channel)
+
+    async def on_timeout(self):
+        if self.started:
+            return
+        if len(self.players) < 2:
+            for uid, _ in self.players:
+                await update_balance(uid, self.buy_in)
+            if self.message:
+                embed = discord.Embed(title="⌛ Torneo Cancelado", color=0x888888)
+                embed.description = "No hubo suficientes jugadores. Se devolvió el dinero."
+                for item in self.children:
+                    item.disabled = True
+                await self.message.edit(embed=embed, view=self)
+            return
+        await self.run_tournament(self.message.channel if self.message else None)
+
+    async def run_tournament(self, channel):
+        if self.started:
+            return
+        self.started = True
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            embed = self.make_embed()
+            embed.title = "🏆 ¡Torneo Iniciado!"
+            embed.color = 0xFFD700
+            await self.message.edit(embed=embed, view=self)
+
+        bracket = list(self.players)
+        random.shuffle(bracket)
+        round_num = 1
+
+        while len(bracket) > 1:
+            next_round = []
+            round_results = []
+
+            pairs = []
+            i = 0
+            while i + 1 < len(bracket):
+                pairs.append((bracket[i], bracket[i + 1]))
+                i += 2
+            if i < len(bracket):
+                bye = bracket[i]
+                next_round.append(bye)
+                round_results.append(f"🎟️ **{bye[1]}** avanza con bye (número impar)")
+
+            for (p1_id, p1_name), (p2_id, p2_name) in pairs:
+                winner = random.choice([(p1_id, p1_name), (p2_id, p2_name)])
+                loser_name = p2_name if winner[0] == p1_id else p1_name
+                next_round.append(winner)
+                coin = random.choice(["🦅 Cara", "🦁 Cruz"])
+                round_results.append(f"**{p1_name}** vs **{p2_name}** → {coin} → 🏅 **{winner[1]}** avanza")
+
+            embed = discord.Embed(
+                title=f"⚔️ Ronda {round_num}",
+                description="\n".join(round_results),
+                color=0xE67E22
+            )
+            survivors = ", ".join(p[1] for p in next_round)
+            embed.set_footer(text=f"Continúan: {survivors}")
+            if channel:
+                await channel.send(embed=embed)
+            await asyncio.sleep(3)
+            bracket = next_round
+            round_num += 1
+
+        champion_id, champion_name = bracket[0]
+        pot = self.buy_in * len(self.players)
+        await update_balance(champion_id, pot)
+        final_balance = await get_balance(champion_id)
+
+        embed = discord.Embed(title="🏆 ¡CAMPEÓN DEL TORNEO!", color=0xFFD700)
+        embed.description = (
+            f"🥇 **{champion_name}** es el campeón absoluto!\n\n"
+            f"💰 Premio: **{pot:,}** 🪙\n"
+            f"Saldo final: **{final_balance:,}** 🪙"
+        )
+        embed.set_footer(text=f"Torneo con {len(self.players)} participantes · {self.buy_in:,} 🪙 de entrada")
+        if channel:
+            await channel.send(embed=embed)
+
+
+@tree.command(name="tournament", description="Organiza un torneo de eliminación directa con otros jugadores")
+@app_commands.describe(entrada="Costo de entrada en monedas")
+async def tournament(interaction: discord.Interaction, entrada: int):
+    if entrada <= 0:
+        await interaction.response.send_message("❌ El costo de entrada debe ser mayor a 0.", ephemeral=True)
+        return
+
+    host_id = str(interaction.user.id)
+    await get_or_create_user(host_id, interaction.user.name)
+    bal = await get_balance(host_id)
+    if bal < entrada:
+        await interaction.response.send_message(
+            f"❌ Necesitas **{entrada:,}** 🪙 para crear el torneo. Tienes **{bal:,}** 🪙.", ephemeral=True
+        )
+        return
+
+    await update_balance(host_id, -entrada)
+    view = TournamentView(host_id=host_id, host_name=interaction.user.display_name, buy_in=entrada)
+    view.players.append((host_id, interaction.user.display_name))
+
+    await interaction.response.send_message(embed=view.make_embed(), view=view)
+    view.message = await interaction.original_response()
+
+
 if __name__ == "__main__":
     if not TOKEN:
         print("ERROR: Falta la variable de entorno DISCORD_TOKEN")
