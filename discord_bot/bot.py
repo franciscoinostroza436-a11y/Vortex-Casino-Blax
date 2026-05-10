@@ -856,6 +856,135 @@ async def blackjack(interaction: discord.Interaction, cantidad: int):
     await interaction.response.send_message(embed=embed, view=view)
 
 
+class CoinflipChallengeView(discord.ui.View):
+    def __init__(self, challenger_id: str, challenger_name: str, challenged: discord.Member, bet: int):
+        super().__init__(timeout=60)
+        self.challenger_id = challenger_id
+        self.challenger_name = challenger_name
+        self.challenged = challenged
+        self.bet = bet
+        self.resolved = False
+
+    @discord.ui.button(label="✅ Aceptar", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.challenged.id:
+            await interaction.response.send_message("Este reto no es para ti.", ephemeral=True)
+            return
+        if self.resolved:
+            return
+        self.resolved = True
+
+        challenged_id = str(self.challenged.id)
+        challenged_balance = await get_balance(challenged_id)
+        if challenged_balance < self.bet:
+            for item in self.children:
+                item.disabled = True
+            embed = discord.Embed(title="❌ Sin Fondos", color=0xFF4444)
+            embed.description = f"{self.challenged.mention} no tiene suficientes monedas para aceptar el reto."
+            await interaction.response.edit_message(embed=embed, view=self)
+            self.stop()
+            return
+
+        await update_balance(self.challenger_id, -self.bet)
+        await update_balance(challenged_id, -self.bet)
+
+        flip = random.choice(["cara", "cruz"])
+        winner_side = random.choice(["cara", "cruz"])
+        challenger_pick = "cara"
+        challenged_pick = "cruz"
+
+        if winner_side == challenger_pick:
+            winner_id = self.challenger_id
+            winner_name = self.challenger_name
+            loser_mention = self.challenged.mention
+        else:
+            winner_id = challenged_id
+            winner_name = self.challenged.name
+            loser_mention = f"<@{self.challenger_id}>"
+
+        total_prize = self.bet * 2
+        await update_balance(winner_id, total_prize)
+        winner_balance = await get_balance(winner_id)
+
+        flip_emoji = "🪙" if flip == "cara" else "🌑"
+        embed = discord.Embed(title="🪙 ¡Resultado del Cara o Cruz!", color=0xFFD700)
+        embed.description = (
+            f"La moneda cayó en **{flip_emoji} {flip.upper()}**\n\n"
+            f"🎩 {self.challenger_name} apostó por **{challenger_pick}**\n"
+            f"🎮 {self.challenged.name} apostó por **{challenged_pick}**\n\n"
+            f"🏆 **¡{winner_name} gana {total_prize:,} 🪙!**\n"
+            f"😔 {loser_mention} pierde **{self.bet:,}** 🪙\n\n"
+            f"Saldo del ganador: **{winner_balance:,}** 🪙"
+        )
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+
+    @discord.ui.button(label="❌ Rechazar", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.challenged.id:
+            await interaction.response.send_message("Este reto no es para ti.", ephemeral=True)
+            return
+        if self.resolved:
+            return
+        self.resolved = True
+        for item in self.children:
+            item.disabled = True
+        embed = discord.Embed(title="🚫 Reto Rechazado", color=0xFF4444)
+        embed.description = f"**{self.challenged.name}** rechazó el reto de cara o cruz."
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+
+    async def on_timeout(self):
+        self.resolved = True
+        for item in self.children:
+            item.disabled = True
+
+
+@tree.command(name="coinflip", description="Reta a otro usuario a cara o cruz por monedas")
+@app_commands.describe(usuario="El usuario al que quieres retar", cantidad="Cantidad a apostar")
+async def coinflip(interaction: discord.Interaction, usuario: discord.Member, cantidad: int):
+    if cantidad <= 0:
+        await interaction.response.send_message("❌ La apuesta debe ser mayor a 0.", ephemeral=True)
+        return
+    if usuario.id == interaction.user.id:
+        await interaction.response.send_message("❌ No puedes retarte a ti mismo.", ephemeral=True)
+        return
+    if usuario.bot:
+        await interaction.response.send_message("❌ No puedes retar a un bot.", ephemeral=True)
+        return
+
+    challenger_id = str(interaction.user.id)
+    await get_or_create_user(challenger_id, interaction.user.name)
+    await get_or_create_user(str(usuario.id), usuario.name)
+
+    challenger_balance = await get_balance(challenger_id)
+    if challenger_balance < cantidad:
+        embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
+        embed.description = f"Necesitas **{cantidad:,}** 🪙 y tienes **{challenger_balance:,}** 🪙."
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    embed = discord.Embed(title="🪙 ¡Reto de Cara o Cruz!", color=0x9B59B6)
+    embed.description = (
+        f"**{interaction.user.mention}** reta a **{usuario.mention}**\n\n"
+        f"💰 Apuesta: **{cantidad:,}** 🪙 cada uno\n"
+        f"🏆 Premio total: **{cantidad*2:,}** 🪙\n\n"
+        f"🎩 {interaction.user.name} → **CARA**\n"
+        f"🎮 {usuario.name} → **CRUZ**\n\n"
+        f"{usuario.mention}, tienes **60 segundos** para aceptar o rechazar."
+    )
+
+    view = CoinflipChallengeView(
+        challenger_id=challenger_id,
+        challenger_name=interaction.user.name,
+        challenged=usuario,
+        bet=cantidad,
+    )
+    await interaction.response.send_message(embed=embed, view=view)
+
+
 if __name__ == "__main__":
     if not TOKEN:
         print("ERROR: Falta la variable de entorno DISCORD_TOKEN")
