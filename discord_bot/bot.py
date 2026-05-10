@@ -31,9 +31,14 @@ async def init_db():
                 user_id TEXT PRIMARY KEY,
                 username TEXT,
                 balance INTEGER DEFAULT 1000,
-                last_daily TEXT
+                last_daily TEXT,
+                last_rob TEXT
             )
         """)
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN last_rob TEXT")
+        except Exception:
+            pass
         await db.execute("""
             CREATE TABLE IF NOT EXISTS inventory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -325,6 +330,104 @@ async def inventory(interaction: discord.Interaction):
                 value=item_data["description"],
                 inline=False
             )
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="leaderboard", description="Muestra el ranking de los usuarios más ricos")
+async def leaderboard(interaction: discord.Interaction):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT username, balance FROM users ORDER BY balance DESC LIMIT 10"
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+    if not rows:
+        await interaction.response.send_message("❌ No hay usuarios registrados aún.", ephemeral=True)
+        return
+
+    medals = ["🥇", "🥈", "🥉"]
+    embed = discord.Embed(title="🏆 Ranking del Casino", color=0xFFD700)
+    description = ""
+    for i, (username, bal) in enumerate(rows):
+        prefix = medals[i] if i < 3 else f"**#{i+1}**"
+        description += f"{prefix} **{username}** — {bal:,} 🪙\n"
+    embed.description = description
+    embed.set_footer(text="Top 10 jugadores más ricos")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="rob", description="Intenta robarle monedas a otro usuario (40% de éxito)")
+@app_commands.describe(usuario="El usuario al que quieres robar")
+async def rob(interaction: discord.Interaction, usuario: discord.Member):
+    robber_id = str(interaction.user.id)
+    victim_id = str(usuario.id)
+
+    if usuario.id == interaction.user.id:
+        await interaction.response.send_message("❌ No puedes robarte a ti mismo.", ephemeral=True)
+        return
+    if usuario.bot:
+        await interaction.response.send_message("❌ No puedes robarle a un bot.", ephemeral=True)
+        return
+
+    await get_or_create_user(robber_id, interaction.user.name)
+    await get_or_create_user(victim_id, usuario.name)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT last_rob FROM users WHERE user_id = ?", (robber_id,)) as cursor:
+            row = await cursor.fetchone()
+            last_rob = row[0] if row else None
+
+    now = datetime.utcnow()
+    if last_rob:
+        last_dt = datetime.fromisoformat(last_rob)
+        diff = now - last_dt
+        if diff < timedelta(hours=1):
+            remaining = timedelta(hours=1) - diff
+            minutes = int(remaining.total_seconds() // 60)
+            seconds = int(remaining.total_seconds() % 60)
+            embed = discord.Embed(title="⏰ Cooldown Activo", color=0xFF4444)
+            embed.description = f"Ya intentaste robar recientemente.\nEspera **{minutes}m {seconds}s** antes de volver a intentarlo."
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+    victim_balance = await get_balance(victim_id)
+    if victim_balance < 100:
+        embed = discord.Embed(title="😅 Víctima Sin Fondos", color=0xFFAA00)
+        embed.description = f"**{usuario.name}** tiene menos de 100 🪙. ¡No vale la pena el riesgo!"
+        await interaction.response.send_message(embed=embed)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET last_rob = ? WHERE user_id = ?", (now.isoformat(), robber_id))
+        await db.commit()
+
+    success = random.random() < 0.40
+
+    if success:
+        pct = random.uniform(0.10, 0.40)
+        stolen = max(1, int(victim_balance * pct))
+        stolen = min(stolen, victim_balance)
+        await update_balance(victim_id, -stolen)
+        await update_balance(robber_id, stolen)
+        robber_balance = await get_balance(robber_id)
+        embed = discord.Embed(title="🦹 ¡Robo Exitoso!", color=0x00FF88)
+        embed.description = (
+            f"¡Le robaste **{stolen:,}** 🪙 a **{usuario.mention}**!\n\n"
+            f"Tu saldo: **{robber_balance:,}** 🪙"
+        )
+    else:
+        fine = max(1, int(victim_balance * 0.10))
+        robber_balance = await get_balance(robber_id)
+        fine = min(fine, robber_balance)
+        await update_balance(robber_id, -fine)
+        new_robber_balance = robber_balance - fine
+        embed = discord.Embed(title="🚔 ¡Te Atraparon!", color=0xFF4444)
+        embed.description = (
+            f"Intentaste robar a **{usuario.mention}** pero te atraparon.\n"
+            f"Pagaste una multa de **{fine:,}** 🪙.\n\n"
+            f"Tu saldo: **{new_robber_balance:,}** 🪙"
+        )
+
     await interaction.response.send_message(embed=embed)
 
 
