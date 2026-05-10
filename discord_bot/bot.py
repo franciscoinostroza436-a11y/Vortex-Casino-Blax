@@ -1598,6 +1598,138 @@ async def use(interaction: discord.Interaction, item: str):
         await interaction.response.send_message(embed=embed)
 
 
+class BetView(discord.ui.View):
+    def __init__(self, challenger_id: str, challenged_id: str, amount: int, challenger_name: str):
+        super().__init__(timeout=60)
+        self.challenger_id = challenger_id
+        self.challenged_id = challenged_id
+        self.amount = amount
+        self.challenger_name = challenger_name
+        self.message: discord.Message | None = None
+
+    async def on_timeout(self):
+        await update_balance(self.challenger_id, self.amount)
+        if self.message:
+            embed = discord.Embed(title="⌛ Apuesta Expirada", color=0x888888)
+            embed.description = (
+                f"La apuesta de **{self.amount:,}** 🪙 no fue aceptada a tiempo.\n"
+                f"Se devolvió el dinero a **{self.challenger_name}**."
+            )
+            for item in self.children:
+                item.disabled = True
+            await self.message.edit(embed=embed, view=self)
+
+    @discord.ui.button(label="✅ Aceptar", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.challenged_id:
+            await interaction.response.send_message("❌ Esta apuesta no es contigo.", ephemeral=True)
+            return
+
+        challenged_balance = await get_balance(self.challenged_id)
+        if challenged_balance < self.amount:
+            await update_balance(self.challenger_id, self.amount)
+            embed = discord.Embed(title="❌ Apuesta Cancelada", color=0xFF4444)
+            embed.description = (
+                f"**{interaction.user.mention}** no tiene suficientes monedas para aceptar.\n"
+                f"Se devolvió el dinero al retador."
+            )
+            for item in self.children:
+                item.disabled = True
+            self.stop()
+            await interaction.response.edit_message(embed=embed, view=self)
+            return
+
+        await update_balance(self.challenged_id, -self.amount)
+
+        pot = self.amount * 2
+        winner_id = random.choice([self.challenger_id, self.challenged_id])
+        loser_id = self.challenged_id if winner_id == self.challenger_id else self.challenger_id
+
+        winner_member = interaction.guild.get_member(int(winner_id))
+        loser_member = interaction.guild.get_member(int(loser_id))
+        winner_name = winner_member.mention if winner_member else f"<@{winner_id}>"
+        loser_name = loser_member.mention if loser_member else f"<@{loser_id}>"
+
+        await update_balance(winner_id, pot)
+        winner_balance = await get_balance(winner_id)
+
+        coin = "🪙"
+        embed = discord.Embed(title="🎲 ¡Resultado de la Apuesta!", color=0xFFD700)
+        embed.description = (
+            f"**Bote total:** {pot:,} {coin}\n\n"
+            f"🏆 **{winner_name}** ganó **{pot:,}** {coin}!\n"
+            f"💸 **{loser_name}** perdió **{self.amount:,}** {coin}\n\n"
+            f"Saldo del ganador: **{winner_balance:,}** {coin}"
+        )
+        for item in self.children:
+            item.disabled = True
+        self.stop()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="❌ Rechazar", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.challenged_id:
+            await interaction.response.send_message("❌ Esta apuesta no es contigo.", ephemeral=True)
+            return
+
+        await update_balance(self.challenger_id, self.amount)
+        embed = discord.Embed(title="🚫 Apuesta Rechazada", color=0xFF4444)
+        embed.description = (
+            f"**{interaction.user.mention}** rechazó la apuesta.\n"
+            f"Se devolvió **{self.amount:,}** 🪙 al retador."
+        )
+        for item in self.children:
+            item.disabled = True
+        self.stop()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+@tree.command(name="bet", description="Reta a otro usuario a una apuesta cara a cara")
+@app_commands.describe(usuario="El usuario al que quieres retar", cantidad="Cantidad a apostar")
+async def bet(interaction: discord.Interaction, usuario: discord.Member, cantidad: int):
+    if cantidad <= 0:
+        await interaction.response.send_message("❌ La apuesta debe ser mayor a 0.", ephemeral=True)
+        return
+    if usuario.id == interaction.user.id:
+        await interaction.response.send_message("❌ No puedes apostarte a ti mismo.", ephemeral=True)
+        return
+    if usuario.bot:
+        await interaction.response.send_message("❌ No puedes retar a un bot.", ephemeral=True)
+        return
+
+    challenger_id = str(interaction.user.id)
+    challenged_id = str(usuario.id)
+    await get_or_create_user(challenger_id, interaction.user.name)
+    await get_or_create_user(challenged_id, usuario.name)
+
+    challenger_balance = await get_balance(challenger_id)
+    if challenger_balance < cantidad:
+        await interaction.response.send_message(
+            f"❌ No tienes suficientes monedas. Tienes **{challenger_balance:,}** 🪙.", ephemeral=True
+        )
+        return
+
+    await update_balance(challenger_id, -cantidad)
+
+    embed = discord.Embed(title="🎲 ¡Desafío de Apuesta!", color=0xE67E22)
+    embed.description = (
+        f"**{interaction.user.mention}** reta a **{usuario.mention}** a una apuesta.\n\n"
+        f"💰 **En juego:** {cantidad:,} 🪙 cada uno → **bote total: {cantidad * 2:,}** 🪙\n\n"
+        f"🎯 El ganador se lleva **todo**. ¡El azar decide!\n\n"
+        f"⏳ Tienes **60 segundos** para aceptar o rechazar."
+    )
+    embed.set_footer(text=f"Solo {usuario.display_name} puede responder")
+
+    view = BetView(
+        challenger_id=challenger_id,
+        challenged_id=challenged_id,
+        amount=cantidad,
+        challenger_name=interaction.user.display_name
+    )
+    await interaction.response.send_message(embed=embed, view=view, content=usuario.mention)
+    view.message = await interaction.original_response()
+
+
 @tree.command(name="gift", description="Regala un objeto de tu inventario a otro usuario")
 @app_commands.describe(usuario="El usuario que recibirá el regalo", item="ID del objeto a regalar")
 async def gift(interaction: discord.Interaction, usuario: discord.Member, item: str):
