@@ -431,6 +431,170 @@ async def rob(interaction: discord.Interaction, usuario: discord.Member):
     await interaction.response.send_message(embed=embed)
 
 
+SUITS = ["♠️", "♥️", "♦️", "♣️"]
+RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+
+def new_deck():
+    deck = [(r, s) for s in SUITS for r in RANKS]
+    random.shuffle(deck)
+    return deck
+
+def card_value(rank):
+    if rank in ("J", "Q", "K"):
+        return 10
+    if rank == "A":
+        return 11
+    return int(rank)
+
+def hand_total(hand):
+    total = sum(card_value(r) for r, _ in hand)
+    aces = sum(1 for r, _ in hand if r == "A")
+    while total > 21 and aces:
+        total -= 10
+        aces -= 1
+    return total
+
+def fmt_hand(hand):
+    return " ".join(f"`{r}{s}`" for r, s in hand)
+
+def bj_embed(player_hand, dealer_hand, bet, reveal_dealer=False, result_msg=None):
+    player_total = hand_total(player_hand)
+    color = 0xFFD700
+    if result_msg:
+        if "¡GANASTE" in result_msg or "BLACKJACK" in result_msg:
+            color = 0x00FF88
+        elif "Perdiste" in result_msg or "Te pasaste" in result_msg:
+            color = 0xFF4444
+        else:
+            color = 0xFFAA00
+
+    embed = discord.Embed(title="🃏 Blackjack", color=color)
+
+    if reveal_dealer:
+        dealer_total = hand_total(dealer_hand)
+        embed.add_field(name=f"Dealer — {dealer_total}", value=fmt_hand(dealer_hand), inline=False)
+    else:
+        hidden = f"`{dealer_hand[0][0]}{dealer_hand[0][1]}` `🂠`"
+        embed.add_field(name="Dealer", value=hidden, inline=False)
+
+    embed.add_field(name=f"Tu mano — {player_total}", value=fmt_hand(player_hand), inline=False)
+    embed.add_field(name="Apuesta", value=f"**{bet:,}** 🪙", inline=True)
+
+    if result_msg:
+        embed.add_field(name="Resultado", value=result_msg, inline=False)
+
+    return embed
+
+
+class BlackjackView(discord.ui.View):
+    def __init__(self, user_id, bet, player_hand, dealer_hand, deck, balance):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.bet = bet
+        self.player_hand = player_hand
+        self.dealer_hand = dealer_hand
+        self.deck = deck
+        self.balance = balance
+
+    async def end_game(self, interaction, result_msg, payout):
+        await update_balance(self.user_id, payout)
+        new_balance = await get_balance(self.user_id)
+        embed = bj_embed(self.player_hand, self.dealer_hand, self.bet, reveal_dealer=True,
+                         result_msg=f"{result_msg}\nSaldo: **{new_balance:,}** 🪙")
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+
+    @discord.ui.button(label="🃏 Pedir (Hit)", style=discord.ButtonStyle.primary)
+    async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("Este no es tu juego.", ephemeral=True)
+            return
+        self.player_hand.append(self.deck.pop())
+        total = hand_total(self.player_hand)
+        if total > 21:
+            await self.end_game(interaction, f"💥 ¡Te pasaste con {total}! Perdiste **{self.bet:,}** 🪙.", 0)
+        elif total == 21:
+            await self.stand_logic(interaction)
+        else:
+            embed = bj_embed(self.player_hand, self.dealer_hand, self.bet)
+            await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="✋ Plantarse (Stand)", style=discord.ButtonStyle.secondary)
+    async def stand(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("Este no es tu juego.", ephemeral=True)
+            return
+        await self.stand_logic(interaction)
+
+    async def stand_logic(self, interaction):
+        while hand_total(self.dealer_hand) < 17:
+            self.dealer_hand.append(self.deck.pop())
+
+        player_total = hand_total(self.player_hand)
+        dealer_total = hand_total(self.dealer_hand)
+
+        if dealer_total > 21:
+            await self.end_game(interaction, f"🎉 ¡El dealer se pasó ({dealer_total})! ¡GANASTE **{self.bet:,}** 🪙!", self.bet)
+        elif player_total > dealer_total:
+            await self.end_game(interaction, f"🎉 ¡GANASTE! {player_total} vs {dealer_total}. +**{self.bet:,}** 🪙", self.bet)
+        elif player_total < dealer_total:
+            await self.end_game(interaction, f"😔 Perdiste. {player_total} vs {dealer_total}. -**{self.bet:,}** 🪙", 0)
+        else:
+            await update_balance(self.user_id, self.bet)
+            new_balance = await get_balance(self.user_id)
+            embed = bj_embed(self.player_hand, self.dealer_hand, self.bet, reveal_dealer=True,
+                             result_msg=f"🤝 ¡Empate! Se devuelve tu apuesta.\nSaldo: **{new_balance:,}** 🪙")
+            for item in self.children:
+                item.disabled = True
+            await interaction.response.edit_message(embed=embed, view=self)
+            self.stop()
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+
+
+@tree.command(name="blackjack", description="Juega al blackjack contra el dealer")
+@app_commands.describe(cantidad="Cantidad a apostar")
+async def blackjack(interaction: discord.Interaction, cantidad: int):
+    if cantidad <= 0:
+        await interaction.response.send_message("❌ La apuesta debe ser mayor a 0.", ephemeral=True)
+        return
+
+    user_id = str(interaction.user.id)
+    await get_or_create_user(user_id, interaction.user.name)
+    balance = await get_balance(user_id)
+
+    if balance < cantidad:
+        embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
+        embed.description = f"Tienes **{balance:,}** 🪙 y quieres apostar **{cantidad:,}** 🪙."
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    await update_balance(user_id, -cantidad)
+
+    deck = new_deck()
+    player_hand = [deck.pop(), deck.pop()]
+    dealer_hand = [deck.pop(), deck.pop()]
+
+    player_total = hand_total(player_hand)
+
+    if player_total == 21:
+        payout = int(cantidad * 1.5)
+        await update_balance(user_id, cantidad + payout)
+        new_balance = await get_balance(user_id)
+        embed = bj_embed(player_hand, dealer_hand, cantidad, reveal_dealer=True,
+                         result_msg=f"🃏 ¡BLACKJACK! Ganas **{payout:,}** 🪙 extra!\nSaldo: **{new_balance:,}** 🪙")
+        await interaction.response.send_message(embed=embed)
+        return
+
+    view = BlackjackView(user_id, cantidad, player_hand, dealer_hand, deck, balance)
+    embed = bj_embed(player_hand, dealer_hand, cantidad)
+    await interaction.response.send_message(embed=embed, view=view)
+
+
 if __name__ == "__main__":
     if not TOKEN:
         print("ERROR: Falta la variable de entorno DISCORD_TOKEN")
