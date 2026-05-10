@@ -1598,6 +1598,81 @@ async def use(interaction: discord.Interaction, item: str):
         await interaction.response.send_message(embed=embed)
 
 
+@tree.command(name="gift", description="Regala un objeto de tu inventario a otro usuario")
+@app_commands.describe(usuario="El usuario que recibirá el regalo", item="ID del objeto a regalar")
+async def gift(interaction: discord.Interaction, usuario: discord.Member, item: str):
+    item = item.lower().strip()
+    if item not in SHOP_ITEMS:
+        ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
+        await interaction.response.send_message(f"❌ Objeto no encontrado. IDs válidos:\n{ids}", ephemeral=True)
+        return
+    if usuario.id == interaction.user.id:
+        await interaction.response.send_message("❌ No puedes regalarte objetos a ti mismo.", ephemeral=True)
+        return
+    if usuario.bot:
+        await interaction.response.send_message("❌ No puedes regalarle a un bot.", ephemeral=True)
+        return
+
+    sender_id = str(interaction.user.id)
+    receiver_id = str(usuario.id)
+    await get_or_create_user(sender_id, interaction.user.name)
+    await get_or_create_user(receiver_id, usuario.name)
+
+    qty = await get_item_quantity(sender_id, item)
+    if qty == 0:
+        embed = discord.Embed(title="❌ Sin Objeto", color=0xFF4444)
+        embed.description = f"No tienes **{SHOP_ITEMS[item]['name']}** en tu inventario."
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    await remove_from_inventory(sender_id, item)
+    await add_to_inventory(receiver_id, item)
+
+    item_data = SHOP_ITEMS[item]
+    embed = discord.Embed(title="🎁 ¡Regalo Enviado!", color=0x00FF88)
+    embed.description = (
+        f"**{interaction.user.mention}** le regaló **{item_data['name']}** a **{usuario.mention}**.\n\n"
+        f"{item_data['description']}\n\n"
+        f"Te quedan **{qty - 1}** unidades en inventario."
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="sell", description="Vende un objeto de tu inventario por el 50% de su valor")
+@app_commands.describe(item="ID del objeto a vender")
+async def sell(interaction: discord.Interaction, item: str):
+    item = item.lower().strip()
+    if item not in SHOP_ITEMS:
+        ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
+        await interaction.response.send_message(f"❌ Objeto no encontrado. IDs válidos:\n{ids}", ephemeral=True)
+        return
+
+    user_id = str(interaction.user.id)
+    await get_or_create_user(user_id, interaction.user.name)
+
+    qty = await get_item_quantity(user_id, item)
+    if qty == 0:
+        embed = discord.Embed(title="❌ Sin Objeto", color=0xFF4444)
+        embed.description = f"No tienes **{SHOP_ITEMS[item]['name']}** en tu inventario."
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    item_data = SHOP_ITEMS[item]
+    sell_price = item_data["price"] // 2
+
+    await remove_from_inventory(user_id, item)
+    await update_balance(user_id, sell_price)
+    new_balance = await get_balance(user_id)
+
+    embed = discord.Embed(title="💰 Objeto Vendido", color=0xFFD700)
+    embed.description = (
+        f"Vendiste **{item_data['name']}** por **{sell_price:,}** 🪙 (50% del precio original).\n\n"
+        f"Saldo actual: **{new_balance:,}** 🪙\n"
+        f"Te quedan **{qty - 1}** unidades en inventario."
+    )
+    await interaction.response.send_message(embed=embed)
+
+
 if __name__ == "__main__":
     if not TOKEN:
         print("ERROR: Falta la variable de entorno DISCORD_TOKEN")
