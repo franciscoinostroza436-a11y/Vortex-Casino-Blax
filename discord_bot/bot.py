@@ -985,6 +985,153 @@ async def coinflip(interaction: discord.Interaction, usuario: discord.Member, ca
     await interaction.response.send_message(embed=embed, view=view)
 
 
+class DuelChallengeView(discord.ui.View):
+    def __init__(self, challenger_id: str, challenger_name: str, challenged: discord.Member, bet: int):
+        super().__init__(timeout=60)
+        self.challenger_id = challenger_id
+        self.challenger_name = challenger_name
+        self.challenged = challenged
+        self.bet = bet
+        self.resolved = False
+
+    @discord.ui.button(label="⚔️ Aceptar Duelo", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.challenged.id:
+            await interaction.response.send_message("Este duelo no es para ti.", ephemeral=True)
+            return
+        if self.resolved:
+            return
+        self.resolved = True
+
+        challenged_id = str(self.challenged.id)
+        challenged_balance = await get_balance(challenged_id)
+        if challenged_balance < self.bet:
+            for item in self.children:
+                item.disabled = True
+            embed = discord.Embed(title="❌ Sin Fondos", color=0xFF4444)
+            embed.description = f"{self.challenged.mention} no tiene suficientes monedas para aceptar el duelo."
+            await interaction.response.edit_message(embed=embed, view=self)
+            self.stop()
+            return
+
+        await update_balance(self.challenger_id, -self.bet)
+        await update_balance(challenged_id, -self.bet)
+
+        dice_challenger = random.randint(1, 6)
+        dice_challenged = random.randint(1, 6)
+
+        def dice_emoji(n):
+            return ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣"][n - 1]
+
+        total_prize = self.bet * 2
+
+        if dice_challenger > dice_challenged:
+            winner_id = self.challenger_id
+            winner_name = self.challenger_name
+            loser_name = self.challenged.name
+            result_line = f"🏆 **¡{self.challenger_name} gana el duelo!**"
+        elif dice_challenged > dice_challenger:
+            winner_id = challenged_id
+            winner_name = self.challenged.name
+            loser_name = self.challenger_name
+            result_line = f"🏆 **¡{self.challenged.name} gana el duelo!**"
+        else:
+            await update_balance(self.challenger_id, self.bet)
+            await update_balance(challenged_id, self.bet)
+            embed = discord.Embed(title="⚔️ ¡Duelo de Dados!", color=0xFFAA00)
+            embed.description = (
+                f"{dice_emoji(dice_challenger)} **{self.challenger_name}** tiró **{dice_challenger}**\n"
+                f"{dice_emoji(dice_challenged)} **{self.challenged.name}** tiró **{dice_challenged}**\n\n"
+                f"🤝 **¡Empate!** Se devuelve la apuesta a ambos."
+            )
+            for item in self.children:
+                item.disabled = True
+            await interaction.response.edit_message(embed=embed, view=self)
+            self.stop()
+            return
+
+        await update_balance(winner_id, total_prize)
+        winner_balance = await get_balance(winner_id)
+
+        embed = discord.Embed(title="⚔️ ¡Duelo de Dados — Resultado!", color=0x00FF88)
+        embed.description = (
+            f"{dice_emoji(dice_challenger)} **{self.challenger_name}** tiró **{dice_challenger}**\n"
+            f"{dice_emoji(dice_challenged)} **{self.challenged.name}** tiró **{dice_challenged}**\n\n"
+            f"{result_line}\n"
+            f"💰 Gana **{total_prize:,}** 🪙\n"
+            f"😔 **{loser_name}** pierde **{self.bet:,}** 🪙\n\n"
+            f"Saldo del ganador: **{winner_balance:,}** 🪙"
+        )
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+
+    @discord.ui.button(label="🏳️ Rechazar", style=discord.ButtonStyle.danger)
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.challenged.id:
+            await interaction.response.send_message("Este duelo no es para ti.", ephemeral=True)
+            return
+        if self.resolved:
+            return
+        self.resolved = True
+        for item in self.children:
+            item.disabled = True
+        embed = discord.Embed(title="🏳️ Duelo Rechazado", color=0xFF4444)
+        embed.description = f"**{self.challenged.name}** rehusó el duelo. ¡Cobarde!"
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+
+    async def on_timeout(self):
+        self.resolved = True
+        for item in self.children:
+            item.disabled = True
+
+
+@tree.command(name="duel", description="Reta a otro usuario a un duelo de dados")
+@app_commands.describe(usuario="El usuario al que quieres retar", cantidad="Cantidad a apostar")
+async def duel(interaction: discord.Interaction, usuario: discord.Member, cantidad: int):
+    if cantidad <= 0:
+        await interaction.response.send_message("❌ La apuesta debe ser mayor a 0.", ephemeral=True)
+        return
+    if usuario.id == interaction.user.id:
+        await interaction.response.send_message("❌ No puedes retarte a ti mismo.", ephemeral=True)
+        return
+    if usuario.bot:
+        await interaction.response.send_message("❌ No puedes retar a un bot.", ephemeral=True)
+        return
+
+    challenger_id = str(interaction.user.id)
+    await get_or_create_user(challenger_id, interaction.user.name)
+    await get_or_create_user(str(usuario.id), usuario.name)
+
+    challenger_balance = await get_balance(challenger_id)
+    if challenger_balance < cantidad:
+        embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
+        embed.description = f"Necesitas **{cantidad:,}** 🪙 y tienes **{challenger_balance:,}** 🪙."
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    embed = discord.Embed(title="⚔️ ¡Duelo de Dados!", color=0xE74C3C)
+    embed.description = (
+        f"**{interaction.user.mention}** reta a **{usuario.mention}** a un duelo de dados.\n\n"
+        f"🎲 Cada jugador lanzará un dado del 1 al 6\n"
+        f"🏆 El mayor número gana todo\n"
+        f"🤝 Si empatan, se devuelve la apuesta\n\n"
+        f"💰 Apuesta: **{cantidad:,}** 🪙 cada uno\n"
+        f"🏆 Premio total: **{cantidad*2:,}** 🪙\n\n"
+        f"{usuario.mention}, tienes **60 segundos** para aceptar o rechazar."
+    )
+
+    view = DuelChallengeView(
+        challenger_id=challenger_id,
+        challenger_name=interaction.user.name,
+        challenged=usuario,
+        bet=cantidad,
+    )
+    await interaction.response.send_message(embed=embed, view=view)
+
+
 if __name__ == "__main__":
     if not TOKEN:
         print("ERROR: Falta la variable de entorno DISCORD_TOKEN")
