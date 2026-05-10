@@ -1,6 +1,7 @@
 import discord
 from discord import app_commands
 import aiosqlite
+import asyncio
 import random
 import os
 from datetime import datetime, timedelta
@@ -1130,6 +1131,225 @@ async def duel(interaction: discord.Interaction, usuario: discord.Member, cantid
         bet=cantidad,
     )
     await interaction.response.send_message(embed=embed, view=view)
+
+
+def generate_crash_point() -> float:
+    r = random.random()
+    if r < 0.30:
+        return round(random.uniform(1.0, 1.5), 2)
+    elif r < 0.55:
+        return round(random.uniform(1.5, 2.5), 2)
+    elif r < 0.75:
+        return round(random.uniform(2.5, 5.0), 2)
+    elif r < 0.88:
+        return round(random.uniform(5.0, 10.0), 2)
+    elif r < 0.95:
+        return round(random.uniform(10.0, 20.0), 2)
+    else:
+        return round(random.uniform(20.0, 50.0), 2)
+
+
+class CrashView(discord.ui.View):
+    def __init__(self, user_id: str, bet: int, crash_point: float):
+        super().__init__(timeout=None)
+        self.user_id = user_id
+        self.bet = bet
+        self.crash_point = crash_point
+        self.current_mult = 1.0
+        self.cashed_out = False
+        self.finished = False
+        self.message: discord.Message | None = None
+
+    def make_embed(self, crashed=False, cashed_out=False) -> discord.Embed:
+        mult_str = f"{self.current_mult:.2f}x"
+        if cashed_out:
+            winnings = int(self.bet * self.current_mult)
+            embed = discord.Embed(title="💸 ¡Cash Out Exitoso!", color=0x00FF88)
+            embed.description = (
+                f"Te retiraste en **{mult_str}** 🚀\n\n"
+                f"💰 Ganaste **{winnings:,}** 🪙"
+            )
+        elif crashed:
+            embed = discord.Embed(title="💥 ¡CRASH!", color=0xFF4444)
+            embed.description = (
+                f"El juego crasheó en **{mult_str}** 💀\n\n"
+                f"😔 Perdiste **{self.bet:,}** 🪙"
+            )
+        else:
+            winnings = int(self.bet * self.current_mult)
+            embed = discord.Embed(title="📈 Crash — ¡Retírate antes del crash!", color=0x9B59B6)
+            embed.description = (
+                f"Multiplicador: **{mult_str}** 🚀\n"
+                f"Apuesta: **{self.bet:,}** 🪙\n\n"
+                f"Si te retiras ahora: **{winnings:,}** 🪙"
+            )
+        return embed
+
+    async def run(self):
+        await asyncio.sleep(2.0)
+        step = 0.1
+        while not self.cashed_out and not self.finished:
+            self.current_mult = round(self.current_mult + step, 2)
+            if self.current_mult > 5.0:
+                step = 0.3
+            elif self.current_mult > 2.0:
+                step = 0.2
+
+            if self.current_mult >= self.crash_point:
+                self.finished = True
+                for item in self.children:
+                    item.disabled = True
+                if self.message:
+                    try:
+                        await self.message.edit(embed=self.make_embed(crashed=True), view=self)
+                    except Exception:
+                        pass
+                self.stop()
+                return
+
+            if self.message:
+                try:
+                    await self.message.edit(embed=self.make_embed(), view=self)
+                except Exception:
+                    pass
+            await asyncio.sleep(1.5)
+
+    @discord.ui.button(label="💸 Cash Out", style=discord.ButtonStyle.success)
+    async def cashout(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("Este no es tu juego.", ephemeral=True)
+            return
+        if self.finished or self.cashed_out:
+            await interaction.response.send_message("El juego ya terminó.", ephemeral=True)
+            return
+
+        self.cashed_out = True
+        self.finished = True
+        winnings = int(self.bet * self.current_mult)
+        await update_balance(self.user_id, winnings)
+        new_balance = await get_balance(self.user_id)
+
+        for item in self.children:
+            item.disabled = True
+
+        embed = self.make_embed(cashed_out=True)
+        embed.add_field(name="Saldo actual", value=f"**{new_balance:,}** 🪙", inline=False)
+        await interaction.response.edit_message(embed=embed, view=self)
+        self.stop()
+
+
+@tree.command(name="crash", description="Apuesta y retírate antes de que crashee el multiplicador")
+@app_commands.describe(cantidad="Cantidad a apostar")
+async def crash(interaction: discord.Interaction, cantidad: int):
+    if cantidad <= 0:
+        await interaction.response.send_message("❌ La apuesta debe ser mayor a 0.", ephemeral=True)
+        return
+
+    user_id = str(interaction.user.id)
+    await get_or_create_user(user_id, interaction.user.name)
+    bal = await get_balance(user_id)
+
+    if bal < cantidad:
+        embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
+        embed.description = f"Tienes **{bal:,}** 🪙 y quieres apostar **{cantidad:,}** 🪙."
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    await update_balance(user_id, -cantidad)
+    crash_point = generate_crash_point()
+
+    view = CrashView(user_id=user_id, bet=cantidad, crash_point=crash_point)
+    embed = view.make_embed()
+    await interaction.response.send_message(embed=embed, view=view)
+    view.message = await interaction.original_response()
+    asyncio.create_task(view.run())
+
+
+@tree.command(name="store", description="Muestra la tienda del casino (alias de /shop)")
+async def store(interaction: discord.Interaction):
+    embed = discord.Embed(title="🏪 Tienda del Casino", color=0x9B59B6)
+    embed.description = "Usa `/buy <id_item>` para comprar. Los roles se usan con `/collect`.\n"
+
+    categorias = {
+        "proteccion": "🛡️ Protección",
+        "rol": "👑 Roles con /collect",
+        "decorativo": "🎭 Decorativos",
+    }
+
+    for cat_key, cat_name in categorias.items():
+        items_in_cat = [(k, v) for k, v in SHOP_ITEMS.items() if v["category"] == cat_key]
+        if not items_in_cat:
+            continue
+        lines = []
+        for item_id, item in items_in_cat:
+            lines.append(f"**{item['name']}** — {item['price']:,} 🪙\n{item['description']}\n`ID: {item_id}`")
+        embed.add_field(name=cat_name, value="\n\n".join(lines), inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="iteminfo", description="Muestra los detalles completos de un objeto de la tienda")
+@app_commands.describe(item="ID del objeto a consultar")
+async def iteminfo(interaction: discord.Interaction, item: str):
+    item = item.lower().strip()
+    if item not in SHOP_ITEMS:
+        ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
+        await interaction.response.send_message(
+            f"❌ Objeto no encontrado. IDs válidos:\n{ids}", ephemeral=True
+        )
+        return
+
+    data = SHOP_ITEMS[item]
+    user_id = str(interaction.user.id)
+    await get_or_create_user(user_id, interaction.user.name)
+    qty = await get_item_quantity(user_id, item)
+
+    cat_labels = {
+        "proteccion": "🛡️ Protección",
+        "rol": "👑 Rol con /collect",
+        "decorativo": "🎭 Decorativo",
+    }
+
+    color_map = {"proteccion": 0x3498DB, "rol": 0xFFD700, "decorativo": 0x9B59B6}
+    embed = discord.Embed(
+        title=data["name"],
+        color=color_map.get(data["category"], 0xFFFFFF)
+    )
+    embed.add_field(name="Descripción", value=data["description"], inline=False)
+    embed.add_field(name="Precio", value=f"**{data['price']:,}** 🪙", inline=True)
+    embed.add_field(name="Categoría", value=cat_labels.get(data["category"], data["category"]), inline=True)
+    embed.add_field(name="En tu inventario", value=f"**{qty}** unidades", inline=True)
+
+    if data["category"] == "rol":
+        embed.add_field(
+            name="💰 Bonus de /collect",
+            value=f"+**{data['collect_bonus']:,}** 🪙 cada **{data['collect_hours']}h**",
+            inline=False
+        )
+        embed.add_field(
+            name="📋 Cómo funciona",
+            value=(
+                "• Compra el rol con `/buy`\n"
+                "• Usa `/collect` para reclamar tus ganancias\n"
+                "• Si tienes varios roles, los bonuses se suman\n"
+                "• El cooldown es el menor entre tus roles activos"
+            ),
+            inline=False
+        )
+    elif data["category"] == "proteccion":
+        embed.add_field(
+            name="📋 Cómo funciona",
+            value=(
+                "• Se activa automáticamente cuando alguien intenta robarte\n"
+                "• Bloquea el robo por completo\n"
+                "• Es consumible: se gasta 1 unidad por cada robo bloqueado\n"
+                "• Puedes tener múltiples unidades en inventario"
+            ),
+            inline=False
+        )
+
+    embed.set_footer(text=f"ID del objeto: {item}")
+    await interaction.response.send_message(embed=embed)
 
 
 if __name__ == "__main__":
