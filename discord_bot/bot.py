@@ -2075,6 +2075,84 @@ async def tournament(interaction: discord.Interaction, entrada: int):
     view.message = await interaction.original_response()
 
 
+@tree.command(name="help", description="Muestra todos los comandos del bot organizados por categoría")
+async def help_cmd(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🎰 Casino Bot — Comandos",
+        description="Todos los comandos disponibles organizados por categoría.",
+        color=0xE91E63
+    )
+
+    embed.add_field(
+        name="💰 Economía",
+        value=(
+            "`/balance` — Cartera, banco y total\n"
+            "`/daily` — Recompensa diaria de 500 🪙\n"
+            "`/dep <cantidad|all>` — Depositar al banco\n"
+            "`/withdraw <cantidad|all>` — Retirar del banco\n"
+            "`/pay @usuario cantidad` — Transferir monedas\n"
+            "`/leaderboard` — Top 10 jugadores"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🎰 Juegos",
+        value=(
+            "`/slots cantidad` — Tragamonedas\n"
+            "`/roulette cantidad color` — Ruleta rojo/negro\n"
+            "`/blackjack cantidad` — Blackjack vs dealer\n"
+            "`/coinflip cantidad cara|cruz` — Cara o cruz\n"
+            "`/crash cantidad` — Crash: retira antes que explote"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚔️ PvP",
+        value=(
+            "`/duel @usuario cantidad` — Duelo 1v1\n"
+            "`/bet @usuario cantidad` — Apuesta (acepta/rechaza)\n"
+            "`/rob @usuario` — Intenta robar (40% éxito)\n"
+            "`/tournament entrada` — Torneo hasta 8 jugadores"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🛍️ Tienda e Inventario",
+        value=(
+            "`/shop` — Ver la tienda\n"
+            "`/buy item` — Comprar un objeto\n"
+            "`/inventory` — Ver tu inventario\n"
+            "`/iteminfo item` — Info de un objeto\n"
+            "`/use item` — Usar un objeto\n"
+            "`/gift @usuario item` — Regalar un objeto\n"
+            "`/sell item` — Vender objeto al 50%"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="📋 Misiones",
+        value="`/missions` — Ver misiones diarias y progreso",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🔧 Admin",
+        value=(
+            "`/addmoney @usuario cantidad` — Añadir monedas\n"
+            "`/removemoney @usuario cantidad` — Quitar monedas\n"
+            "`/collect` — Recoger ganancias de roles"
+        ),
+        inline=False
+    )
+
+    embed.set_footer(text="🏦 El banco es seguro contra robos  •  Casino Bot")
+    await interaction.response.send_message(embed=embed)
+
+
 if __name__ == "__main__":
     if not TOKEN:
         print("ERROR: Falta la variable de entorno DISCORD_TOKEN")
