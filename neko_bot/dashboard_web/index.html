@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Neko Bot Dashboard</title>
+<style>
+  :root {
+    --pink: #FF69B4;
+    --pink-dark: #e0559a;
+    --bg: #0f0f1a;
+    --card: #1a1a2e;
+    --card2: #16213e;
+    --text: #f0f0f0;
+    --muted: #999;
+    --green: #00FF88;
+    --red: #FF4444;
+    --yellow: #FFD700;
+    --border: #2a2a4a;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+
+  .sidebar {
+    position: fixed; left: 0; top: 0; bottom: 0; width: 220px;
+    background: var(--card); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; padding: 0;
+    z-index: 100;
+  }
+  .sidebar-header {
+    padding: 24px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 12px;
+  }
+  .sidebar-header img { width: 40px; height: 40px; border-radius: 50%; }
+  .sidebar-header h2 { font-size: 16px; color: var(--pink); }
+  .sidebar-header span { font-size: 11px; color: var(--muted); }
+  .nav { flex: 1; padding: 12px 0; }
+  .nav-item {
+    display: flex; align-items: center; gap: 12px;
+    padding: 12px 20px; cursor: pointer; color: var(--muted);
+    transition: all 0.2s; font-size: 14px; border-left: 3px solid transparent;
+  }
+  .nav-item:hover { color: var(--text); background: rgba(255,105,180,0.08); }
+  .nav-item.active { color: var(--pink); background: rgba(255,105,180,0.12); border-left-color: var(--pink); }
+  .nav-item .icon { font-size: 18px; width: 22px; text-align: center; }
+
+  .main { margin-left: 220px; padding: 24px; min-height: 100vh; }
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 28px;
+  }
+  .topbar h1 { font-size: 22px; }
+  .guild-selector {
+    display: flex; gap: 8px; align-items: center;
+  }
+  .guild-selector input, .guild-selector select {
+    background: var(--card2); border: 1px solid var(--border); color: var(--text);
+    padding: 8px 12px; border-radius: 8px; font-size: 13px; outline: none;
+  }
+  .btn {
+    background: var(--pink); color: white; border: none;
+    padding: 8px 16px; border-radius: 8px; cursor: pointer;
+    font-size: 13px; font-weight: 600; transition: background 0.2s;
+  }
+  .btn:hover { background: var(--pink-dark); }
+  .btn-outline {
+    background: transparent; border: 1px solid var(--pink); color: var(--pink);
+  }
+  .btn-outline:hover { background: rgba(255,105,180,0.1); }
+
+  .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+  .stat-card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; display: flex; flex-direction: column; gap: 6px;
+  }
+  .stat-card .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-card .value { font-size: 28px; font-weight: 700; }
+  .stat-card .icon { font-size: 24px; margin-bottom: 4px; }
+
+  .section { display: none; }
+  .section.active { display: block; }
+
+  .card {
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; margin-bottom: 20px;
+  }
+  .card h3 { margin-bottom: 16px; font-size: 15px; color: var(--pink); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; padding: 10px 12px; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--border); }
+  td { padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 20px;
+    font-size: 11px; font-weight: 600;
+  }
+  .badge-ban { background: rgba(255,68,68,0.15); color: var(--red); }
+  .badge-kick { background: rgba(255,165,0,0.15); color: orange; }
+  .badge-mute { background: rgba(255,215,0,0.15); color: var(--yellow); }
+  .badge-warn { background: rgba(255,255,0,0.1); color: #FFE033; }
+  .badge-clear { background: rgba(0,255,136,0.1); color: var(--green); }
+
+  .rank-item {
+    display: flex; align-items: center; gap: 14px;
+    padding: 12px 0; border-bottom: 1px solid var(--border);
+  }
+  .rank-item:last-child { border-bottom: none; }
+  .rank-num { width: 28px; text-align: center; font-weight: 700; color: var(--muted); }
+  .rank-num.top1 { color: #FFD700; }
+  .rank-num.top2 { color: #C0C0C0; }
+  .rank-num.top3 { color: #CD7F32; }
+  .rank-info { flex: 1; }
+  .rank-name { font-weight: 600; font-size: 14px; }
+  .rank-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .rank-level { font-size: 20px; font-weight: 700; color: var(--pink); }
+  .xp-bar-wrap { flex: 1; }
+  .xp-bar-bg { background: var(--border); border-radius: 4px; height: 6px; overflow: hidden; }
+  .xp-bar-fill { background: linear-gradient(90deg, var(--pink), #ff9de2); height: 100%; border-radius: 4px; transition: width 0.5s; }
+
+  .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .form-group { display: flex; flex-direction: column; gap: 6px; }
+  .form-group label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .form-group input, .form-group select, .form-group textarea {
+    background: var(--card2); border: 1px solid var(--border); color: var(--text);
+    padding: 10px 12px; border-radius: 8px; font-size: 13px; outline: none;
+    transition: border-color 0.2s;
+  }
+  .form-group input:focus, .form-group textarea:focus { border-color: var(--pink); }
+  .form-group textarea { resize: vertical; min-height: 80px; }
+  .form-group.full { grid-column: 1 / -1; }
+  .form-actions { margin-top: 20px; }
+
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .status-online { background: var(--green); }
+  .status-offline { background: var(--red); }
+
+  .connect-screen {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    min-height: 60vh; gap: 16px; text-align: center;
+  }
+  .connect-screen h2 { font-size: 22px; }
+  .connect-screen p { color: var(--muted); max-width: 400px; }
+  .connect-form { display: flex; flex-direction: column; gap: 12px; width: 360px; }
+  .connect-form input {
+    background: var(--card); border: 1px solid var(--border); color: var(--text);
+    padding: 12px 16px; border-radius: 10px; font-size: 14px; outline: none;
+  }
+  .connect-form input:focus { border-color: var(--pink); }
+  .error-msg { color: var(--red); font-size: 13px; }
+
+  .alert {
+    padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; font-size: 13px;
+    display: none;
+  }
+  .alert-success { background: rgba(0,255,136,0.1); border: 1px solid rgba(0,255,136,0.2); color: var(--green); }
+  .alert-error { background: rgba(255,68,68,0.1); border: 1px solid rgba(255,68,68,0.2); color: var(--red); }
+
+  @media (max-width: 900px) {
+    .stats-grid { grid-template-columns: 1fr 1fr; }
+    .form-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+  <div class="sidebar-header">
+    <img src="https://media.tenor.com/2nt2JWsI2WIAAAAC/neko-cute.gif" alt="neko"/>
+    <div>
+      <h2>Neko Bot</h2>
+      <span id="bot-status"><span class="status-dot status-offline"></span>Desconectado</span>
+    </div>
+  </div>
+  <nav class="nav">
+    <div class="nav-item active" onclick="showSection('stats')"><span class="icon">📊</span> Estadísticas</div>
+    <div class="nav-item" onclick="showSection('ranking')"><span class="icon">🏆</span> Ranking XP</div>
+    <div class="nav-item" onclick="showSection('users')"><span class="icon">👥</span> Usuarios</div>
+    <div class="nav-item" onclick="showSection('modlogs')"><span class="icon">📋</span> Logs de Mod</div>
+    <div class="nav-item" onclick="showSection('settings')"><span class="icon">⚙️</span> Configuración</div>
+  </nav>
+</div>
+
+<div class="main">
+  <div class="topbar">
+    <h1 id="section-title">📊 Estadísticas</h1>
+    <div class="guild-selector">
+      <input id="guild-input" type="text" placeholder="ID del servidor..." style="width:200px"/>
+      <button class="btn" onclick="loadGuild()">Cargar</button>
+    </div>
+  </div>
+
+  <div id="connect-banner" class="connect-screen">
+    <div style="font-size:60px">🐱</div>
+    <h2>Neko Bot Dashboard</h2>
+    <p>Ingresa el ID de tu servidor de Discord y haz clic en <strong>Cargar</strong> para ver las estadísticas.</p>
+    <p style="font-size:12px; color:#666">Tip: El ID del servidor se obtiene haciendo clic derecho sobre el servidor en Discord → "Copiar ID"</p>
+  </div>
+
+  <div id="dashboard-content" style="display:none">
+    <div id="alert-box" class="alert"></div>
+
+    <div id="section-stats" class="section active">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <span class="icon">👥</span>
+          <span class="label">Usuarios con XP</span>
+          <span class="value" id="stat-users">—</span>
+        </div>
+        <div class="stat-card">
+          <span class="icon">💬</span>
+          <span class="label">Mensajes totales</span>
+          <span class="value" id="stat-messages">—</span>
+        </div>
+        <div class="stat-card">
+          <span class="icon">⭐</span>
+          <span class="label">Nivel más alto</span>
+          <span class="value" id="stat-toplevel">—</span>
+        </div>
+        <div class="stat-card">
+          <span class="icon">🔨</span>
+          <span class="label">Acciones de mod</span>
+          <span class="value" id="stat-modactions">—</span>
+        </div>
+      </div>
+      <div class="card">
+        <h3>🐱 Bienvenido al Dashboard de Neko Bot</h3>
+        <p style="color:var(--muted); line-height:1.7; font-size:14px">
+          Este panel te permite monitorear y configurar tu bot sin salir del navegador.<br/>
+          Navega por las secciones del menú lateral para ver el ranking de XP, gestionar usuarios,
+          revisar logs de moderación y ajustar la configuración del servidor.
+        </p>
+      </div>
+    </div>
+
+    <div id="section-ranking" class="section">
+      <div class="card">
+        <h3>🏆 Top 10 — Ranking de XP</h3>
+        <div id="ranking-list"></div>
+      </div>
+    </div>
+
+    <div id="section-users" class="section">
+      <div class="card">
+        <h3>👥 Todos los Usuarios</h3>
+        <table>
+          <thead><tr><th>#</th><th>Usuario</th><th>Nivel</th><th>XP</th><th>Mensajes</th></tr></thead>
+          <tbody id="users-table"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div id="section-modlogs" class="section">
+      <div class="card">
+        <h3>📋 Logs de Moderación</h3>
+        <table>
+          <thead><tr><th>Acción</th><th>Moderador</th><th>Usuario</th><th>Razón</th><th>Fecha</th></tr></thead>
+          <tbody id="modlogs-table"></tbody>
+        </table>
+        <div style="margin-top:12px; display:flex; gap:8px">
+          <button class="btn btn-outline" onclick="loadModlogs(-1)">← Anterior</button>
+          <span id="modlogs-page" style="padding:8px; color:var(--muted); font-size:13px">Página 1</span>
+          <button class="btn btn-outline" onclick="loadModlogs(1)">Siguiente →</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="section-settings" class="section">
+      <div class="card">
+        <h3>⚙️ Configuración del Servidor</h3>
+        <div id="alert-settings" class="alert"></div>
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Prefijo del bot</label>
+            <input id="cfg-prefix" type="text" placeholder="n!"/>
+          </div>
+          <div class="form-group">
+            <label>XP habilitado</label>
+            <select id="cfg-xp">
+              <option value="1">Activado</option>
+              <option value="0">Desactivado</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>ID del canal de bienvenida</label>
+            <input id="cfg-welcome-channel" type="text" placeholder="123456789012345678"/>
+          </div>
+          <div class="form-group">
+            <label>ID del canal de logs</label>
+            <input id="cfg-log-channel" type="text" placeholder="123456789012345678"/>
+          </div>
+          <div class="form-group full">
+            <label>Mensaje de bienvenida</label>
+            <textarea id="cfg-welcome-msg" placeholder="Bienvenido/a {user} al servidor {server}!&#10;&#10;Variables: {user} = mención, {server} = nombre del servidor"></textarea>
+          </div>
+        </div>
+        <div class="form-actions">
+          <button class="btn" onclick="saveSettings()">💾 Guardar Configuración</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API_BASE = window.location.origin;
+const SECRET = "neko_dashboard_secret";
+let currentGuild = "";
+let modlogsPage = 1;
+
+const sectionTitles = {
+  stats: "📊 Estadísticas",
+  ranking: "🏆 Ranking XP",
+  users: "👥 Usuarios",
+  modlogs: "📋 Logs de Moderación",
+  settings: "⚙️ Configuración",
+};
+
+function showSection(name) {
+  document.querySelectorAll(".section").forEach(s => s.classList.remove("active"));
+  document.querySelectorAll(".nav-item").forEach(n => n.classList.remove("active"));
+  document.getElementById("section-" + name).classList.add("active");
+  event.currentTarget.classList.add("active");
+  document.getElementById("section-title").textContent = sectionTitles[name];
+  if (currentGuild) {
+    if (name === "ranking") loadRanking();
+    if (name === "users") loadUsers();
+    if (name === "modlogs") loadModlogs(0);
+    if (name === "settings") loadSettings();
+    if (name === "stats") loadStats();
+  }
+}
+
+async function apiFetch(path, opts = {}) {
+  const url = `/api/dashboard-api${path}`;
+  const res = await fetch(url, {
+    headers: { "X-Dashboard-Secret": SECRET, "Content-Type": "application/json", ...(opts.headers || {}) },
+    ...opts,
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+async function loadGuild() {
+  const gid = document.getElementById("guild-input").value.trim();
+  if (!gid) return;
+  currentGuild = gid;
+  document.getElementById("connect-banner").style.display = "none";
+  document.getElementById("dashboard-content").style.display = "block";
+  document.getElementById("bot-status").innerHTML = '<span class="status-dot status-online"></span>Conectado';
+  loadStats();
+}
+
+async function loadStats() {
+  try {
+    const data = await apiFetch(`/guilds/${currentGuild}/stats`);
+    document.getElementById("stat-users").textContent = data.total_users.toLocaleString();
+    document.getElementById("stat-messages").textContent = data.total_messages.toLocaleString();
+    document.getElementById("stat-toplevel").textContent = data.top_level;
+    document.getElementById("stat-modactions").textContent = data.mod_actions.toLocaleString();
+  } catch(e) { showAlert("Error cargando estadísticas: " + e.message, false); }
+}
+
+function xpForLevel(l) { return 100 * (l + 1) * (l + 2) / 2; }
+
+async function loadRanking() {
+  try {
+    const data = await apiFetch(`/guilds/${currentGuild}/ranking`);
+    const medals = ["🥇","🥈","🥉","4","5","6","7","8","9","10"];
+    const topClasses = ["top1","top2","top3","","","","","","",""];
+    const list = document.getElementById("ranking-list");
+    list.innerHTML = data.slice(0,10).map((u, i) => {
+      const needed = xpForLevel(u.level);
+      const pct = Math.min(100, Math.round(u.xp / Math.max(needed, 1) * 100));
+      return `<div class="rank-item">
+        <div class="rank-num ${topClasses[i]}">${medals[i]}</div>
+        <div class="rank-info">
+          <div class="rank-name">${escHtml(u.username)}</div>
+          <div class="rank-sub">${u.xp.toLocaleString()} XP · ${u.messages.toLocaleString()} mensajes</div>
+          <div style="margin-top:6px"><div class="xp-bar-bg"><div class="xp-bar-fill" style="width:${pct}%"></div></div></div>
+        </div>
+        <div class="rank-level">${u.level}</div>
+      </div>`;
+    }).join("");
+  } catch(e) { showAlert("Error cargando ranking: " + e.message, false); }
+}
+
+async function loadUsers() {
+  try {
+    const data = await apiFetch(`/guilds/${currentGuild}/users`);
+    const tbody = document.getElementById("users-table");
+    tbody.innerHTML = data.map((u, i) => `
+      <tr>
+        <td style="color:var(--muted)">${i+1}</td>
+        <td><strong>${escHtml(u.username)}</strong></td>
+        <td><span style="color:var(--pink);font-weight:700">${u.level}</span></td>
+        <td>${u.xp.toLocaleString()}</td>
+        <td>${u.messages.toLocaleString()}</td>
+      </tr>`).join("");
+  } catch(e) { showAlert("Error cargando usuarios: " + e.message, false); }
+}
+
+async function loadModlogs(delta) {
+  modlogsPage = Math.max(1, modlogsPage + delta);
+  try {
+    const data = await apiFetch(`/guilds/${currentGuild}/modlogs?page=${modlogsPage}`);
+    document.getElementById("modlogs-page").textContent = `Página ${modlogsPage} · ${data.total} acciones totales`;
+    const badgeClass = a => ({BAN:"badge-ban",KICK:"badge-kick",MUTE:"badge-mute",WARN:"badge-warn",CLEAR:"badge-clear"}[a] || "");
+    const tbody = document.getElementById("modlogs-table");
+    tbody.innerHTML = data.logs.map(l => `
+      <tr>
+        <td><span class="badge ${badgeClass(l.action)}">${l.action}</span></td>
+        <td>${escHtml(l.moderator)}</td>
+        <td>${escHtml(l.target)}</td>
+        <td style="color:var(--muted)">${escHtml(l.reason)}</td>
+        <td style="color:var(--muted);font-size:12px">${l.timestamp ? l.timestamp.slice(0,16).replace("T"," ") : ""}</td>
+      </tr>`).join("") || `<tr><td colspan="5" style="color:var(--muted);text-align:center;padding:20px">Sin registros</td></tr>`;
+  } catch(e) { showAlert("Error cargando logs: " + e.message, false); }
+}
+
+async function loadSettings() {
+  try {
+    const d = await apiFetch(`/guilds/${currentGuild}/settings`);
+    document.getElementById("cfg-prefix").value = d.prefix || "n!";
+    document.getElementById("cfg-xp").value = d.xp_enabled;
+    document.getElementById("cfg-welcome-channel").value = d.welcome_channel || "";
+    document.getElementById("cfg-log-channel").value = d.log_channel || "";
+    document.getElementById("cfg-welcome-msg").value = d.welcome_message || "";
+  } catch(e) { showAlert("Error cargando configuración: " + e.message, false, "settings"); }
+}
+
+async function saveSettings() {
+  const payload = {
+    prefix: document.getElementById("cfg-prefix").value,
+    xp_enabled: parseInt(document.getElementById("cfg-xp").value),
+    welcome_channel: document.getElementById("cfg-welcome-channel").value,
+    log_channel: document.getElementById("cfg-log-channel").value,
+    welcome_message: document.getElementById("cfg-welcome-msg").value,
+  };
+  try {
+    await apiFetch(`/guilds/${currentGuild}/settings`, { method: "POST", body: JSON.stringify(payload) });
+    showAlert("✅ Configuración guardada correctamente.", true, "settings");
+  } catch(e) { showAlert("❌ Error guardando: " + e.message, false, "settings"); }
+}
+
+function showAlert(msg, success, target = "main") {
+  const id = target === "settings" ? "alert-settings" : "alert-box";
+  const el = document.getElementById(id);
+  el.className = "alert " + (success ? "alert-success" : "alert-error");
+  el.textContent = msg;
+  el.style.display = "block";
+  setTimeout(() => el.style.display = "none", 4000);
+}
+
+function escHtml(str) {
+  if (!str) return "";
+  return str.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+</script>
+</body>
+</html>
