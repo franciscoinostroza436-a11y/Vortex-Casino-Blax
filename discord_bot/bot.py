@@ -106,6 +106,12 @@ SHOP_ITEMS = {
 
 ROLE_ITEMS = [k for k, v in SHOP_ITEMS.items() if v["category"] == "rol"]
 
+def calc_daily_reward(streak: int) -> int:
+    if streak <= 1:
+        return 5_000
+    day = min(streak, 30)
+    return 50_000 + (day - 2) * 10_000
+
 RED_NUMBERS = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
 BLACK_NUMBERS = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
 
@@ -200,6 +206,10 @@ async def init_db():
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
             except Exception:
                 pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN daily_streak INTEGER DEFAULT 0")
+        except Exception:
+            pass
         try:
             await db.execute("ALTER TABLE users ADD COLUMN bank INTEGER DEFAULT 0")
         except Exception:
@@ -400,12 +410,17 @@ async def balance(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="daily", description="Recoge tu recompensa diaria de 500 monedas")
+@tree.command(name="daily", description="Recoge tu recompensa diaria con racha de días")
 async def daily(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     row = await get_or_create_user(user_id, interaction.user.name)
     last_daily = row[1]
     now = datetime.utcnow()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT daily_streak FROM users WHERE user_id = ?", (user_id,)) as cur:
+            srow = await cur.fetchone()
+            current_streak = (srow[0] or 0) if srow else 0
 
     if last_daily:
         last_dt = datetime.fromisoformat(last_daily)
@@ -418,17 +433,33 @@ async def daily(interaction: discord.Interaction):
             embed.description = f"Ya recogiste tu recompensa diaria.\nVuelve en **{hours}h {minutes}m**."
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
+        new_streak = (current_streak + 1) if diff < timedelta(hours=48) else 1
+    else:
+        new_streak = 1
+
+    if new_streak > 30:
+        new_streak = 1
+
+    reward = calc_daily_reward(new_streak)
+    next_reward = calc_daily_reward(min(new_streak + 1, 30))
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE users SET balance = balance + 500, last_daily = ? WHERE user_id = ?",
-            (now.isoformat(), user_id)
+            "UPDATE users SET balance = balance + ?, last_daily = ?, daily_streak = ? WHERE user_id = ?",
+            (reward, now.isoformat(), new_streak, user_id)
         )
         await db.commit()
 
     bal = await get_balance(user_id)
+    streak_bar = "🔥" * min(new_streak, 10) + ("+" if new_streak > 10 else "")
     embed = discord.Embed(title="🎁 ¡Recompensa Diaria!", color=0x00FF88)
-    embed.description = f"¡Recibiste **500** 🪙!\nSaldo actual: **{bal:,}** 🪙"
+    embed.description = (
+        f"{streak_bar}\n"
+        f"**Día {new_streak}** de racha\n\n"
+        f"💰 Recibiste: **{reward:,}** 🪙\n"
+        f"📅 Mañana (día {min(new_streak+1,30)}): **{next_reward:,}** 🪙\n\n"
+        f"👛 Saldo actual: **{bal:,}** 🪙"
+    )
     await track_mission(user_id, "daily_used")
     await interaction.response.send_message(embed=embed)
 
@@ -2821,12 +2852,16 @@ async def on_message(message: discord.Message):
             )
         await message.channel.send(embed=embed)
 
-    # ,daily — recompensa diaria de 500 monedas (cooldown 24h)
+    # ,daily — recompensa diaria con racha (cooldown 24h)
     elif cmd == "daily":
-        await get_or_create_user(user_id, message.author.name)
         row = await get_or_create_user(user_id, message.author.name)
         last_daily = row[1]
         now = datetime.utcnow()
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT daily_streak FROM users WHERE user_id = ?", (user_id,)) as cur:
+                srow = await cur.fetchone()
+                current_streak = (srow[0] or 0) if srow else 0
 
         if last_daily:
             last_dt = datetime.fromisoformat(last_daily)
@@ -2839,17 +2874,33 @@ async def on_message(message: discord.Message):
                 embed.description = f"Ya recogiste tu recompensa diaria.\nVuelve en **{hours_r}h {mins_r}m**."
                 await message.channel.send(embed=embed)
                 return
+            new_streak = (current_streak + 1) if diff < timedelta(hours=48) else 1
+        else:
+            new_streak = 1
+
+        if new_streak > 30:
+            new_streak = 1
+
+        reward = calc_daily_reward(new_streak)
+        next_reward = calc_daily_reward(min(new_streak + 1, 30))
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "UPDATE users SET balance = balance + 500, last_daily = ? WHERE user_id = ?",
-                (now.isoformat(), user_id)
+                "UPDATE users SET balance = balance + ?, last_daily = ?, daily_streak = ? WHERE user_id = ?",
+                (reward, now.isoformat(), new_streak, user_id)
             )
             await db.commit()
 
         bal = await get_balance(user_id)
+        streak_bar = "🔥" * min(new_streak, 10) + ("+" if new_streak > 10 else "")
         embed = discord.Embed(title="🎁 ¡Recompensa Diaria!", color=0x00FF88)
-        embed.description = f"¡Recibiste **500** 🪙!\nSaldo actual: **{bal:,}** 🪙"
+        embed.description = (
+            f"{streak_bar}\n"
+            f"**Día {new_streak}** de racha\n\n"
+            f"💰 Recibiste: **{reward:,}** 🪙\n"
+            f"📅 Mañana (día {min(new_streak+1,30)}): **{next_reward:,}** 🪙\n\n"
+            f"👛 Saldo actual: **{bal:,}** 🪙"
+        )
         await track_mission(user_id, "daily_used")
         await message.channel.send(embed=embed)
 
