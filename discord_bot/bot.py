@@ -195,7 +195,7 @@ async def init_db():
                 last_collect TEXT
             )
         """)
-        for col in ("last_rob", "last_collect"):
+        for col in ("last_rob", "last_collect", "last_work", "last_slut", "last_crime"):
             try:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
             except Exception:
@@ -2595,6 +2595,233 @@ async def on_message(message: discord.Message):
             f"**{message.author.mention}** le envió **{cantidad:,}** 🪙 a **{target_member.mention}**.\n\n"
             f"👛 Tu nuevo saldo: **{sender_balance - cantidad:,}** 🪙"
         )
+        await message.channel.send(embed=embed)
+
+    # ,work — gana monedas trabajando (cooldown 1h)
+    elif cmd == "work":
+        await get_or_create_user(user_id, message.author.name)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT last_work FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                last_work = row[0] if row else None
+
+        now = datetime.utcnow()
+        if last_work:
+            diff = now - datetime.fromisoformat(last_work)
+            if diff < timedelta(hours=1):
+                remaining = timedelta(hours=1) - diff
+                mins = int(remaining.total_seconds() // 60)
+                secs = int(remaining.total_seconds() % 60)
+                embed = discord.Embed(title="⏰ Aún estás trabajando", color=0xFF4444)
+                embed.description = f"Descansa **{mins}m {secs}s** antes de volver a trabajar."
+                await message.channel.send(embed=embed)
+                return
+
+        earned = random.randint(500, 3000)
+        trabajos = [
+            ("👨‍🍳 Cocinero", f"Preparaste platos toda la noche y ganaste **{earned:,}** 🪙."),
+            ("🚗 Taxista", f"Llevaste pasajeros por toda la ciudad y ganaste **{earned:,}** 🪙."),
+            ("💻 Programador", f"Terminaste un proyecto freelance y ganaste **{earned:,}** 🪙."),
+            ("🎸 Músico", f"Tocaste en una plaza y la gente aplaudió. Ganaste **{earned:,}** 🪙."),
+            ("📦 Repartidor", f"Repartiste 30 pedidos y ganaste **{earned:,}** 🪙."),
+            ("🧹 Limpiador", f"Limpiaste el casino de arriba a abajo. Ganaste **{earned:,}** 🪙."),
+        ]
+        titulo, desc = random.choice(trabajos)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET balance = balance + ?, last_work = ? WHERE user_id = ?",
+                             (earned, now.isoformat(), user_id))
+            await db.commit()
+
+        new_bal = await get_balance(user_id)
+        embed = discord.Embed(title=f"💼 {titulo}", color=0x00FF88)
+        embed.description = f"{desc}\n\n👛 Saldo actual: **{new_bal:,}** 🪙"
+        await message.channel.send(embed=embed)
+
+    # ,slut — 60% ganar / 40% perder (cooldown 30min)
+    elif cmd == "slut":
+        await get_or_create_user(user_id, message.author.name)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT last_slut FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                last_slut = row[0] if row else None
+
+        now = datetime.utcnow()
+        if last_slut:
+            diff = now - datetime.fromisoformat(last_slut)
+            if diff < timedelta(minutes=30):
+                remaining = timedelta(minutes=30) - diff
+                mins = int(remaining.total_seconds() // 60)
+                secs = int(remaining.total_seconds() % 60)
+                embed = discord.Embed(title="⏰ Cooldown Activo", color=0xFF4444)
+                embed.description = f"Espera **{mins}m {secs}s** para volver a intentarlo."
+                await message.channel.send(embed=embed)
+                return
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET last_slut = ? WHERE user_id = ?", (now.isoformat(), user_id))
+            await db.commit()
+
+        success = random.random() < 0.60
+        if success:
+            earned = random.randint(1000, 6000)
+            escenas = [
+                f"💋 Una noche rentable. Ganaste **{earned:,}** 🪙.",
+                f"💄 El cliente quedó satisfecho. Ganaste **{earned:,}** 🪙.",
+                f"🌹 Noche de buenas propinas. Ganaste **{earned:,}** 🪙.",
+            ]
+            await update_balance(user_id, earned)
+            new_bal = await get_balance(user_id)
+            embed = discord.Embed(title="💋 ¡Éxito!", color=0xFF69B4)
+            embed.description = f"{random.choice(escenas)}\n\n👛 Saldo: **{new_bal:,}** 🪙"
+        else:
+            lost = random.randint(500, 2000)
+            bal = await get_balance(user_id)
+            lost = min(lost, bal)
+            await update_balance(user_id, -lost)
+            new_bal = await get_balance(user_id)
+            embed = discord.Embed(title="🚔 ¡Te Pillaron!", color=0xFF4444)
+            embed.description = (
+                f"La policía te arrestó. Multa: **{lost:,}** 🪙.\n\n"
+                f"👛 Saldo: **{new_bal:,}** 🪙"
+            )
+        await message.channel.send(embed=embed)
+
+    # ,crime — 60% ganar / 40% perder (cooldown 1h)
+    elif cmd == "crime":
+        await get_or_create_user(user_id, message.author.name)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT last_crime FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                last_crime = row[0] if row else None
+
+        now = datetime.utcnow()
+        if last_crime:
+            diff = now - datetime.fromisoformat(last_crime)
+            if diff < timedelta(hours=1):
+                remaining = timedelta(hours=1) - diff
+                mins = int(remaining.total_seconds() // 60)
+                secs = int(remaining.total_seconds() % 60)
+                embed = discord.Embed(title="⏰ Cooldown Activo", color=0xFF4444)
+                embed.description = f"Espera **{mins}m {secs}s** antes de cometer otro crimen."
+                await message.channel.send(embed=embed)
+                return
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET last_crime = ? WHERE user_id = ?", (now.isoformat(), user_id))
+            await db.commit()
+
+        success = random.random() < 0.60
+        if success:
+            earned = random.randint(5000, 25000)
+            crimenes = [
+                f"🏦 Asaltaste un banco pequeño y escapaste con **{earned:,}** 🪙.",
+                f"💎 Vendiste joyas robadas en el mercado negro. Ganaste **{earned:,}** 🪙.",
+                f"🎰 Hackeaste una slot machine. Ganaste **{earned:,}** 🪙.",
+                f"🚗 Robaste un auto de lujo y lo vendiste. Ganaste **{earned:,}** 🪙.",
+                f"📱 Estafaste a un coleccionista con NFTs falsos. Ganaste **{earned:,}** 🪙.",
+            ]
+            await update_balance(user_id, earned)
+            new_bal = await get_balance(user_id)
+            embed = discord.Embed(title="🦹 ¡Crimen Exitoso!", color=0x9B59B6)
+            embed.description = f"{random.choice(crimenes)}\n\n👛 Saldo: **{new_bal:,}** 🪙"
+        else:
+            lost = random.randint(2000, 10000)
+            bal = await get_balance(user_id)
+            lost = min(lost, bal)
+            await update_balance(user_id, -lost)
+            new_bal = await get_balance(user_id)
+            fracasos = [
+                f"🚔 La policía te atrapó en pleno acto. Multa: **{lost:,}** 🪙.",
+                f"😬 Tu cómplice te traicionó. Perdiste **{lost:,}** 🪙 en sobornos.",
+                f"🔒 Las cámaras te grabaron. Multa judicial: **{lost:,}** 🪙.",
+            ]
+            embed = discord.Embed(title="🚔 ¡Operación Fallida!", color=0xFF4444)
+            embed.description = f"{random.choice(fracasos)}\n\n👛 Saldo: **{new_bal:,}** 🪙"
+        await message.channel.send(embed=embed)
+
+    # ,rob @usuario
+    elif cmd == "rob":
+        await get_or_create_user(user_id, message.author.name)
+
+        if not message.mentions:
+            await message.channel.send("❌ Menciona al usuario. Ejemplo: `,rob @Alguien`")
+            return
+
+        target = message.mentions[0]
+        if target.id == message.author.id:
+            await message.channel.send("❌ No puedes robarte a ti mismo.")
+            return
+        if target.bot:
+            await message.channel.send("❌ No puedes robarle a un bot.")
+            return
+
+        victim_id = str(target.id)
+        await get_or_create_user(victim_id, target.name)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT last_rob FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                last_rob = row[0] if row else None
+
+        now = datetime.utcnow()
+        if last_rob:
+            diff = now - datetime.fromisoformat(last_rob)
+            if diff < timedelta(hours=1):
+                remaining = timedelta(hours=1) - diff
+                mins = int(remaining.total_seconds() // 60)
+                secs = int(remaining.total_seconds() % 60)
+                embed = discord.Embed(title="⏰ Cooldown Activo", color=0xFF4444)
+                embed.description = f"Espera **{mins}m {secs}s** antes de volver a intentarlo."
+                await message.channel.send(embed=embed)
+                return
+
+        victim_balance = await get_balance(victim_id)
+        if victim_balance < 100:
+            embed = discord.Embed(title="😅 Víctima Sin Fondos", color=0xFFAA00)
+            embed.description = f"**{target.name}** tiene menos de 100 🪙. ¡No vale la pena!"
+            await message.channel.send(embed=embed)
+            return
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET last_rob = ? WHERE user_id = ?", (now.isoformat(), user_id))
+            await db.commit()
+
+        anti_rob_qty = await get_item_quantity(victim_id, "anti_rob")
+        if anti_rob_qty > 0:
+            await remove_from_inventory(victim_id, "anti_rob")
+            embed = discord.Embed(title="🛡️ ¡Robo Bloqueado!", color=0x3498DB)
+            embed.description = (
+                f"**{target.mention}** tenía un **Escudo Anti-Robo** activo.\n"
+                f"¡Tu intento de robo fue bloqueado y el escudo se consumió!"
+            )
+            await message.channel.send(embed=embed)
+            return
+
+        success = random.random() < 0.40
+        if success:
+            pct = random.uniform(0.10, 0.40)
+            stolen = max(1, int(victim_balance * pct))
+            stolen = min(stolen, victim_balance)
+            await update_balance(victim_id, -stolen)
+            await update_balance(user_id, stolen)
+            robber_balance = await get_balance(user_id)
+            embed = discord.Embed(title="🦹 ¡Robo Exitoso!", color=0x00FF88)
+            embed.description = (
+                f"¡Le robaste **{stolen:,}** 🪙 a **{target.mention}**!\n\n"
+                f"Tu saldo: **{robber_balance:,}** 🪙"
+            )
+        else:
+            fine = max(1, int(victim_balance * 0.10))
+            robber_balance = await get_balance(user_id)
+            fine = min(fine, robber_balance)
+            await update_balance(user_id, -fine)
+            embed = discord.Embed(title="🚔 ¡Te Atraparon!", color=0xFF4444)
+            embed.description = (
+                f"Intentaste robar a **{target.mention}** pero te atraparon.\n"
+                f"Multa: **{fine:,}** 🪙\n\n"
+                f"Tu saldo: **{robber_balance - fine:,}** 🪙"
+            )
         await message.channel.send(embed=embed)
 
 
