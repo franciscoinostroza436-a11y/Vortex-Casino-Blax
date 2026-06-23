@@ -2461,6 +2461,142 @@ async def on_message(message: discord.Message):
         embed = bj_embed(player_hand, dealer_hand, cantidad)
         await message.channel.send(embed=embed, view=view)
 
+    # ,dep <cantidad|all>
+    elif cmd == "dep":
+        await get_or_create_user(user_id, message.author.name)
+        wallet = await get_balance(user_id)
+
+        if not args:
+            await message.channel.send("❌ Uso: `,dep <cantidad|all>`\nEjemplo: `,dep all` o `,dep 5000`")
+            return
+
+        amount_str = args[0].lower()
+        if amount_str == "all":
+            amount = wallet
+        else:
+            try:
+                amount = int(amount_str)
+            except ValueError:
+                await message.channel.send("❌ Escribe un número o `all`. Ejemplo: `,dep all`")
+                return
+
+        if amount <= 0:
+            await message.channel.send("❌ La cantidad debe ser mayor a 0.")
+            return
+        if amount > wallet:
+            embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
+            embed.description = f"Solo tienes **{wallet:,}** 🪙 en cartera."
+            await message.channel.send(embed=embed)
+            return
+
+        await update_balance(user_id, -amount)
+        await update_bank(user_id, amount)
+        new_wallet = await get_balance(user_id)
+        new_bank = await get_bank(user_id)
+
+        embed = discord.Embed(title="🏦 Depósito Exitoso", color=0x3498DB)
+        embed.description = f"Depositaste **{amount:,}** 🪙 en el banco.\n"
+        embed.add_field(name="👛 Cartera", value=f"**{new_wallet:,}** 🪙", inline=True)
+        embed.add_field(name="🏦 Banco", value=f"**{new_bank:,}** 🪙", inline=True)
+        embed.set_footer(text="El banco está protegido contra robos")
+        await message.channel.send(embed=embed)
+
+    # ,withdraw <cantidad|all>
+    elif cmd == "withdraw":
+        await get_or_create_user(user_id, message.author.name)
+        bank_bal = await get_bank(user_id)
+
+        if not args:
+            await message.channel.send("❌ Uso: `,withdraw <cantidad|all>`\nEjemplo: `,withdraw all` o `,withdraw 5000`")
+            return
+
+        amount_str = args[0].lower()
+        if amount_str == "all":
+            amount = bank_bal
+        else:
+            try:
+                amount = int(amount_str)
+            except ValueError:
+                await message.channel.send("❌ Escribe un número o `all`. Ejemplo: `,withdraw all`")
+                return
+
+        if amount <= 0:
+            await message.channel.send("❌ La cantidad debe ser mayor a 0.")
+            return
+        if amount > bank_bal:
+            embed = discord.Embed(title="❌ Saldo Bancario Insuficiente", color=0xFF4444)
+            embed.description = f"Solo tienes **{bank_bal:,}** 🪙 en el banco."
+            await message.channel.send(embed=embed)
+            return
+
+        await update_bank(user_id, -amount)
+        await update_balance(user_id, amount)
+        new_wallet = await get_balance(user_id)
+        new_bank = await get_bank(user_id)
+
+        embed = discord.Embed(title="🏦 Retiro Exitoso", color=0x00FF88)
+        embed.description = f"Retiraste **{amount:,}** 🪙 del banco a tu cartera.\n"
+        embed.add_field(name="👛 Cartera", value=f"**{new_wallet:,}** 🪙", inline=True)
+        embed.add_field(name="🏦 Banco", value=f"**{new_bank:,}** 🪙", inline=True)
+        await message.channel.send(embed=embed)
+
+    # ,pay @usuario <cantidad|all>
+    elif cmd == "pay":
+        await get_or_create_user(user_id, message.author.name)
+
+        # Necesitamos al menos 2 args: @usuario y cantidad
+        if len(args) < 2:
+            await message.channel.send("❌ Uso: `,pay @usuario <cantidad|all>`\nEjemplo: `,pay @Alguien all` o `,pay @Alguien 5000`")
+            return
+
+        # Resolver el usuario mencionado
+        target_member = None
+        if message.mentions:
+            target_member = message.mentions[0]
+        else:
+            await message.channel.send("❌ Menciona al usuario. Ejemplo: `,pay @Alguien 5000`")
+            return
+
+        if target_member.id == message.author.id:
+            await message.channel.send("❌ No puedes transferirte dinero a ti mismo.")
+            return
+        if target_member.bot:
+            await message.channel.send("❌ No puedes enviarle monedas a un bot.")
+            return
+
+        sender_balance = await get_balance(user_id)
+        # La cantidad es el último argumento (puede ser "all" o número)
+        amount_str = args[-1].lower()
+        if amount_str == "all":
+            cantidad = sender_balance
+        else:
+            try:
+                cantidad = int(amount_str)
+            except ValueError:
+                await message.channel.send("❌ Escribe un número o `all`. Ejemplo: `,pay @Alguien all`")
+                return
+
+        if cantidad <= 0:
+            await message.channel.send("❌ La cantidad debe ser mayor a 0.")
+            return
+        if sender_balance < cantidad:
+            embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
+            embed.description = f"Tienes **{sender_balance:,}** 🪙 y quieres enviar **{cantidad:,}** 🪙."
+            await message.channel.send(embed=embed)
+            return
+
+        receiver_id = str(target_member.id)
+        await get_or_create_user(receiver_id, target_member.name)
+        await update_balance(user_id, -cantidad)
+        await update_balance(receiver_id, cantidad)
+
+        embed = discord.Embed(title="💸 Transferencia Exitosa", color=0x00FF88)
+        embed.description = (
+            f"**{message.author.mention}** le envió **{cantidad:,}** 🪙 a **{target_member.mention}**.\n\n"
+            f"👛 Tu nuevo saldo: **{sender_balance - cantidad:,}** 🪙"
+        )
+        await message.channel.send(embed=embed)
+
 
 if __name__ == "__main__":
     if not TOKEN:
