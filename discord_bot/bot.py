@@ -70,6 +70,38 @@ SHOP_ITEMS = {
         "collect_bonus": 1500,
         "collect_hours": 6,
     },
+    "role_bronce": {
+        "name": "🥉 Rol: Bronce",
+        "price": 50_000_000,
+        "description": "Gana **+50,000,000** 🪙 cada 4h con `/collect`.",
+        "category": "rol",
+        "collect_bonus": 50_000_000,
+        "collect_hours": 4,
+    },
+    "role_plata": {
+        "name": "🥈 Rol: Plata",
+        "price": 150_000_000,
+        "description": "Gana **+50,000,000** 🪙 cada 4h con `/collect`.",
+        "category": "rol",
+        "collect_bonus": 50_000_000,
+        "collect_hours": 4,
+    },
+    "role_oro": {
+        "name": "🥇 Rol: Oro",
+        "price": 200_000_000,
+        "description": "Gana **+50,000,000** 🪙 cada 4h con `/collect`.",
+        "category": "rol",
+        "collect_bonus": 50_000_000,
+        "collect_hours": 4,
+    },
+    "role_diamante": {
+        "name": "💎 Rol: Diamante",
+        "price": 250_000_000,
+        "description": "Gana **+50,000,000** 🪙 cada 4h con `/collect`.",
+        "category": "rol",
+        "collect_bonus": 50_000_000,
+        "collect_hours": 4,
+    },
 }
 
 ROLE_ITEMS = [k for k, v in SHOP_ITEMS.items() if v["category"] == "rol"]
