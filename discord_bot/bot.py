@@ -176,8 +176,11 @@ USE_FLAVOR = {
 }
 
 intents = discord.Intents.default()
+intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+
+PREFIX = ","
 
 
 async def init_db():
@@ -2228,6 +2231,235 @@ async def help_cmd(interaction: discord.Interaction):
 
     embed.set_footer(text="🏦 El banco es seguro contra robos  •  Casino Bot")
     await interaction.response.send_message(embed=embed)
+
+
+@client.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if not message.content.startswith(PREFIX):
+        return
+
+    content = message.content[len(PREFIX):].strip()
+    parts = content.split()
+    if not parts:
+        return
+
+    cmd = parts[0].lower()
+    args = parts[1:]
+    user_id = str(message.author.id)
+
+    # ,bal
+    if cmd == "bal":
+        await get_or_create_user(user_id, message.author.name)
+        bal = await get_balance(user_id)
+        bank_bal = await get_bank(user_id)
+        total = bal + bank_bal
+        embed = discord.Embed(title="💰 Tu Saldo", color=0xFFD700)
+        embed.add_field(name="👛 Cartera", value=f"**{bal:,}** 🪙", inline=True)
+        embed.add_field(name="🏦 Banco", value=f"**{bank_bal:,}** 🪙", inline=True)
+        embed.add_field(name="📊 Total", value=f"**{total:,}** 🪙", inline=True)
+        embed.set_footer(text=f"Casino Bot • {message.author.name} • El banco es seguro contra robos")
+        await message.channel.send(embed=embed)
+
+    # ,shop
+    elif cmd == "shop":
+        embed = discord.Embed(title="🏪 Tienda del Casino", color=0x9B59B6)
+        embed.description = "Usa `,buy <id_item>` o `/buy <id_item>` para comprar. Los roles se usan con `,collect`.\n"
+        categorias = {
+            "proteccion": "🛡️ Protección",
+            "rol": "👑 Roles con /collect",
+            "decorativo": "🎭 Decorativos",
+        }
+        for cat_key, cat_name in categorias.items():
+            items_in_cat = [(k, v) for k, v in SHOP_ITEMS.items() if v["category"] == cat_key]
+            if not items_in_cat:
+                continue
+            lines = [
+                f"**{item['name']}** — {item['price']:,} 🪙\n{item['description']}\n`ID: {item_id}`"
+                for item_id, item in items_in_cat
+            ]
+            embed.add_field(name=cat_name, value="\n\n".join(lines), inline=False)
+        await message.channel.send(embed=embed)
+
+    # ,collect
+    elif cmd == "collect":
+        await get_or_create_user(user_id, message.author.name)
+        owned_roles = []
+        for role_id in ROLE_ITEMS:
+            qty = await get_item_quantity(user_id, role_id)
+            if qty > 0:
+                owned_roles.append(role_id)
+
+        if not owned_roles:
+            embed = discord.Embed(title="❌ Sin Roles", color=0xFF4444)
+            embed.description = (
+                "No tienes ningún rol activo.\n"
+                "Compra un rol en `,shop` para ganar monedas con `,collect`."
+            )
+            await message.channel.send(embed=embed)
+            return
+
+        min_hours = min(SHOP_ITEMS[r]["collect_hours"] for r in owned_roles)
+        total_bonus = sum(SHOP_ITEMS[r]["collect_bonus"] for r in owned_roles)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT last_collect FROM users WHERE user_id = ?", (user_id,)) as cursor:
+                row = await cursor.fetchone()
+                last_collect = row[0] if row else None
+
+        now = datetime.utcnow()
+        if last_collect:
+            last_dt = datetime.fromisoformat(last_collect)
+            diff = now - last_dt
+            if diff < timedelta(hours=min_hours):
+                remaining = timedelta(hours=min_hours) - diff
+                hrs, remainder = divmod(int(remaining.total_seconds()), 3600)
+                mins = remainder // 60
+                embed = discord.Embed(title="⏰ Collect No Disponible", color=0xFF4444)
+                embed.description = f"Ya recogiste tus ganancias.\nVuelve en **{hrs}h {mins}m**."
+                await message.channel.send(embed=embed)
+                return
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET balance = balance + ?, last_collect = ? WHERE user_id = ?",
+                (total_bonus, now.isoformat(), user_id)
+            )
+            await db.commit()
+
+        new_balance = await get_balance(user_id)
+        embed = discord.Embed(title="💰 ¡Ganancias Recogidas!", color=0x00FF88)
+        lines = "\n".join(
+            f"{SHOP_ITEMS[r]['name']} → +**{SHOP_ITEMS[r]['collect_bonus']:,}** 🪙"
+            for r in owned_roles
+        )
+        embed.description = (
+            f"{lines}\n\n"
+            f"**Total:** +**{total_bonus:,}** 🪙\n"
+            f"Saldo actual: **{new_balance:,}** 🪙"
+        )
+        await message.channel.send(embed=embed)
+
+    # ,roulette <cantidad|all> <red|rojo|black|negro>
+    elif cmd == "roulette":
+        await get_or_create_user(user_id, message.author.name)
+        bal = await get_balance(user_id)
+
+        args_str = " ".join(args).lower()
+        amount = None
+        color = None
+
+        if "all" in args_str:
+            amount = bal
+        if "red" in args_str or "rojo" in args_str:
+            color = "rojo"
+        elif "black" in args_str or "negro" in args_str:
+            color = "negro"
+
+        if amount is None:
+            for a in args:
+                try:
+                    amount = int(a)
+                    break
+                except ValueError:
+                    pass
+
+        if amount is None or color is None:
+            await message.channel.send("❌ Uso: `,roulette <cantidad|all> <red|black>`\nEjemplo: `,roulette all red` o `,roulette 1000 black`")
+            return
+        if amount <= 0:
+            await message.channel.send("❌ La apuesta debe ser mayor a 0.")
+            return
+        if bal < amount:
+            embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
+            embed.description = f"Tienes **{bal:,}** 🪙 y quieres apostar **{amount:,}** 🪙."
+            await message.channel.send(embed=embed)
+            return
+
+        numero = random.randint(0, 36)
+        if numero == 0:
+            resultado_color = "verde"
+            emoji = "🟢"
+        elif numero in RED_NUMBERS:
+            resultado_color = "rojo"
+            emoji = "🔴"
+        else:
+            resultado_color = "negro"
+            emoji = "⚫"
+
+        gano = resultado_color == color
+        if gano:
+            await update_balance(user_id, amount)
+            new_balance = bal + amount
+            embed = discord.Embed(title="🎰 ¡GANASTE!", color=0x00FF88)
+            embed.description = (
+                f"La ruleta cayó en **{emoji} {numero} ({resultado_color})**\n"
+                f"Apostaste: **{color}** ✅\n\n"
+                f"💰 Ganaste **{amount:,}** 🪙\n"
+                f"Saldo actual: **{new_balance:,}** 🪙"
+            )
+        else:
+            await update_balance(user_id, -amount)
+            new_balance = bal - amount
+            embed = discord.Embed(title="🎰 Perdiste...", color=0xFF4444)
+            embed.description = (
+                f"La ruleta cayó en **{emoji} {numero} ({resultado_color})**\n"
+                f"Apostaste: **{color}** ❌\n\n"
+                f"💸 Perdiste **{amount:,}** 🪙\n"
+                f"Saldo actual: **{new_balance:,}** 🪙"
+            )
+
+        await track_mission(user_id, "roulette_played")
+        await message.channel.send(embed=embed)
+
+    # ,bj <cantidad|all>
+    elif cmd == "bj":
+        await get_or_create_user(user_id, message.author.name)
+        bal = await get_balance(user_id)
+
+        if not args:
+            await message.channel.send("❌ Uso: `,bj <cantidad|all>`\nEjemplo: `,bj all` o `,bj 5000`")
+            return
+
+        amount_str = args[0].lower()
+        if amount_str == "all":
+            cantidad = bal
+        else:
+            try:
+                cantidad = int(amount_str)
+            except ValueError:
+                await message.channel.send("❌ Uso: `,bj <cantidad|all>`")
+                return
+
+        if cantidad <= 0:
+            await message.channel.send("❌ La apuesta debe ser mayor a 0.")
+            return
+        if bal < cantidad:
+            embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
+            embed.description = f"Tienes **{bal:,}** 🪙 y quieres apostar **{cantidad:,}** 🪙."
+            await message.channel.send(embed=embed)
+            return
+
+        await update_balance(user_id, -cantidad)
+        deck = new_deck()
+        player_hand = [deck.pop(), deck.pop()]
+        dealer_hand = [deck.pop(), deck.pop()]
+        player_total = hand_total(player_hand)
+
+        if player_total == 21:
+            payout = int(cantidad * 1.5)
+            await update_balance(user_id, cantidad + payout)
+            await track_mission(user_id, "blackjack_won")
+            new_balance = await get_balance(user_id)
+            embed = bj_embed(player_hand, dealer_hand, cantidad, reveal_dealer=True,
+                             result_msg=f"🃏 ¡BLACKJACK! Ganas **{payout:,}** 🪙 extra!\nSaldo: **{new_balance:,}** 🪙")
+            await message.channel.send(embed=embed)
+            return
+
+        view = BlackjackView(user_id, cantidad, player_hand, dealer_hand, deck, bal)
+        embed = bj_embed(player_hand, dealer_hand, cantidad)
+        await message.channel.send(embed=embed, view=view)
 
 
 if __name__ == "__main__":
