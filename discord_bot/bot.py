@@ -81,25 +81,25 @@ SHOP_ITEMS = {
     "role_plata": {
         "name": "🥈 Rol: Plata",
         "price": 150_000_000,
-        "description": "Gana **+50,000,000** 🪙 cada 4h con `/collect`.",
+        "description": "Gana **+60,000,000** 🪙 cada 4h con `/collect`.",
         "category": "rol",
-        "collect_bonus": 50_000_000,
+        "collect_bonus": 60_000_000,
         "collect_hours": 4,
     },
     "role_oro": {
         "name": "🥇 Rol: Oro",
         "price": 200_000_000,
-        "description": "Gana **+50,000,000** 🪙 cada 4h con `/collect`.",
+        "description": "Gana **+70,000,000** 🪙 cada 4h con `/collect`.",
         "category": "rol",
-        "collect_bonus": 50_000_000,
+        "collect_bonus": 70_000_000,
         "collect_hours": 4,
     },
     "role_diamante": {
         "name": "💎 Rol: Diamante",
         "price": 250_000_000,
-        "description": "Gana **+50,000,000** 🪙 cada 4h con `/collect`.",
+        "description": "Gana **+160,000,000** 🪙 cada 4h con `/collect`.",
         "category": "rol",
-        "collect_bonus": 50_000_000,
+        "collect_bonus": 160_000_000,
         "collect_hours": 4,
     },
 }
@@ -964,6 +964,51 @@ async def leaderboard(interaction: discord.Interaction):
         description += f"{prefix} **{username}** — {bal:,} 🪙\n"
     embed.description = description
     embed.set_footer(text="Top 10 jugadores más ricos")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="ranking", description="Top 10 jugadores más ricos con sus roles")
+async def ranking(interaction: discord.Interaction):
+    ROLE_BADGES = {
+        "role_diamante": "💎",
+        "role_oro": "🥇",
+        "role_plata": "🥈",
+        "role_bronce": "🥉",
+        "role_supremo": "👑",
+        "role_viciado": "🎮",
+        "role_vip": "🎩",
+    }
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, username, balance FROM users ORDER BY balance DESC LIMIT 10"
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        if not rows:
+            await interaction.response.send_message("❌ No hay usuarios registrados aún.", ephemeral=True)
+            return
+
+        user_roles: dict[str, list[str]] = {}
+        for uid, _, _ in rows:
+            async with db.execute(
+                "SELECT item_id FROM inventory WHERE user_id = ? AND quantity > 0",
+                (uid,)
+            ) as cur:
+                inv = await cur.fetchall()
+            badges = [ROLE_BADGES[item[0]] for item in inv if item[0] in ROLE_BADGES]
+            user_roles[uid] = badges
+
+    medals = ["🥇", "🥈", "🥉"]
+    embed = discord.Embed(title="🏆 Ranking del Casino", color=0xFFD700)
+    description = ""
+    for i, (uid, username, bal) in enumerate(rows):
+        prefix = medals[i] if i < 3 else f"**#{i+1}**"
+        badges_str = " ".join(user_roles.get(uid, []))
+        role_part = f" {badges_str}" if badges_str else ""
+        description += f"{prefix} **{username}**{role_part} — **{bal:,}** 🪙\n"
+    embed.description = description
+    embed.set_footer(text="Usa /shop para comprar roles y destacarte en el ranking")
     await interaction.response.send_message(embed=embed)
 
 
