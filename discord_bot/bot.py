@@ -2608,16 +2608,15 @@ async def on_message(message: discord.Message):
         now = datetime.utcnow()
         if last_work:
             diff = now - datetime.fromisoformat(last_work)
-            if diff < timedelta(hours=1):
-                remaining = timedelta(hours=1) - diff
-                mins = int(remaining.total_seconds() // 60)
-                secs = int(remaining.total_seconds() % 60)
+            if diff < timedelta(seconds=30):
+                remaining = timedelta(seconds=30) - diff
+                secs = int(remaining.total_seconds())
                 embed = discord.Embed(title="⏰ Aún estás trabajando", color=0xFF4444)
-                embed.description = f"Descansa **{mins}m {secs}s** antes de volver a trabajar."
+                embed.description = f"Descansa **{secs}s** antes de volver a trabajar."
                 await message.channel.send(embed=embed)
                 return
 
-        earned = random.randint(500, 3000)
+        earned = random.randint(1000, 100000)
         trabajos = [
             ("👨‍🍳 Cocinero", f"Preparaste platos toda la noche y ganaste **{earned:,}** 🪙."),
             ("🚗 Taxista", f"Llevaste pasajeros por toda la ciudad y ganaste **{earned:,}** 🪙."),
@@ -2649,12 +2648,11 @@ async def on_message(message: discord.Message):
         now = datetime.utcnow()
         if last_slut:
             diff = now - datetime.fromisoformat(last_slut)
-            if diff < timedelta(minutes=30):
-                remaining = timedelta(minutes=30) - diff
-                mins = int(remaining.total_seconds() // 60)
-                secs = int(remaining.total_seconds() % 60)
+            if diff < timedelta(seconds=30):
+                remaining = timedelta(seconds=30) - diff
+                secs = int(remaining.total_seconds())
                 embed = discord.Embed(title="⏰ Cooldown Activo", color=0xFF4444)
-                embed.description = f"Espera **{mins}m {secs}s** para volver a intentarlo."
+                embed.description = f"Espera **{secs}s** para volver a intentarlo."
                 await message.channel.send(embed=embed)
                 return
 
@@ -2664,7 +2662,7 @@ async def on_message(message: discord.Message):
 
         success = random.random() < 0.60
         if success:
-            earned = random.randint(1000, 6000)
+            earned = random.randint(1000, 100000)
             escenas = [
                 f"💋 Una noche rentable. Ganaste **{earned:,}** 🪙.",
                 f"💄 El cliente quedó satisfecho. Ganaste **{earned:,}** 🪙.",
@@ -2675,7 +2673,7 @@ async def on_message(message: discord.Message):
             embed = discord.Embed(title="💋 ¡Éxito!", color=0xFF69B4)
             embed.description = f"{random.choice(escenas)}\n\n👛 Saldo: **{new_bal:,}** 🪙"
         else:
-            lost = random.randint(500, 2000)
+            lost = random.randint(1000, 100000)
             bal = await get_balance(user_id)
             lost = min(lost, bal)
             await update_balance(user_id, -lost)
@@ -2698,12 +2696,11 @@ async def on_message(message: discord.Message):
         now = datetime.utcnow()
         if last_crime:
             diff = now - datetime.fromisoformat(last_crime)
-            if diff < timedelta(hours=1):
-                remaining = timedelta(hours=1) - diff
-                mins = int(remaining.total_seconds() // 60)
-                secs = int(remaining.total_seconds() % 60)
+            if diff < timedelta(seconds=30):
+                remaining = timedelta(seconds=30) - diff
+                secs = int(remaining.total_seconds())
                 embed = discord.Embed(title="⏰ Cooldown Activo", color=0xFF4444)
-                embed.description = f"Espera **{mins}m {secs}s** antes de cometer otro crimen."
+                embed.description = f"Espera **{secs}s** antes de cometer otro crimen."
                 await message.channel.send(embed=embed)
                 return
 
@@ -2713,7 +2710,7 @@ async def on_message(message: discord.Message):
 
         success = random.random() < 0.60
         if success:
-            earned = random.randint(5000, 25000)
+            earned = random.randint(1000, 100000)
             crimenes = [
                 f"🏦 Asaltaste un banco pequeño y escapaste con **{earned:,}** 🪙.",
                 f"💎 Vendiste joyas robadas en el mercado negro. Ganaste **{earned:,}** 🪙.",
@@ -2726,7 +2723,7 @@ async def on_message(message: discord.Message):
             embed = discord.Embed(title="🦹 ¡Crimen Exitoso!", color=0x9B59B6)
             embed.description = f"{random.choice(crimenes)}\n\n👛 Saldo: **{new_bal:,}** 🪙"
         else:
-            lost = random.randint(2000, 10000)
+            lost = random.randint(1000, 100000)
             bal = await get_balance(user_id)
             lost = min(lost, bal)
             await update_balance(user_id, -lost)
@@ -2823,6 +2820,121 @@ async def on_message(message: discord.Message):
                 f"Tu saldo: **{robber_balance - fine:,}** 🪙"
             )
         await message.channel.send(embed=embed)
+
+    # ,daily — recompensa diaria de 500 monedas (cooldown 24h)
+    elif cmd == "daily":
+        await get_or_create_user(user_id, message.author.name)
+        row = await get_or_create_user(user_id, message.author.name)
+        last_daily = row[1]
+        now = datetime.utcnow()
+
+        if last_daily:
+            last_dt = datetime.fromisoformat(last_daily)
+            diff = now - last_dt
+            if diff < timedelta(hours=24):
+                remaining = timedelta(hours=24) - diff
+                hours_r, rem = divmod(int(remaining.total_seconds()), 3600)
+                mins_r = rem // 60
+                embed = discord.Embed(title="⏰ Recompensa No Disponible", color=0xFF4444)
+                embed.description = f"Ya recogiste tu recompensa diaria.\nVuelve en **{hours_r}h {mins_r}m**."
+                await message.channel.send(embed=embed)
+                return
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET balance = balance + 500, last_daily = ? WHERE user_id = ?",
+                (now.isoformat(), user_id)
+            )
+            await db.commit()
+
+        bal = await get_balance(user_id)
+        embed = discord.Embed(title="🎁 ¡Recompensa Diaria!", color=0x00FF88)
+        embed.description = f"¡Recibiste **500** 🪙!\nSaldo actual: **{bal:,}** 🪙"
+        await track_mission(user_id, "daily_used")
+        await message.channel.send(embed=embed)
+
+    # ,duel @usuario <cantidad>
+    elif cmd == "duel":
+        await get_or_create_user(user_id, message.author.name)
+
+        if not message.mentions or len(args) < 2:
+            await message.channel.send("❌ Uso: `,duel @usuario <cantidad>`\nEjemplo: `,duel @Alguien 5000`")
+            return
+
+        target = message.mentions[0]
+        if target.id == message.author.id:
+            await message.channel.send("❌ No puedes retarte a ti mismo.")
+            return
+        if target.bot:
+            await message.channel.send("❌ No puedes retar a un bot.")
+            return
+
+        try:
+            cantidad = int(args[-1])
+        except ValueError:
+            await message.channel.send("❌ Escribe una cantidad válida. Ejemplo: `,duel @Alguien 5000`")
+            return
+
+        if cantidad <= 0:
+            await message.channel.send("❌ La apuesta debe ser mayor a 0.")
+            return
+
+        challenger_balance = await get_balance(user_id)
+        if challenger_balance < cantidad:
+            embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
+            embed.description = f"Necesitas **{cantidad:,}** 🪙 y tienes **{challenger_balance:,}** 🪙."
+            await message.channel.send(embed=embed)
+            return
+
+        await get_or_create_user(str(target.id), target.name)
+
+        embed = discord.Embed(title="⚔️ ¡Duelo de Dados!", color=0xE74C3C)
+        embed.description = (
+            f"**{message.author.mention}** reta a **{target.mention}** a un duelo de dados.\n\n"
+            f"🎲 Cada jugador lanzará un dado del 1 al 6\n"
+            f"🏆 El mayor número gana todo\n"
+            f"🤝 Si empatan, se devuelve la apuesta\n\n"
+            f"💰 Apuesta: **{cantidad:,}** 🪙 cada uno\n"
+            f"🏆 Premio total: **{cantidad*2:,}** 🪙\n\n"
+            f"{target.mention}, tienes **60 segundos** para aceptar o rechazar."
+        )
+        view = DuelChallengeView(
+            challenger_id=user_id,
+            challenger_name=message.author.name,
+            challenged=target,
+            bet=cantidad,
+        )
+        await message.channel.send(embed=embed, view=view)
+
+    # ,torneo <entrada>
+    elif cmd == "torneo":
+        await get_or_create_user(user_id, message.author.name)
+
+        if not args:
+            await message.channel.send("❌ Uso: `,torneo <entrada>`\nEjemplo: `,torneo 5000`")
+            return
+
+        try:
+            entrada = int(args[0])
+        except ValueError:
+            await message.channel.send("❌ Escribe una cantidad válida. Ejemplo: `,torneo 5000`")
+            return
+
+        if entrada <= 0:
+            await message.channel.send("❌ El costo de entrada debe ser mayor a 0.")
+            return
+
+        bal = await get_balance(user_id)
+        if bal < entrada:
+            await message.channel.send(f"❌ Necesitas **{entrada:,}** 🪙 para crear el torneo. Tienes **{bal:,}** 🪙.")
+            return
+
+        await update_balance(user_id, -entrada)
+        view = TournamentView(host_id=user_id, host_name=message.author.display_name, buy_in=entrada)
+        view.players.append((user_id, message.author.display_name))
+
+        sent = await message.channel.send(embed=view.make_embed(), view=view)
+        view.message = sent
 
 
 if __name__ == "__main__":
