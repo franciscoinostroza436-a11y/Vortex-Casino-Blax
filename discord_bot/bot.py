@@ -224,6 +224,25 @@ async def init_db():
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS lottery_tickets (
+                user_id TEXT PRIMARY KEY,
+                username TEXT,
+                tickets INTEGER DEFAULT 0
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS lottery_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS lottery_channels (
+                guild_id TEXT PRIMARY KEY,
+                channel_id TEXT
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS missions (
                 user_id TEXT,
                 mission_id TEXT,
@@ -388,10 +407,83 @@ async def get_missions_data(user_id: str) -> list:
     return results
 
 
+LOTTERY_TICKET_PRICE = 10_000
+
+async def run_lottery_draw():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id, username, tickets FROM lottery_tickets WHERE tickets > 0") as cur:
+            participants = await cur.fetchall()
+
+    if not participants:
+        return
+
+    pool = []
+    for uid, uname, tix in participants:
+        pool.extend([uid] * tix)
+
+    winner_id = random.choice(pool)
+    winner_name = next(u for u, n, t in participants if u == winner_id)[1] if False else \
+        next(n for u, n, t in participants if u == winner_id)
+    total_tickets = sum(t for _, _, t in participants)
+    pot = total_tickets * LOTTERY_TICKET_PRICE
+
+    await update_balance(winner_id, pot)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM lottery_tickets")
+        await db.execute("INSERT OR REPLACE INTO lottery_meta (key, value) VALUES ('last_draw', ?)",
+                         (datetime.utcnow().isoformat(),))
+        await db.commit()
+
+    embed = discord.Embed(title="🎰 ¡SORTEO DE LOTERÍA!", color=0xFFD700)
+    embed.description = (
+        f"🏆 **¡<@{winner_id}> gana la lotería!**\n\n"
+        f"💰 Premio: **{pot:,}** 🪙\n"
+        f"🎟️ Boletos vendidos: **{total_tickets:,}**\n"
+        f"👥 Participantes: **{len(participants)}**\n\n"
+        f"_El próximo sorteo es en **7 días**. Usa `,lottery` para participar._"
+    )
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT channel_id FROM lottery_channels") as cur:
+            channels = await cur.fetchall()
+
+    for (ch_id,) in channels:
+        ch = client.get_channel(int(ch_id))
+        if ch:
+            try:
+                await ch.send(embed=embed)
+            except Exception:
+                pass
+
+
+async def lottery_loop():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        await asyncio.sleep(60)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT value FROM lottery_meta WHERE key = 'last_draw'") as cur:
+                row = await cur.fetchone()
+                last_draw = row[0] if row else None
+
+        now = datetime.utcnow()
+        if last_draw is None:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("INSERT OR IGNORE INTO lottery_meta (key, value) VALUES ('last_draw', ?)",
+                                 (now.isoformat(),))
+                await db.commit()
+            continue
+
+        last_dt = datetime.fromisoformat(last_draw)
+        if (now - last_dt) >= timedelta(days=7):
+            await run_lottery_draw()
+
+
 @client.event
 async def on_ready():
     await init_db()
     await tree.sync()
+    asyncio.create_task(lottery_loop())
     print(f"Bot conectado como {client.user}")
 
 
@@ -2986,6 +3078,117 @@ async def on_message(message: discord.Message):
 
         sent = await message.channel.send(embed=view.make_embed(), view=view)
         view.message = sent
+
+    # ,lottery [cantidad|info]
+    elif cmd in ("lottery", "loto", "loteria", "lotería"):
+        await get_or_create_user(user_id, message.author.name)
+
+        sub = args[0].lower() if args else ""
+
+        # ,lottery info — ver estado del bote
+        if sub == "info":
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute("SELECT SUM(tickets), COUNT(*) FROM lottery_tickets WHERE tickets > 0") as cur:
+                    row = await cur.fetchone()
+                    total_tickets = row[0] or 0
+                    total_players = row[1] or 0
+                async with db.execute("SELECT tickets FROM lottery_tickets WHERE user_id = ?", (user_id,)) as cur:
+                    trow = await cur.fetchone()
+                    my_tickets = (trow[0] or 0) if trow else 0
+                async with db.execute("SELECT value FROM lottery_meta WHERE key = 'last_draw'") as cur:
+                    mrow = await cur.fetchone()
+                    last_draw = mrow[0] if mrow else None
+
+            pot = total_tickets * LOTTERY_TICKET_PRICE
+            if last_draw:
+                next_draw_dt = datetime.fromisoformat(last_draw) + timedelta(days=7)
+                remaining = next_draw_dt - datetime.utcnow()
+                if remaining.total_seconds() > 0:
+                    days_r = remaining.days
+                    hours_r = remaining.seconds // 3600
+                    mins_r = (remaining.seconds % 3600) // 60
+                    time_str = f"**{days_r}d {hours_r}h {mins_r}m**"
+                else:
+                    time_str = "**¡Muy pronto!**"
+            else:
+                time_str = "**7 días desde el primer boleto**"
+
+            embed = discord.Embed(title="🎰 Lotería del Casino", color=0xFFD700)
+            embed.description = (
+                f"💰 **Bote actual:** {pot:,} 🪙\n"
+                f"🎟️ **Boletos vendidos:** {total_tickets:,}\n"
+                f"👥 **Participantes:** {total_players}\n"
+                f"⏰ **Próximo sorteo en:** {time_str}\n\n"
+                f"🎫 **Tus boletos:** {my_tickets}\n\n"
+                f"Cada boleto cuesta **{LOTTERY_TICKET_PRICE:,}** 🪙\n"
+                f"Usa `,lottery <cantidad>` para comprar boletos.\n"
+                f"Más boletos = más probabilidad de ganar 🍀"
+            )
+            await message.channel.send(embed=embed)
+            return
+
+        # ,lottery [n] — comprar boletos
+        if sub == "" or sub.isdigit():
+            cantidad = int(sub) if sub.isdigit() else 1
+        else:
+            await message.channel.send(
+                "❌ Uso: `,lottery [cantidad]` para comprar boletos o `,lottery info` para ver el bote."
+            )
+            return
+
+        if cantidad < 1:
+            await message.channel.send("❌ Debes comprar al menos 1 boleto.")
+            return
+        if cantidad > 100:
+            await message.channel.send("❌ Máximo 100 boletos por compra.")
+            return
+
+        total_cost = cantidad * LOTTERY_TICKET_PRICE
+        bal = await get_balance(user_id)
+        if bal < total_cost:
+            embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
+            embed.description = (
+                f"Comprar **{cantidad}** boleto(s) cuesta **{total_cost:,}** 🪙.\n"
+                f"Tienes **{bal:,}** 🪙 en cartera."
+            )
+            await message.channel.send(embed=embed)
+            return
+
+        await update_balance(user_id, -total_cost)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO lottery_tickets (user_id, username, tickets) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET tickets = tickets + ?, username = ?",
+                (user_id, message.author.name, cantidad, cantidad, message.author.name)
+            )
+            await db.execute(
+                "INSERT OR REPLACE INTO lottery_channels (guild_id, channel_id) VALUES (?, ?)",
+                (str(message.guild.id) if message.guild else "0", str(message.channel.id))
+            )
+            await db.commit()
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT tickets FROM lottery_tickets WHERE user_id = ?", (user_id,)) as cur:
+                trow = await cur.fetchone()
+                my_total = trow[0] if trow else cantidad
+            async with db.execute("SELECT SUM(tickets) FROM lottery_tickets WHERE tickets > 0") as cur:
+                srow = await cur.fetchone()
+                total_tickets = srow[0] or 0
+
+        pot = total_tickets * LOTTERY_TICKET_PRICE
+        new_bal = await get_balance(user_id)
+
+        embed = discord.Embed(title="🎟️ ¡Boleto(s) Comprado(s)!", color=0x00FF88)
+        embed.description = (
+            f"Compraste **{cantidad}** boleto(s) por **{total_cost:,}** 🪙\n\n"
+            f"🎫 Tus boletos totales: **{my_total}**\n"
+            f"💰 Bote actual: **{pot:,}** 🪙\n"
+            f"🎟️ Boletos totales: **{total_tickets}**\n\n"
+            f"👛 Saldo restante: **{new_bal:,}** 🪙\n\n"
+            f"_El sorteo es automático cada **7 días**. ¡Buena suerte! 🍀_"
+        )
+        await message.channel.send(embed=embed)
 
 
 if __name__ == "__main__":
