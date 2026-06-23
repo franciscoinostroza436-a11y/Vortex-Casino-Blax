@@ -69,3 +69,4 @@ channel = "stable-25_05"
 
 [userenv.shared]
 DISCORD_TOKEN = "REDACTED_DISCORD_TOKEN"
+"REDACTED_DISCORD_TOKEN" = ""
