@@ -3079,6 +3079,70 @@ async def on_message(message: discord.Message):
         sent = await message.channel.send(embed=view.make_embed(), view=view)
         view.message = sent
 
+    # ,addmoney <@usuario> <cantidad> — solo administradores
+    elif cmd == "addmoney":
+        if not message.author.guild_permissions.administrator:
+            await message.channel.send("❌ Solo los administradores pueden usar este comando.")
+            return
+        if len(args) < 2:
+            await message.channel.send("❌ Uso: `,addmoney <@usuario> <cantidad>`")
+            return
+        target = message.mentions[0] if message.mentions else None
+        if not target:
+            await message.channel.send("❌ Debes mencionar a un usuario. Ej: `,addmoney @usuario 50000`")
+            return
+        try:
+            amount = int(args[1].replace(",", "").replace(".", ""))
+        except ValueError:
+            await message.channel.send("❌ La cantidad debe ser un número entero.")
+            return
+        if amount <= 0:
+            await message.channel.send("❌ La cantidad debe ser mayor a 0.")
+            return
+        await get_or_create_user(str(target.id), target.name)
+        await update_balance(str(target.id), amount)
+        new_bal = await get_balance(str(target.id))
+        embed = discord.Embed(title="💰 Dinero Añadido", color=0x00FF88)
+        embed.description = (
+            f"✅ Se añadieron **{amount:,}** 🪙 a {target.mention}\n"
+            f"📊 Nuevo saldo: **{new_bal:,}** 🪙\n\n"
+            f"_Por: {message.author.display_name}_"
+        )
+        await message.channel.send(embed=embed)
+
+    # ,removemoney <@usuario> <cantidad> — solo administradores
+    elif cmd == "removemoney":
+        if not message.author.guild_permissions.administrator:
+            await message.channel.send("❌ Solo los administradores pueden usar este comando.")
+            return
+        if len(args) < 2:
+            await message.channel.send("❌ Uso: `,removemoney <@usuario> <cantidad>`")
+            return
+        target = message.mentions[0] if message.mentions else None
+        if not target:
+            await message.channel.send("❌ Debes mencionar a un usuario. Ej: `,removemoney @usuario 50000`")
+            return
+        try:
+            amount = int(args[1].replace(",", "").replace(".", ""))
+        except ValueError:
+            await message.channel.send("❌ La cantidad debe ser un número entero.")
+            return
+        if amount <= 0:
+            await message.channel.send("❌ La cantidad debe ser mayor a 0.")
+            return
+        await get_or_create_user(str(target.id), target.name)
+        cur_bal = await get_balance(str(target.id))
+        deduct = min(amount, cur_bal)
+        await update_balance(str(target.id), -deduct)
+        new_bal = await get_balance(str(target.id))
+        embed = discord.Embed(title="💸 Dinero Eliminado", color=0xFF4444)
+        embed.description = (
+            f"✅ Se eliminaron **{deduct:,}** 🪙 de {target.mention}\n"
+            f"📊 Nuevo saldo: **{new_bal:,}** 🪙\n\n"
+            f"_Por: {message.author.display_name}_"
+        )
+        await message.channel.send(embed=embed)
+
     # ,lottery [cantidad|info]
     elif cmd in ("lottery", "loto", "loteria", "lotería"):
         await get_or_create_user(user_id, message.author.name)
