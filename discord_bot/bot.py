@@ -987,6 +987,30 @@ async def removemoney(interaction: discord.Interaction, usuario: discord.Member,
     await interaction.response.send_message(embed=embed)
 
 
+@tree.command(name="resetmoney", description="Reinicia el saldo de cartera a 0 (admins pueden resetear a otros)")
+@app_commands.describe(usuario="[Solo admins] Usuario a resetear (opcional, por defecto tú mismo)")
+async def resetmoney_slash(interaction: discord.Interaction, usuario: discord.Member = None):
+    is_admin = interaction.user.guild_permissions.administrator
+    if usuario and not is_admin:
+        await interaction.response.send_message("❌ Solo los administradores pueden resetear el saldo de otros usuarios.", ephemeral=True)
+        return
+    target = usuario if usuario else interaction.user
+    target_id = str(target.id)
+    await get_or_create_user(target_id, target.name)
+    cur_bal = await get_balance(target_id)
+    await update_balance(target_id, -cur_bal)
+    embed = discord.Embed(title="🔄 Saldo Reseteado", color=0xFF8800)
+    if target.id == interaction.user.id:
+        embed.description = f"Tu saldo de cartera ha sido reseteado a **0** 🪙."
+    else:
+        embed.description = (
+            f"El saldo de {target.mention} ha sido reseteado a **0** 🪙.\n"
+            f"_(Tenía **{cur_bal:,}** 🪙)_\n\n"
+            f"_Por: {interaction.user.display_name}_"
+        )
+    await interaction.response.send_message(embed=embed)
+
+
 @tree.command(name="shop", description="Muestra los objetos disponibles en la tienda")
 async def shop(interaction: discord.Interaction):
     embed = discord.Embed(title="🏪 Tienda del Casino", color=0x9B59B6)
@@ -3141,6 +3165,30 @@ async def on_message(message: discord.Message):
             f"📊 Nuevo saldo: **{new_bal:,}** 🪙\n\n"
             f"_Por: {message.author.display_name}_"
         )
+        await message.channel.send(embed=embed)
+
+    # ,reset-money [@usuario] — todos en sí mismos, admins en cualquiera
+    elif cmd in ("reset-money", "resetmoney", "resetbal"):
+        is_admin = message.author.guild_permissions.administrator
+        target = message.mentions[0] if message.mentions else None
+        if target and not is_admin:
+            await message.channel.send("❌ Solo los administradores pueden resetear el saldo de otros usuarios.")
+            return
+        if not target:
+            target = message.author
+        target_id = str(target.id)
+        await get_or_create_user(target_id, target.name)
+        cur_bal = await get_balance(target_id)
+        await update_balance(target_id, -cur_bal)
+        embed = discord.Embed(title="🔄 Saldo Reseteado", color=0xFF8800)
+        if target.id == message.author.id:
+            embed.description = f"Tu saldo de cartera ha sido reseteado a **0** 🪙."
+        else:
+            embed.description = (
+                f"El saldo de {target.mention} ha sido reseteado a **0** 🪙.\n"
+                f"_(Tenía **{cur_bal:,}** 🪙)_\n\n"
+                f"_Por: {message.author.display_name}_"
+            )
         await message.channel.send(embed=embed)
 
     # ,lottery [cantidad|info]
