@@ -280,15 +280,18 @@ async def get_bank(user_id: str) -> int:
             return row[0] if row else 0
 
 
+MAX_BALANCE = 5_000_000_000_000_000_000_000_000
+
+
 async def update_bank(user_id: str, amount: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET bank = bank + ? WHERE user_id = ?", (amount, user_id))
+        await db.execute("UPDATE users SET bank = MIN(bank + ?, ?) WHERE user_id = ?", (amount, MAX_BALANCE, user_id))
         await db.commit()
 
 
 async def update_balance(user_id: str, amount: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
+        await db.execute("UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id = ?", (amount, MAX_BALANCE, user_id))
         await db.commit()
 
 
