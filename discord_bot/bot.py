@@ -948,6 +948,7 @@ async def rob(interaction: discord.Interaction, usuario: discord.Member):
         await interaction.response.send_message("❌ No puedes robarle a un bot.", ephemeral=True)
         return
 
+    await interaction.response.defer()
     await get_or_create_user(robber_id, interaction.user.name)
     await get_or_create_user(victim_id, usuario.name)
 
@@ -966,14 +967,14 @@ async def rob(interaction: discord.Interaction, usuario: discord.Member):
             seconds = int(remaining.total_seconds() % 60)
             embed = discord.Embed(title="⏰ Cooldown Activo", color=0xFF4444)
             embed.description = f"Espera **{minutes}m {seconds}s** antes de volver a intentarlo."
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
     victim_balance = await get_balance(victim_id)
     if victim_balance < 100:
         embed = discord.Embed(title="😅 Víctima Sin Fondos", color=0xFFAA00)
         embed.description = f"**{usuario.name}** tiene menos de 100 🪙. ¡No vale la pena!"
-        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(embed=embed)
         return
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -996,7 +997,7 @@ async def rob(interaction: discord.Interaction, usuario: discord.Member):
                 f"**{usuario.mention}** tiene un **Escudo Anti-Robos** activo.\n"
                 f"⏰ Su escudo dura **{mins_s} min** más. ¡No puedes robarle ahora!"
             )
-            await interaction.response.send_message(embed=embed)
+            await interaction.followup.send(embed=embed)
             return
 
     success = random.random() < 0.40
@@ -1027,7 +1028,7 @@ async def rob(interaction: discord.Interaction, usuario: discord.Member):
             f"Tu saldo: **{new_robber_balance:,}** 🪙"
         )
 
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="addmoney", description="[ADMIN] Añade monedas a un usuario")
@@ -2552,16 +2553,17 @@ async def fighters_slash(interaction: discord.Interaction):
 @app_commands.describe(luchador="ID del luchador (usa /fighters para ver la lista)")
 async def buyfighter_slash(interaction: discord.Interaction, luchador: str):
     user_id = str(interaction.user.id)
-    await get_or_create_user(user_id, interaction.user.name)
     fid = luchador.lower().strip()
     if fid not in FIGHTERS:
         ids = ", ".join(f"`{k}`" for k in FIGHTERS)
         await interaction.response.send_message(f"❌ Luchador no encontrado. IDs válidos: {ids}", ephemeral=True)
         return
+    await interaction.response.defer()
+    await get_or_create_user(user_id, interaction.user.name)
     f = FIGHTERS[fid]
     bal = await get_balance(user_id)
     if bal < f["price"]:
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"❌ Te faltan **{f['price'] - bal:,}** 🪙 para comprar **{f['name']}**.", ephemeral=True)
         return
     await update_balance(user_id, -f["price"])
@@ -2574,17 +2576,18 @@ async def buyfighter_slash(interaction: discord.Interaction, luchador: str):
         f"❤️ HP: {f['hp']} | ⚔️ ATK: {f['attack']} | 🛡️ DEF: {f['defense']}\n\n"
         f"_Reta a alguien con `/fight @usuario`_"
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="myfighter", description="Muestra tu luchador actual")
 async def myfighter_slash(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
+    await interaction.response.defer()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (user_id,)) as cur:
             row = await cur.fetchone()
     if not row:
-        await interaction.response.send_message("❌ No tienes luchador. Compra uno con `/buyfighter`.", ephemeral=True)
+        await interaction.followup.send("❌ No tienes luchador. Compra uno con `/buyfighter`.", ephemeral=True)
         return
     fid = row[0]
     s = await get_fighter_stats(user_id, fid)
@@ -2604,7 +2607,7 @@ async def myfighter_slash(interaction: discord.Interaction):
         f"Usa `,addpuntos <stat> <cantidad>` para mejorar tu luchador.\n"
         f"Stats: `ataque`, `defensa`, `salud`"
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="fight", description="Reta a otro usuario a una pelea entre luchadores")
@@ -2618,6 +2621,7 @@ async def fight_slash(interaction: discord.Interaction, usuario: discord.Member)
     if usuario.bot:
         await interaction.response.send_message("❌ No puedes retar a un bot.", ephemeral=True)
         return
+    await interaction.response.defer()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT last_fight FROM fight_cooldowns WHERE user_id = ?", (uid1,)) as cur:
             crow = await cur.fetchone()
@@ -2626,7 +2630,7 @@ async def fight_slash(interaction: discord.Interaction, usuario: discord.Member)
         if diff < timedelta(seconds=30):
             rem = timedelta(seconds=30) - diff
             s = int(rem.total_seconds())
-            await interaction.response.send_message(f"⏰ Espera **{s}s** antes de volver a pelear.", ephemeral=True)
+            await interaction.followup.send(f"⏰ Espera **{s}s** antes de volver a pelear.", ephemeral=True)
             return
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (uid1,)) as cur:
@@ -2634,10 +2638,10 @@ async def fight_slash(interaction: discord.Interaction, usuario: discord.Member)
         async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (uid2,)) as cur:
             r2 = await cur.fetchone()
     if not r1:
-        await interaction.response.send_message("❌ No tienes luchador. Compra uno con `/buyfighter`.", ephemeral=True)
+        await interaction.followup.send("❌ No tienes luchador. Compra uno con `/buyfighter`.", ephemeral=True)
         return
     if not r2:
-        await interaction.response.send_message(f"❌ **{usuario.name}** no tiene luchador.", ephemeral=True)
+        await interaction.followup.send(f"❌ **{usuario.name}** no tiene luchador.", ephemeral=True)
         return
     s1 = await get_fighter_stats(uid1, r1[0])
     s2 = await get_fighter_stats(uid2, r2[0])
@@ -2668,7 +2672,7 @@ async def fight_slash(interaction: discord.Interaction, usuario: discord.Member)
         f"💰 Premio: **{prize:,}** 🪙 de {loser_user.mention}"
         f"{level_up_msg}"
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 FIGHTER_TOURNAMENT_PRIZE = 60_000_000
@@ -2813,16 +2817,17 @@ async def addpuntos_slash(interaction: discord.Interaction, stat: str, cantidad:
     if cantidad <= 0:
         await interaction.response.send_message("❌ La cantidad debe ser mayor a 0.", ephemeral=True)
         return
+    await interaction.response.defer()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT fighter_id FROM fighters WHERE user_id=?", (user_id,)) as cur:
             row = await cur.fetchone()
     if not row:
-        await interaction.response.send_message("❌ No tienes luchador. Compra uno con `/buyfighter`.", ephemeral=True)
+        await interaction.followup.send("❌ No tienes luchador. Compra uno con `/buyfighter`.", ephemeral=True)
         return
     fid = row[0]
     s = await get_fighter_stats(user_id, fid)
     if s["points"] < cantidad:
-        await interaction.response.send_message(f"❌ Solo tienes **{s['points']}** puntos disponibles.", ephemeral=True)
+        await interaction.followup.send(f"❌ Solo tienes **{s['points']}** puntos disponibles.", ephemeral=True)
         return
     col_map = {"ataque": "bonus_attack", "defensa": "bonus_defense", "salud": "bonus_hp"}
     val_map  = {"ataque": cantidad * 2, "defensa": cantidad * 2, "salud": cantidad * 5}
@@ -2843,22 +2848,22 @@ async def addpuntos_slash(interaction: discord.Interaction, stat: str, cantidad:
         f"**Stats actuales de {s2['name']}:**\n"
         f"❤️ HP: **{s2['hp']}** | ⚔️ ATK: **{s2['attack']}** | 🛡️ DEF: **{s2['defense']}**"
     )
-    await interaction.response.send_message(embed=embed)
+    await interaction.followup.send(embed=embed)
 
 
 @tree.command(name="ftorneo", description="Crea un torneo de luchadores. El campeón gana 60 millones.")
 async def ftorneo_slash(interaction: discord.Interaction):
     uid = str(interaction.user.id)
+    await interaction.response.defer()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (uid,)) as cur:
             row = await cur.fetchone()
     if not row:
-        await interaction.response.send_message("❌ Necesitas un luchador para organizar un torneo. Compra uno con `/buyfighter`.", ephemeral=True)
+        await interaction.followup.send("❌ Necesitas un luchador para organizar un torneo. Compra uno con `/buyfighter`.", ephemeral=True)
         return
     view = FighterTournamentView(host_id=uid, host_name=interaction.user.display_name)
     view.players.append((uid, interaction.user.display_name, row[0]))
-    await interaction.response.send_message(embed=view.make_embed(), view=view)
-    msg = await interaction.original_response()
+    msg = await interaction.followup.send(embed=view.make_embed(), view=view)
     view.message = msg
 
 
