@@ -3790,6 +3790,66 @@ async def on_message(message: discord.Message):
         )
         await message.channel.send(embed=embed)
 
+    # ,addlevel @usuario <fighter_id> <niveles> — solo admins
+    elif cmd == "addlevel":
+        if not message.author.guild_permissions.administrator:
+            await message.channel.send("❌ Solo los administradores pueden usar este comando.")
+            return
+        target = message.mentions[0] if message.mentions else message.author
+        target_id = str(target.id)
+        remaining_args = [a for a in args if not a.startswith("<@")]
+        if len(remaining_args) < 2:
+            await message.channel.send("❌ Uso: `,addlevel @usuario <fighter_id> <niveles>`\nEj: `,addlevel @Juan novato 50`")
+            return
+        fid = remaining_args[0].lower()
+        if fid not in FIGHTERS:
+            ids = ", ".join(f"`{k}`" for k in FIGHTERS)
+            await message.channel.send(f"❌ ID de luchador inválido. IDs válidos: {ids}")
+            return
+        try:
+            add_lvls = int(remaining_args[1])
+        except ValueError:
+            await message.channel.send("❌ Los niveles deben ser un número entero.")
+            return
+        if add_lvls <= 0:
+            await message.channel.send("❌ Debes agregar al menos 1 nivel.")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT fighter_id FROM fighters WHERE user_id=?", (target_id,)) as cur:
+                frow = await cur.fetchone()
+        if not frow:
+            await message.channel.send(f"❌ **{target.name}** no tiene ningún luchador comprado.")
+            return
+        if frow[0] != fid:
+            await message.channel.send(f"❌ **{target.name}** tiene un **{FIGHTERS[frow[0]]['name']}**, no un **{FIGHTERS[fid]['name']}**.")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT level, xp, points FROM fighter_levels WHERE user_id=? AND fighter_id=?",
+                (target_id, fid)
+            ) as cur:
+                lvl_row = await cur.fetchone()
+        cur_level, cur_xp, cur_points = lvl_row if lvl_row else (1, 0, 0)
+        new_level = cur_level + add_lvls
+        points_gained = add_lvls * 5
+        new_points = cur_points + points_gained
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO fighter_levels (user_id, fighter_id, level, xp, points) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(user_id, fighter_id) DO UPDATE SET level=excluded.level, xp=excluded.xp, points=excluded.points",
+                (target_id, fid, new_level, 0, new_points)
+            )
+            await db.commit()
+        f = FIGHTERS[fid]
+        embed = discord.Embed(title="🆙 ¡Niveles Añadidos!", color=0x00FF88)
+        embed.description = (
+            f"Se añadieron **{add_lvls}** niveles al luchador **{f['name']}** de {target.mention}\n\n"
+            f"📊 Nivel anterior: **{cur_level}** → Nivel nuevo: **{new_level}**\n"
+            f"🎯 Puntos ganados: **+{points_gained}** (total disponible: **{new_points}**)\n\n"
+            f"_Por: {message.author.display_name}_"
+        )
+        await message.channel.send(embed=embed)
+
     # ,addpuntos <stat> <cantidad>
     elif cmd == "addpuntos":
         await get_or_create_user(user_id, message.author.name)
