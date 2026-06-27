@@ -11,9 +11,9 @@ DB_PATH = "discord_bot/casino.db"
 
 SHOP_ITEMS = {
     "anti_rob": {
-        "name": "🛡️ Escudo Anti-Robo",
-        "price": 800,
-        "description": "Bloquea automáticamente el próximo intento de robo. ¡Consumible!",
+        "name": "🛡️ Escudo Anti-Robos",
+        "price": 800_000,
+        "description": "Actívalo con `/use` y te protege de robos durante **1h 30m**. ¡Consumible!",
         "category": "proteccion",
     },
     "vip_card": {
@@ -105,6 +105,45 @@ SHOP_ITEMS = {
 }
 
 ROLE_ITEMS = [k for k, v in SHOP_ITEMS.items() if v["category"] == "rol"]
+
+FIGHTERS = {
+    "novato": {
+        "name": "🥊 Novato",
+        "price": 5_000,
+        "hp": 80, "attack": 10, "defense": 5,
+        "description": "Un luchador principiante. Barato pero débil.",
+    },
+    "peleador": {
+        "name": "⚔️ Peleador Callejero",
+        "price": 50_000,
+        "hp": 120, "attack": 18, "defense": 10,
+        "description": "Con experiencia en las calles. Equilibrado.",
+    },
+    "guerrero": {
+        "name": "🗡️ Guerrero",
+        "price": 500_000,
+        "hp": 180, "attack": 28, "defense": 18,
+        "description": "Entrenado en combate cuerpo a cuerpo.",
+    },
+    "asesino": {
+        "name": "🗡️ Asesino",
+        "price": 5_000_000,
+        "hp": 150, "attack": 45, "defense": 12,
+        "description": "Alto daño pero poca defensa. Para arriesgados.",
+    },
+    "tanque": {
+        "name": "🛡️ Tanque",
+        "price": 10_000_000,
+        "hp": 300, "attack": 20, "defense": 40,
+        "description": "Casi imposible de derribar. Daño moderado.",
+    },
+    "campeon": {
+        "name": "👑 Campeón",
+        "price": 100_000_000,
+        "hp": 250, "attack": 50, "defense": 35,
+        "description": "El mejor luchador del casino. Ataque y defensa elite.",
+    },
+}
 
 def calc_daily_reward(streak: int) -> int:
     if streak <= 1:
@@ -214,6 +253,22 @@ async def init_db():
             await db.execute("ALTER TABLE users ADD COLUMN bank INTEGER DEFAULT 0")
         except Exception:
             pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN shield_until TEXT")
+        except Exception:
+            pass
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS fighters (
+                user_id TEXT PRIMARY KEY,
+                fighter_id TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS fight_cooldowns (
+                user_id TEXT PRIMARY KEY,
+                last_fight TEXT
+            )
+        """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS inventory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -914,16 +969,22 @@ async def rob(interaction: discord.Interaction, usuario: discord.Member):
         )
         await db.commit()
 
-    anti_rob_qty = await get_item_quantity(victim_id, "anti_rob")
-    if anti_rob_qty > 0:
-        await remove_from_inventory(victim_id, "anti_rob")
-        embed = discord.Embed(title="🛡️ ¡Robo Bloqueado!", color=0x3498DB)
-        embed.description = (
-            f"**{usuario.mention}** tenía un **Escudo Anti-Robo** activo.\n"
-            f"¡Tu intento de robo fue bloqueado y el escudo se consumió!"
-        )
-        await interaction.response.send_message(embed=embed)
-        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT shield_until FROM users WHERE user_id = ?", (victim_id,)) as cur:
+            srow = await cur.fetchone()
+            shield_until = srow[0] if srow else None
+    if shield_until:
+        shield_dt = datetime.fromisoformat(shield_until)
+        if datetime.utcnow() < shield_dt:
+            remaining_shield = shield_dt - datetime.utcnow()
+            mins_s = int(remaining_shield.total_seconds() // 60)
+            embed = discord.Embed(title="🛡️ ¡Robo Bloqueado!", color=0x3498DB)
+            embed.description = (
+                f"**{usuario.mention}** tiene un **Escudo Anti-Robos** activo.\n"
+                f"⏰ Su escudo dura **{mins_s} min** más. ¡No puedes robarle ahora!"
+            )
+            await interaction.response.send_message(embed=embed)
+            return
 
     success = random.random() < 0.40
 
@@ -1885,12 +1946,17 @@ async def use(interaction: discord.Interaction, item: str):
         await interaction.response.send_message(embed=embed)
 
     elif item == "anti_rob":
-        embed = discord.Embed(title="🛡️ Escudo Anti-Robo", color=0x3498DB)
+        now_dt = datetime.utcnow()
+        shield_exp = now_dt + timedelta(minutes=90)
+        await remove_from_inventory(user_id, "anti_rob")
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET shield_until = ? WHERE user_id = ?", (shield_exp.isoformat(), user_id))
+            await db.commit()
+        embed = discord.Embed(title="🛡️ ¡Escudo Anti-Robos Activado!", color=0x3498DB)
         embed.description = (
-            f"Tu escudo está **activo** y listo.\n\n"
-            f"🔒 Se activará automáticamente la próxima vez que alguien intente robarte.\n"
-            f"💡 Es consumible: se gastará 1 unidad por robo bloqueado.\n\n"
-            f"Tienes **{qty}** escudos en tu inventario."
+            f"🔒 Estás protegido de robos durante **1 hora y 30 minutos**.\n\n"
+            f"⏰ Expira a las **{shield_exp.strftime('%H:%M UTC')}**\n"
+            f"📦 Escudos restantes: **{qty - 1}**"
         )
         await interaction.response.send_message(embed=embed)
 
@@ -2380,6 +2446,142 @@ async def help_cmd(interaction: discord.Interaction):
     )
 
     embed.set_footer(text="🏦 El banco es seguro contra robos  •  Casino Bot")
+    await interaction.response.send_message(embed=embed)
+
+
+def simulate_fight(f1_id: str, f2_id: str) -> tuple[str, str]:
+    f1 = dict(FIGHTERS[f1_id]); f2 = dict(FIGHTERS[f2_id])
+    hp1, hp2 = f1["hp"], f2["hp"]
+    log_lines = []
+    turn = 0
+    while hp1 > 0 and hp2 > 0:
+        if turn % 2 == 0:
+            dmg = max(1, f1["attack"] - f2["defense"] // 2 + random.randint(-4, 6))
+            hp2 -= dmg
+            log_lines.append(f"⚔️ **{f1['name']}** golpea por **{dmg}** dmg → {f2['name']} HP: {max(0, hp2)}")
+        else:
+            dmg = max(1, f2["attack"] - f1["defense"] // 2 + random.randint(-4, 6))
+            hp1 -= dmg
+            log_lines.append(f"⚔️ **{f2['name']}** golpea por **{dmg}** dmg → {f1['name']} HP: {max(0, hp1)}")
+        turn += 1
+        if turn > 30:
+            break
+    winner = f1_id if hp1 > hp2 else f2_id
+    return winner, "\n".join(log_lines[-6:])
+
+
+@tree.command(name="fighters", description="Muestra todos los luchadores disponibles para comprar")
+async def fighters_slash(interaction: discord.Interaction):
+    embed = discord.Embed(title="🥊 Luchadores del Casino", color=0xFF6B00)
+    embed.description = "Compra un luchador con `/buyfighter <id>` y reta a otros con `/fight @usuario`.\n\u200b"
+    for fid, f in FIGHTERS.items():
+        embed.add_field(
+            name=f"{f['name']} — `{fid}`",
+            value=f"💰 {f['price']:,} 🪙\n❤️ HP: {f['hp']} | ⚔️ ATK: {f['attack']} | 🛡️ DEF: {f['defense']}\n_{f['description']}_",
+            inline=False
+        )
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="buyfighter", description="Compra un luchador para pelear")
+@app_commands.describe(luchador="ID del luchador (usa /fighters para ver la lista)")
+async def buyfighter_slash(interaction: discord.Interaction, luchador: str):
+    user_id = str(interaction.user.id)
+    await get_or_create_user(user_id, interaction.user.name)
+    fid = luchador.lower().strip()
+    if fid not in FIGHTERS:
+        ids = ", ".join(f"`{k}`" for k in FIGHTERS)
+        await interaction.response.send_message(f"❌ Luchador no encontrado. IDs válidos: {ids}", ephemeral=True)
+        return
+    f = FIGHTERS[fid]
+    bal = await get_balance(user_id)
+    if bal < f["price"]:
+        await interaction.response.send_message(
+            f"❌ Te faltan **{f['price'] - bal:,}** 🪙 para comprar **{f['name']}**.", ephemeral=True)
+        return
+    await update_balance(user_id, -f["price"])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO fighters (user_id, fighter_id) VALUES (?, ?)", (user_id, fid))
+        await db.commit()
+    embed = discord.Embed(title=f"🥊 ¡Luchador Comprado!", color=0x00FF88)
+    embed.description = (
+        f"Ahora tienes a **{f['name']}** en tu equipo.\n\n"
+        f"❤️ HP: {f['hp']} | ⚔️ ATK: {f['attack']} | 🛡️ DEF: {f['defense']}\n\n"
+        f"_Reta a alguien con `/fight @usuario`_"
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="myfighter", description="Muestra tu luchador actual")
+async def myfighter_slash(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+    if not row:
+        await interaction.response.send_message("❌ No tienes luchador. Compra uno con `/buyfighter`.", ephemeral=True)
+        return
+    f = FIGHTERS[row[0]]
+    embed = discord.Embed(title=f"🥊 Tu Luchador: {f['name']}", color=0xFF6B00)
+    embed.description = (
+        f"❤️ HP: **{f['hp']}** | ⚔️ ATK: **{f['attack']}** | 🛡️ DEF: **{f['defense']}**\n"
+        f"💰 Valor: **{f['price']:,}** 🪙\n\n_{f['description']}_"
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="fight", description="Reta a otro usuario a una pelea entre luchadores")
+@app_commands.describe(usuario="Usuario al que quieres retar")
+async def fight_slash(interaction: discord.Interaction, usuario: discord.Member):
+    uid1 = str(interaction.user.id)
+    uid2 = str(usuario.id)
+    if uid1 == uid2:
+        await interaction.response.send_message("❌ No puedes pelearte contigo mismo.", ephemeral=True)
+        return
+    if usuario.bot:
+        await interaction.response.send_message("❌ No puedes retar a un bot.", ephemeral=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT last_fight FROM fight_cooldowns WHERE user_id = ?", (uid1,)) as cur:
+            crow = await cur.fetchone()
+    if crow and crow[0]:
+        diff = datetime.utcnow() - datetime.fromisoformat(crow[0])
+        if diff < timedelta(minutes=30):
+            rem = timedelta(minutes=30) - diff
+            m = int(rem.total_seconds() // 60)
+            await interaction.response.send_message(f"⏰ Espera **{m} min** antes de volver a pelear.", ephemeral=True)
+            return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (uid1,)) as cur:
+            r1 = await cur.fetchone()
+        async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (uid2,)) as cur:
+            r2 = await cur.fetchone()
+    if not r1:
+        await interaction.response.send_message("❌ No tienes luchador. Compra uno con `/buyfighter`.", ephemeral=True)
+        return
+    if not r2:
+        await interaction.response.send_message(f"❌ **{usuario.name}** no tiene luchador.", ephemeral=True)
+        return
+    winner_id, battle_log = simulate_fight(r1[0], r2[0])
+    loser_id = uid2 if winner_id == uid1 else uid1
+    winner_user = interaction.user if winner_id == uid1 else usuario
+    loser_user = usuario if winner_id == uid1 else interaction.user
+    loser_bal = await get_balance(loser_id)
+    prize = max(1, int(loser_bal * 0.10))
+    await update_balance(loser_id, -prize)
+    await update_balance(winner_id, prize)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO fight_cooldowns (user_id, last_fight) VALUES (?, ?)",
+                         (uid1, datetime.utcnow().isoformat()))
+        await db.commit()
+    f1 = FIGHTERS[r1[0]]; f2 = FIGHTERS[r2[0]]
+    embed = discord.Embed(title="🥊 ¡COMBATE!", color=0xFF0000)
+    embed.description = (
+        f"**{interaction.user.display_name}** ({f1['name']}) vs **{usuario.display_name}** ({f2['name']})\n\n"
+        f"{battle_log}\n\n"
+        f"🏆 **¡{winner_user.mention} gana!**\n"
+        f"💰 Premio: **{prize:,}** 🪙 de {loser_user.mention}"
+    )
     await interaction.response.send_message(embed=embed)
 
 
@@ -2934,16 +3136,22 @@ async def on_message(message: discord.Message):
             await db.execute("UPDATE users SET last_rob = ? WHERE user_id = ?", (now.isoformat(), user_id))
             await db.commit()
 
-        anti_rob_qty = await get_item_quantity(victim_id, "anti_rob")
-        if anti_rob_qty > 0:
-            await remove_from_inventory(victim_id, "anti_rob")
-            embed = discord.Embed(title="🛡️ ¡Robo Bloqueado!", color=0x3498DB)
-            embed.description = (
-                f"**{target.mention}** tenía un **Escudo Anti-Robo** activo.\n"
-                f"¡Tu intento de robo fue bloqueado y el escudo se consumió!"
-            )
-            await message.channel.send(embed=embed)
-            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT shield_until FROM users WHERE user_id = ?", (victim_id,)) as cur:
+                srow = await cur.fetchone()
+                shield_until = srow[0] if srow else None
+        if shield_until:
+            shield_dt = datetime.fromisoformat(shield_until)
+            if datetime.utcnow() < shield_dt:
+                remaining_shield = shield_dt - datetime.utcnow()
+                mins_s = int(remaining_shield.total_seconds() // 60)
+                embed = discord.Embed(title="🛡️ ¡Robo Bloqueado!", color=0x3498DB)
+                embed.description = (
+                    f"**{target.mention}** tiene un **Escudo Anti-Robos** activo.\n"
+                    f"⏰ Su escudo dura **{mins_s} min** más. ¡No puedes robarle ahora!"
+                )
+                await message.channel.send(embed=embed)
+                return
 
         success = random.random() < 0.40
         if success:
@@ -3167,6 +3375,120 @@ async def on_message(message: discord.Message):
             f"✅ Se eliminaron **{deduct:,}** 🪙 de {target.mention}\n"
             f"📊 Nuevo saldo: **{new_bal:,}** 🪙\n\n"
             f"_Por: {message.author.display_name}_"
+        )
+        await message.channel.send(embed=embed)
+
+    # ,fighters — lista luchadores disponibles
+    elif cmd == "fighters":
+        embed = discord.Embed(title="🥊 Luchadores del Casino", color=0xFF6B00)
+        embed.description = "Compra con `,buyfighter <id>` y pelea con `,fight @usuario`.\n\u200b"
+        for fid, f in FIGHTERS.items():
+            embed.add_field(
+                name=f"{f['name']} — `{fid}`",
+                value=f"💰 {f['price']:,} 🪙\n❤️ HP: {f['hp']} | ⚔️ ATK: {f['attack']} | 🛡️ DEF: {f['defense']}\n_{f['description']}_",
+                inline=False
+            )
+        await message.channel.send(embed=embed)
+
+    # ,buyfighter <id>
+    elif cmd == "buyfighter":
+        await get_or_create_user(user_id, message.author.name)
+        if not args:
+            ids = ", ".join(f"`{k}`" for k in FIGHTERS)
+            await message.channel.send(f"❌ Uso: `,buyfighter <id>` — IDs: {ids}")
+            return
+        fid = args[0].lower()
+        if fid not in FIGHTERS:
+            ids = ", ".join(f"`{k}`" for k in FIGHTERS)
+            await message.channel.send(f"❌ ID inválido. IDs válidos: {ids}")
+            return
+        f = FIGHTERS[fid]
+        bal = await get_balance(user_id)
+        if bal < f["price"]:
+            await message.channel.send(f"❌ Te faltan **{f['price'] - bal:,}** 🪙 para comprar **{f['name']}**.")
+            return
+        await update_balance(user_id, -f["price"])
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR REPLACE INTO fighters (user_id, fighter_id) VALUES (?, ?)", (user_id, fid))
+            await db.commit()
+        embed = discord.Embed(title="🥊 ¡Luchador Comprado!", color=0x00FF88)
+        embed.description = (
+            f"Ahora tienes a **{f['name']}** en tu equipo.\n\n"
+            f"❤️ HP: {f['hp']} | ⚔️ ATK: {f['attack']} | 🛡️ DEF: {f['defense']}\n\n"
+            f"_Reta a alguien con `,fight @usuario`_"
+        )
+        await message.channel.send(embed=embed)
+
+    # ,myfighter
+    elif cmd == "myfighter":
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (user_id,)) as cur:
+                row = await cur.fetchone()
+        if not row:
+            await message.channel.send("❌ No tienes luchador. Compra uno con `,buyfighter`.")
+            return
+        f = FIGHTERS[row[0]]
+        embed = discord.Embed(title=f"🥊 Tu Luchador: {f['name']}", color=0xFF6B00)
+        embed.description = (
+            f"❤️ HP: **{f['hp']}** | ⚔️ ATK: **{f['attack']}** | 🛡️ DEF: **{f['defense']}**\n"
+            f"💰 Valor: **{f['price']:,}** 🪙\n\n_{f['description']}_"
+        )
+        await message.channel.send(embed=embed)
+
+    # ,fight @usuario
+    elif cmd == "fight":
+        await get_or_create_user(user_id, message.author.name)
+        if not message.mentions:
+            await message.channel.send("❌ Menciona al usuario. Ejemplo: `,fight @Alguien`")
+            return
+        target = message.mentions[0]
+        if target.id == message.author.id:
+            await message.channel.send("❌ No puedes pelearte contigo mismo.")
+            return
+        if target.bot:
+            await message.channel.send("❌ No puedes retar a un bot.")
+            return
+        uid2 = str(target.id)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT last_fight FROM fight_cooldowns WHERE user_id = ?", (user_id,)) as cur:
+                crow = await cur.fetchone()
+        if crow and crow[0]:
+            diff = datetime.utcnow() - datetime.fromisoformat(crow[0])
+            if diff < timedelta(minutes=30):
+                rem = timedelta(minutes=30) - diff
+                m = int(rem.total_seconds() // 60)
+                await message.channel.send(f"⏰ Espera **{m} min** antes de volver a pelear.")
+                return
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (user_id,)) as cur:
+                r1 = await cur.fetchone()
+            async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (uid2,)) as cur:
+                r2 = await cur.fetchone()
+        if not r1:
+            await message.channel.send("❌ No tienes luchador. Compra uno con `,buyfighter`.")
+            return
+        if not r2:
+            await message.channel.send(f"❌ **{target.name}** no tiene luchador.")
+            return
+        winner_id, battle_log = simulate_fight(r1[0], r2[0])
+        loser_id = uid2 if winner_id == user_id else user_id
+        winner_mem = message.author if winner_id == user_id else target
+        loser_mem = target if winner_id == user_id else message.author
+        loser_bal = await get_balance(loser_id)
+        prize = max(1, int(loser_bal * 0.10))
+        await update_balance(loser_id, -prize)
+        await update_balance(user_id if winner_id == user_id else uid2, prize)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR REPLACE INTO fight_cooldowns (user_id, last_fight) VALUES (?, ?)",
+                             (user_id, datetime.utcnow().isoformat()))
+            await db.commit()
+        f1 = FIGHTERS[r1[0]]; f2 = FIGHTERS[r2[0]]
+        embed = discord.Embed(title="🥊 ¡COMBATE!", color=0xFF0000)
+        embed.description = (
+            f"**{message.author.display_name}** ({f1['name']}) vs **{target.display_name}** ({f2['name']})\n\n"
+            f"{battle_log}\n\n"
+            f"🏆 **¡{winner_mem.mention} gana!**\n"
+            f"💰 Premio: **{prize:,}** 🪙 de {loser_mem.mention}"
         )
         await message.channel.send(embed=embed)
 
