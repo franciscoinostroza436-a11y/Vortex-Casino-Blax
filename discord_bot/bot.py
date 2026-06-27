@@ -2546,10 +2546,10 @@ async def fight_slash(interaction: discord.Interaction, usuario: discord.Member)
             crow = await cur.fetchone()
     if crow and crow[0]:
         diff = datetime.utcnow() - datetime.fromisoformat(crow[0])
-        if diff < timedelta(minutes=30):
-            rem = timedelta(minutes=30) - diff
-            m = int(rem.total_seconds() // 60)
-            await interaction.response.send_message(f"⏰ Espera **{m} min** antes de volver a pelear.", ephemeral=True)
+        if diff < timedelta(seconds=30):
+            rem = timedelta(seconds=30) - diff
+            s = int(rem.total_seconds())
+            await interaction.response.send_message(f"⏰ Espera **{s}s** antes de volver a pelear.", ephemeral=True)
             return
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (uid1,)) as cur:
@@ -2583,6 +2583,150 @@ async def fight_slash(interaction: discord.Interaction, usuario: discord.Member)
         f"💰 Premio: **{prize:,}** 🪙 de {loser_user.mention}"
     )
     await interaction.response.send_message(embed=embed)
+
+
+FIGHTER_TOURNAMENT_PRIZE = 60_000_000
+
+class FighterTournamentView(discord.ui.View):
+    MAX_PLAYERS = 8
+
+    def __init__(self, host_id: str, host_name: str):
+        super().__init__(timeout=90)
+        self.host_id = host_id
+        self.host_name = host_name
+        self.players: list[tuple[str, str, str]] = []  # (user_id, display_name, fighter_id)
+        self.message: discord.Message | None = None
+        self.started = False
+
+    def roster_text(self):
+        if not self.players:
+            return "_Nadie se ha unido todavía..._"
+        lines = []
+        for i, (_, name, fid) in enumerate(self.players):
+            f = FIGHTERS[fid]
+            lines.append(f"{i+1}. **{name}** — {f['name']}")
+        return "\n".join(lines)
+
+    def make_embed(self):
+        embed = discord.Embed(title="🥊 Torneo de Luchadores — Inscripción Abierta", color=0xFF6B00)
+        embed.description = (
+            f"🏆 El campeón gana **{FIGHTER_TOURNAMENT_PRIZE:,}** 🪙\n"
+            f"👥 Jugadores: {len(self.players)}/{self.MAX_PLAYERS}\n\n"
+            f"**Participantes:**\n{self.roster_text()}\n\n"
+            f"⏳ El torneo inicia en **90 segundos** o cuando haya {self.MAX_PLAYERS} jugadores.\n"
+            f"_Necesitas tener un luchador (`,buyfighter`) para inscribirte._"
+        )
+        embed.set_footer(text=f"Organizado por {self.host_name}")
+        return embed
+
+    @discord.ui.button(label="⚔️ Unirme al Torneo", style=discord.ButtonStyle.danger)
+    async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = str(interaction.user.id)
+        if self.started:
+            await interaction.response.send_message("❌ El torneo ya empezó.", ephemeral=True)
+            return
+        if any(p[0] == uid for p in self.players):
+            await interaction.response.send_message("❌ Ya estás inscrito.", ephemeral=True)
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (uid,)) as cur:
+                row = await cur.fetchone()
+        if not row:
+            await interaction.response.send_message("❌ No tienes luchador. Compra uno con `,buyfighter`.", ephemeral=True)
+            return
+        self.players.append((uid, interaction.user.display_name, row[0]))
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+        if len(self.players) >= self.MAX_PLAYERS:
+            await self.run_tournament(interaction.message)
+
+    async def on_timeout(self):
+        if not self.started and self.message:
+            await self.run_tournament(self.message)
+
+    async def run_tournament(self, msg: discord.Message):
+        if self.started:
+            return
+        self.started = True
+        self.stop()
+
+        channel = msg.channel
+        players = list(self.players)
+
+        if len(players) < 2:
+            embed = discord.Embed(title="❌ Torneo Cancelado", color=0xFF4444)
+            embed.description = "No hubo suficientes participantes (mínimo 2)."
+            await channel.send(embed=embed)
+            return
+
+        embed = discord.Embed(title="🥊 ¡TORNEO DE LUCHADORES INICIADO!", color=0xFF6B00)
+        names = "\n".join(f"• **{n}** ({FIGHTERS[fid]['name']})" for _, n, fid in players)
+        embed.description = f"**{len(players)} luchadores** entran al ring:\n\n{names}\n\n_¡Que comience la batalla!_"
+        await channel.send(embed=embed)
+        await asyncio.sleep(2)
+
+        round_num = 1
+        while len(players) > 1:
+            embed = discord.Embed(title=f"🔔 Ronda {round_num}", color=0xFFAA00)
+            round_text = []
+            next_round = []
+            random.shuffle(players)
+
+            i = 0
+            while i < len(players):
+                if i + 1 < len(players):
+                    p1 = players[i]; p2 = players[i + 1]
+                    winner_fid, log = simulate_fight(p1[2], p2[2])
+                    winner = p1 if winner_fid == p1[2] else p2
+                    loser  = p2 if winner == p1 else p1
+                    if winner_fid == p1[2] and p2[2] == p1[2]:
+                        winner = random.choice([p1, p2])
+                        loser  = p2 if winner == p1 else p1
+                    round_text.append(
+                        f"⚔️ **{p1[1]}** vs **{p2[1]}**\n"
+                        f"{log}\n"
+                        f"✅ Avanza: **{winner[1]}**\n"
+                    )
+                    next_round.append(winner)
+                    i += 2
+                else:
+                    round_text.append(f"🎯 **{players[i][1]}** pasa directo (sin rival)")
+                    next_round.append(players[i])
+                    i += 1
+
+            embed.description = "\n\n".join(round_text)
+            await channel.send(embed=embed)
+            await asyncio.sleep(2)
+            players = next_round
+            round_num += 1
+
+        champion = players[0]
+        await update_balance(champion[0], FIGHTER_TOURNAMENT_PRIZE)
+        champ_bal = await get_balance(champion[0])
+
+        embed = discord.Embed(title="🏆 ¡CAMPEÓN DEL TORNEO!", color=0xFFD700)
+        embed.description = (
+            f"👑 **<@{champion[0]}> es el campeón!**\n"
+            f"Luchador: **{FIGHTERS[champion[2]]['name']}**\n\n"
+            f"💰 Premio: **{FIGHTER_TOURNAMENT_PRIZE:,}** 🪙\n"
+            f"💼 Saldo nuevo: **{champ_bal:,}** 🪙"
+        )
+        await channel.send(embed=embed)
+
+
+@tree.command(name="ftorneo", description="Crea un torneo de luchadores. El campeón gana 60 millones.")
+async def ftorneo_slash(interaction: discord.Interaction):
+    uid = str(interaction.user.id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (uid,)) as cur:
+            row = await cur.fetchone()
+    if not row:
+        await interaction.response.send_message("❌ Necesitas un luchador para organizar un torneo. Compra uno con `/buyfighter`.", ephemeral=True)
+        return
+    view = FighterTournamentView(host_id=uid, host_name=interaction.user.display_name)
+    view.players.append((uid, interaction.user.display_name, row[0]))
+    await interaction.response.send_message(embed=view.make_embed(), view=view)
+    msg = await interaction.original_response()
+    view.message = msg
 
 
 @client.event
@@ -3454,10 +3598,10 @@ async def on_message(message: discord.Message):
                 crow = await cur.fetchone()
         if crow and crow[0]:
             diff = datetime.utcnow() - datetime.fromisoformat(crow[0])
-            if diff < timedelta(minutes=30):
-                rem = timedelta(minutes=30) - diff
-                m = int(rem.total_seconds() // 60)
-                await message.channel.send(f"⏰ Espera **{m} min** antes de volver a pelear.")
+            if diff < timedelta(seconds=30):
+                rem = timedelta(seconds=30) - diff
+                s = int(rem.total_seconds())
+                await message.channel.send(f"⏰ Espera **{s}s** antes de volver a pelear.")
                 return
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (user_id,)) as cur:
@@ -3491,6 +3635,20 @@ async def on_message(message: discord.Message):
             f"💰 Premio: **{prize:,}** 🪙 de {loser_mem.mention}"
         )
         await message.channel.send(embed=embed)
+
+    # ,ftorneo — torneo de luchadores
+    elif cmd == "ftorneo":
+        await get_or_create_user(user_id, message.author.name)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (user_id,)) as cur:
+                row = await cur.fetchone()
+        if not row:
+            await message.channel.send("❌ Necesitas un luchador para organizar un torneo. Compra uno con `,buyfighter`.")
+            return
+        view = FighterTournamentView(host_id=user_id, host_name=message.author.display_name)
+        view.players.append((user_id, message.author.display_name, row[0]))
+        sent = await message.channel.send(embed=view.make_embed(), view=view)
+        view.message = sent
 
     # ,reset-money [@usuario] — todos en sí mismos, admins en cualquiera
     elif cmd in ("reset-money", "resetmoney", "resetbal"):
