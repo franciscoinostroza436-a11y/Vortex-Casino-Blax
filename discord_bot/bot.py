@@ -230,6 +230,8 @@ PREFIX = ","
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA synchronous=NORMAL")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id TEXT PRIMARY KEY,
@@ -2643,8 +2645,10 @@ async def fight_slash(interaction: discord.Interaction, usuario: discord.Member)
     if not r2:
         await interaction.followup.send(f"❌ **{usuario.name}** no tiene luchador.", ephemeral=True)
         return
-    s1 = await get_fighter_stats(uid1, r1[0])
-    s2 = await get_fighter_stats(uid2, r2[0])
+    (s1, s2), loser_bal_placeholder = await asyncio.gather(
+        asyncio.gather(get_fighter_stats(uid1, r1[0]), get_fighter_stats(uid2, r2[0])),
+        asyncio.sleep(0)
+    )
     win_idx, battle_log = simulate_fight_stats(s1, s2)
     winner_id = uid1 if win_idx == 0 else uid2
     loser_id  = uid2 if win_idx == 0 else uid1
@@ -2654,14 +2658,19 @@ async def fight_slash(interaction: discord.Interaction, usuario: discord.Member)
     loser_user  = usuario if winner_id == uid1 else interaction.user
     loser_bal = await get_balance(loser_id)
     prize = max(1, int(loser_bal * 0.10))
-    await update_balance(loser_id, -prize)
-    await update_balance(winner_id, prize)
+    now_str = datetime.utcnow().isoformat()
+    await asyncio.gather(
+        update_balance(loser_id, -prize),
+        update_balance(winner_id, prize),
+    )
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("INSERT OR REPLACE INTO fight_cooldowns (user_id, last_fight) VALUES (?, ?)",
-                         (uid1, datetime.utcnow().isoformat()))
+                         (uid1, now_str))
         await db.commit()
-    new_lvl, _, pts_gained = await add_fighter_xp(winner_id, winner_fid, 15)
-    await add_fighter_xp(loser_id, loser_fid, 5)
+    (new_lvl, _, pts_gained), _ = await asyncio.gather(
+        add_fighter_xp(winner_id, winner_fid, 15),
+        add_fighter_xp(loser_id, loser_fid, 5),
+    )
     level_up_msg = f"\n🆙 **¡{winner_user.display_name} subió al nivel {new_lvl}!** +{pts_gained} puntos" if pts_gained else ""
     embed = discord.Embed(title="🥊 ¡COMBATE!", color=0xFF0000)
     embed.description = (
