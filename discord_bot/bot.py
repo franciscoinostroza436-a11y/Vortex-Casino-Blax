@@ -270,6 +270,19 @@ async def init_db():
             )
         """)
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS fighter_levels (
+                user_id TEXT,
+                fighter_id TEXT,
+                level INTEGER DEFAULT 1,
+                xp INTEGER DEFAULT 0,
+                points INTEGER DEFAULT 0,
+                bonus_hp INTEGER DEFAULT 0,
+                bonus_attack INTEGER DEFAULT 0,
+                bonus_defense INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, fighter_id)
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS inventory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT,
@@ -2449,25 +2462,77 @@ async def help_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-def simulate_fight(f1_id: str, f2_id: str) -> tuple[str, str]:
-    f1 = dict(FIGHTERS[f1_id]); f2 = dict(FIGHTERS[f2_id])
-    hp1, hp2 = f1["hp"], f2["hp"]
+async def get_fighter_stats(user_id: str, fighter_id: str) -> dict:
+    base = FIGHTERS[fighter_id]
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT level, xp, points, bonus_hp, bonus_attack, bonus_defense FROM fighter_levels WHERE user_id=? AND fighter_id=?",
+            (user_id, fighter_id)
+        ) as cur:
+            row = await cur.fetchone()
+    level, xp, pts, b_hp, b_atk, b_def = row if row else (1, 0, 0, 0, 0, 0)
+    return {
+        "name": base["name"],
+        "hp": base["hp"] + b_hp,
+        "attack": base["attack"] + b_atk,
+        "defense": base["defense"] + b_def,
+        "level": level, "xp": xp, "points": pts,
+        "bonus_hp": b_hp, "bonus_attack": b_atk, "bonus_defense": b_def,
+        "base_id": fighter_id,
+    }
+
+
+async def add_fighter_xp(user_id: str, fighter_id: str, xp_gain: int) -> tuple[int, int, int]:
+    """Returns (new_level, new_xp, points_gained)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT level, xp, points FROM fighter_levels WHERE user_id=? AND fighter_id=?",
+            (user_id, fighter_id)
+        ) as cur:
+            row = await cur.fetchone()
+    level, xp, points = row if row else (1, 0, 0)
+    xp += xp_gain
+    points_gained = 0
+    while xp >= level * 20:
+        xp -= level * 20
+        level += 1
+        points += 5
+        points_gained += 5
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO fighter_levels (user_id, fighter_id, level, xp, points) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(user_id, fighter_id) DO UPDATE SET level=excluded.level, xp=excluded.xp, points=excluded.points",
+            (user_id, fighter_id, level, xp, points)
+        )
+        await db.commit()
+    return level, xp, points_gained
+
+
+def simulate_fight_stats(s1: dict, s2: dict) -> tuple[int, str]:
+    """0 = primer luchador gana, 1 = segundo luchador gana"""
+    hp1, hp2 = s1["hp"], s2["hp"]
     log_lines = []
     turn = 0
     while hp1 > 0 and hp2 > 0:
         if turn % 2 == 0:
-            dmg = max(1, f1["attack"] - f2["defense"] // 2 + random.randint(-4, 6))
+            dmg = max(1, s1["attack"] - s2["defense"] // 2 + random.randint(-4, 6))
             hp2 -= dmg
-            log_lines.append(f"⚔️ **{f1['name']}** golpea por **{dmg}** dmg → {f2['name']} HP: {max(0, hp2)}")
+            log_lines.append(f"⚔️ **{s1['name']}** golpea por **{dmg}** dmg → {s2['name']} HP: {max(0, hp2)}")
         else:
-            dmg = max(1, f2["attack"] - f1["defense"] // 2 + random.randint(-4, 6))
+            dmg = max(1, s2["attack"] - s1["defense"] // 2 + random.randint(-4, 6))
             hp1 -= dmg
-            log_lines.append(f"⚔️ **{f2['name']}** golpea por **{dmg}** dmg → {f1['name']} HP: {max(0, hp1)}")
+            log_lines.append(f"⚔️ **{s2['name']}** golpea por **{dmg}** dmg → {s1['name']} HP: {max(0, hp1)}")
         turn += 1
-        if turn > 30:
+        if turn > 40:
             break
-    winner = f1_id if hp1 > hp2 else f2_id
-    return winner, "\n".join(log_lines[-6:])
+    winner_idx = 0 if hp1 > hp2 else 1
+    return winner_idx, "\n".join(log_lines[-6:])
+
+
+def simulate_fight(f1_id: str, f2_id: str) -> tuple[str, str]:
+    s1 = {**FIGHTERS[f1_id]}; s2 = {**FIGHTERS[f2_id]}
+    idx, log = simulate_fight_stats(s1, s2)
+    return (f1_id if idx == 0 else f2_id), log
 
 
 @tree.command(name="fighters", description="Muestra todos los luchadores disponibles para comprar")
@@ -2521,11 +2586,23 @@ async def myfighter_slash(interaction: discord.Interaction):
     if not row:
         await interaction.response.send_message("❌ No tienes luchador. Compra uno con `/buyfighter`.", ephemeral=True)
         return
-    f = FIGHTERS[row[0]]
-    embed = discord.Embed(title=f"🥊 Tu Luchador: {f['name']}", color=0xFF6B00)
+    fid = row[0]
+    s = await get_fighter_stats(user_id, fid)
+    base = FIGHTERS[fid]
+    xp_needed = s["level"] * 20
+    bar_filled = int((s["xp"] / xp_needed) * 10)
+    xp_bar = "█" * bar_filled + "░" * (10 - bar_filled)
+    embed = discord.Embed(title=f"🥊 {s['name']} — Nivel {s['level']}", color=0xFF6B00)
     embed.description = (
-        f"❤️ HP: **{f['hp']}** | ⚔️ ATK: **{f['attack']}** | 🛡️ DEF: **{f['defense']}**\n"
-        f"💰 Valor: **{f['price']:,}** 🪙\n\n_{f['description']}_"
+        f"**Stats actuales:**\n"
+        f"❤️ HP: **{s['hp']}** (+{s['bonus_hp']})\n"
+        f"⚔️ ATK: **{s['attack']}** (+{s['bonus_attack']})\n"
+        f"🛡️ DEF: **{s['defense']}** (+{s['bonus_defense']})\n\n"
+        f"📊 XP: `{xp_bar}` {s['xp']}/{xp_needed}\n"
+        f"🎯 Puntos disponibles: **{s['points']}**\n\n"
+        f"_{base['description']}_\n\n"
+        f"Usa `,addpuntos <stat> <cantidad>` para mejorar tu luchador.\n"
+        f"Stats: `ataque`, `defensa`, `salud`"
     )
     await interaction.response.send_message(embed=embed)
 
@@ -2562,10 +2639,15 @@ async def fight_slash(interaction: discord.Interaction, usuario: discord.Member)
     if not r2:
         await interaction.response.send_message(f"❌ **{usuario.name}** no tiene luchador.", ephemeral=True)
         return
-    winner_id, battle_log = simulate_fight(r1[0], r2[0])
-    loser_id = uid2 if winner_id == uid1 else uid1
+    s1 = await get_fighter_stats(uid1, r1[0])
+    s2 = await get_fighter_stats(uid2, r2[0])
+    win_idx, battle_log = simulate_fight_stats(s1, s2)
+    winner_id = uid1 if win_idx == 0 else uid2
+    loser_id  = uid2 if win_idx == 0 else uid1
+    winner_fid = r1[0] if win_idx == 0 else r2[0]
+    loser_fid  = r2[0] if win_idx == 0 else r1[0]
     winner_user = interaction.user if winner_id == uid1 else usuario
-    loser_user = usuario if winner_id == uid1 else interaction.user
+    loser_user  = usuario if winner_id == uid1 else interaction.user
     loser_bal = await get_balance(loser_id)
     prize = max(1, int(loser_bal * 0.10))
     await update_balance(loser_id, -prize)
@@ -2574,13 +2656,17 @@ async def fight_slash(interaction: discord.Interaction, usuario: discord.Member)
         await db.execute("INSERT OR REPLACE INTO fight_cooldowns (user_id, last_fight) VALUES (?, ?)",
                          (uid1, datetime.utcnow().isoformat()))
         await db.commit()
-    f1 = FIGHTERS[r1[0]]; f2 = FIGHTERS[r2[0]]
+    new_lvl, _, pts_gained = await add_fighter_xp(winner_id, winner_fid, 15)
+    await add_fighter_xp(loser_id, loser_fid, 5)
+    level_up_msg = f"\n🆙 **¡{winner_user.display_name} subió al nivel {new_lvl}!** +{pts_gained} puntos" if pts_gained else ""
     embed = discord.Embed(title="🥊 ¡COMBATE!", color=0xFF0000)
     embed.description = (
-        f"**{interaction.user.display_name}** ({f1['name']}) vs **{usuario.display_name}** ({f2['name']})\n\n"
+        f"**{interaction.user.display_name}** ({s1['name']} Nv.{s1['level']}) vs "
+        f"**{usuario.display_name}** ({s2['name']} Nv.{s2['level']})\n\n"
         f"{battle_log}\n\n"
         f"🏆 **¡{winner_user.mention} gana!**\n"
         f"💰 Premio: **{prize:,}** 🪙 de {loser_user.mention}"
+        f"{level_up_msg}"
     )
     await interaction.response.send_message(embed=embed)
 
@@ -2675,16 +2761,19 @@ class FighterTournamentView(discord.ui.View):
             while i < len(players):
                 if i + 1 < len(players):
                     p1 = players[i]; p2 = players[i + 1]
-                    winner_fid, log = simulate_fight(p1[2], p2[2])
-                    winner = p1 if winner_fid == p1[2] else p2
-                    loser  = p2 if winner == p1 else p1
-                    if winner_fid == p1[2] and p2[2] == p1[2]:
-                        winner = random.choice([p1, p2])
-                        loser  = p2 if winner == p1 else p1
+                    s1 = await get_fighter_stats(p1[0], p1[2])
+                    s2 = await get_fighter_stats(p2[0], p2[2])
+                    win_idx, log = simulate_fight_stats(s1, s2)
+                    winner = p1 if win_idx == 0 else p2
+                    loser  = p2 if win_idx == 0 else p1
+                    w_fid = winner[2]; l_fid = loser[2]
+                    new_lvl, _, pts_g = await add_fighter_xp(winner[0], w_fid, 20)
+                    await add_fighter_xp(loser[0], l_fid, 5)
+                    lvl_note = f" 🆙Nv.{new_lvl}" if pts_g else ""
                     round_text.append(
-                        f"⚔️ **{p1[1]}** vs **{p2[1]}**\n"
+                        f"⚔️ **{p1[1]}** ({s1['name']} Nv.{s1['level']}) vs **{p2[1]}** ({s2['name']} Nv.{s2['level']})\n"
                         f"{log}\n"
-                        f"✅ Avanza: **{winner[1]}**\n"
+                        f"✅ Avanza: **{winner[1]}**{lvl_note}\n"
                     )
                     next_round.append(winner)
                     i += 2
@@ -2711,6 +2800,50 @@ class FighterTournamentView(discord.ui.View):
             f"💼 Saldo nuevo: **{champ_bal:,}** 🪙"
         )
         await channel.send(embed=embed)
+
+
+@tree.command(name="addpuntos", description="Agrega puntos a los stats de tu luchador")
+@app_commands.describe(stat="Stat a mejorar: ataque, defensa, salud", cantidad="Cuántos puntos invertir")
+async def addpuntos_slash(interaction: discord.Interaction, stat: str, cantidad: int):
+    user_id = str(interaction.user.id)
+    stat = stat.lower().strip()
+    if stat not in ("ataque", "defensa", "salud"):
+        await interaction.response.send_message("❌ Stat inválido. Usa: `ataque`, `defensa` o `salud`.", ephemeral=True)
+        return
+    if cantidad <= 0:
+        await interaction.response.send_message("❌ La cantidad debe ser mayor a 0.", ephemeral=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT fighter_id FROM fighters WHERE user_id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
+    if not row:
+        await interaction.response.send_message("❌ No tienes luchador. Compra uno con `/buyfighter`.", ephemeral=True)
+        return
+    fid = row[0]
+    s = await get_fighter_stats(user_id, fid)
+    if s["points"] < cantidad:
+        await interaction.response.send_message(f"❌ Solo tienes **{s['points']}** puntos disponibles.", ephemeral=True)
+        return
+    col_map = {"ataque": "bonus_attack", "defensa": "bonus_defense", "salud": "bonus_hp"}
+    val_map  = {"ataque": cantidad * 2, "defensa": cantidad * 2, "salud": cantidad * 5}
+    col = col_map[stat]; bonus_gain = val_map[stat]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            f"INSERT INTO fighter_levels (user_id, fighter_id, points, {col}) VALUES (?,?,?,?) "
+            f"ON CONFLICT(user_id, fighter_id) DO UPDATE SET points=points-?, {col}={col}+?",
+            (user_id, fid, -cantidad, bonus_gain, cantidad, bonus_gain)
+        )
+        await db.commit()
+    s2 = await get_fighter_stats(user_id, fid)
+    stat_emoji = {"ataque": "⚔️", "defensa": "🛡️", "salud": "❤️"}[stat]
+    embed = discord.Embed(title="📈 ¡Stat Mejorado!", color=0x00FF88)
+    embed.description = (
+        f"{stat_emoji} **{stat.capitalize()}** +{bonus_gain} puntos de stat\n"
+        f"🎯 Puntos restantes: **{s2['points']}**\n\n"
+        f"**Stats actuales de {s2['name']}:**\n"
+        f"❤️ HP: **{s2['hp']}** | ⚔️ ATK: **{s2['attack']}** | 🛡️ DEF: **{s2['defense']}**"
+    )
+    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="ftorneo", description="Crea un torneo de luchadores. El campeón gana 60 millones.")
@@ -3571,11 +3704,23 @@ async def on_message(message: discord.Message):
         if not row:
             await message.channel.send("❌ No tienes luchador. Compra uno con `,buyfighter`.")
             return
-        f = FIGHTERS[row[0]]
-        embed = discord.Embed(title=f"🥊 Tu Luchador: {f['name']}", color=0xFF6B00)
+        fid = row[0]
+        s = await get_fighter_stats(user_id, fid)
+        base = FIGHTERS[fid]
+        xp_needed = s["level"] * 20
+        bar_filled = int((s["xp"] / xp_needed) * 10) if xp_needed > 0 else 0
+        xp_bar = "█" * bar_filled + "░" * (10 - bar_filled)
+        embed = discord.Embed(title=f"🥊 {s['name']} — Nivel {s['level']}", color=0xFF6B00)
         embed.description = (
-            f"❤️ HP: **{f['hp']}** | ⚔️ ATK: **{f['attack']}** | 🛡️ DEF: **{f['defense']}**\n"
-            f"💰 Valor: **{f['price']:,}** 🪙\n\n_{f['description']}_"
+            f"**Stats actuales:**\n"
+            f"❤️ HP: **{s['hp']}** (+{s['bonus_hp']})\n"
+            f"⚔️ ATK: **{s['attack']}** (+{s['bonus_attack']})\n"
+            f"🛡️ DEF: **{s['defense']}** (+{s['bonus_defense']})\n\n"
+            f"📊 XP: `{xp_bar}` {s['xp']}/{xp_needed}\n"
+            f"🎯 Puntos disponibles: **{s['points']}**\n\n"
+            f"_{base['description']}_\n\n"
+            f"Usa `,addpuntos <stat> <cantidad>` para mejorar tu luchador.\n"
+            f"Stats: `ataque`, `defensa`, `salud`"
         )
         await message.channel.send(embed=embed)
 
@@ -3614,25 +3759,84 @@ async def on_message(message: discord.Message):
         if not r2:
             await message.channel.send(f"❌ **{target.name}** no tiene luchador.")
             return
-        winner_id, battle_log = simulate_fight(r1[0], r2[0])
-        loser_id = uid2 if winner_id == user_id else user_id
+        s1 = await get_fighter_stats(user_id, r1[0])
+        s2 = await get_fighter_stats(uid2, r2[0])
+        win_idx, battle_log = simulate_fight_stats(s1, s2)
+        winner_id  = user_id if win_idx == 0 else uid2
+        loser_id   = uid2 if win_idx == 0 else user_id
+        winner_fid = r1[0] if win_idx == 0 else r2[0]
+        loser_fid  = r2[0] if win_idx == 0 else r1[0]
         winner_mem = message.author if winner_id == user_id else target
-        loser_mem = target if winner_id == user_id else message.author
+        loser_mem  = target if winner_id == user_id else message.author
         loser_bal = await get_balance(loser_id)
         prize = max(1, int(loser_bal * 0.10))
         await update_balance(loser_id, -prize)
-        await update_balance(user_id if winner_id == user_id else uid2, prize)
+        await update_balance(winner_id, prize)
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("INSERT OR REPLACE INTO fight_cooldowns (user_id, last_fight) VALUES (?, ?)",
                              (user_id, datetime.utcnow().isoformat()))
             await db.commit()
-        f1 = FIGHTERS[r1[0]]; f2 = FIGHTERS[r2[0]]
+        new_lvl, _, pts_gained = await add_fighter_xp(winner_id, winner_fid, 15)
+        await add_fighter_xp(loser_id, loser_fid, 5)
+        level_up_msg = f"\n🆙 **¡{winner_mem.display_name} subió al nivel {new_lvl}!** +{pts_gained} puntos" if pts_gained else ""
         embed = discord.Embed(title="🥊 ¡COMBATE!", color=0xFF0000)
         embed.description = (
-            f"**{message.author.display_name}** ({f1['name']}) vs **{target.display_name}** ({f2['name']})\n\n"
+            f"**{message.author.display_name}** ({s1['name']} Nv.{s1['level']}) vs "
+            f"**{target.display_name}** ({s2['name']} Nv.{s2['level']})\n\n"
             f"{battle_log}\n\n"
             f"🏆 **¡{winner_mem.mention} gana!**\n"
             f"💰 Premio: **{prize:,}** 🪙 de {loser_mem.mention}"
+            f"{level_up_msg}"
+        )
+        await message.channel.send(embed=embed)
+
+    # ,addpuntos <stat> <cantidad>
+    elif cmd == "addpuntos":
+        await get_or_create_user(user_id, message.author.name)
+        if len(args) < 2:
+            await message.channel.send("❌ Uso: `,addpuntos <stat> <cantidad>` — Stats: `ataque`, `defensa`, `salud`")
+            return
+        stat = args[0].lower()
+        if stat not in ("ataque", "defensa", "salud"):
+            await message.channel.send("❌ Stat inválido. Usa: `ataque`, `defensa` o `salud`.")
+            return
+        try:
+            cantidad = int(args[1])
+        except ValueError:
+            await message.channel.send("❌ La cantidad debe ser un número entero.")
+            return
+        if cantidad <= 0:
+            await message.channel.send("❌ La cantidad debe ser mayor a 0.")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT fighter_id FROM fighters WHERE user_id=?", (user_id,)) as cur:
+                row = await cur.fetchone()
+        if not row:
+            await message.channel.send("❌ No tienes luchador. Compra uno con `,buyfighter`.")
+            return
+        fid = row[0]
+        s = await get_fighter_stats(user_id, fid)
+        if s["points"] < cantidad:
+            await message.channel.send(f"❌ Solo tienes **{s['points']}** puntos disponibles.")
+            return
+        col_map  = {"ataque": "bonus_attack", "defensa": "bonus_defense", "salud": "bonus_hp"}
+        val_map  = {"ataque": cantidad * 2, "defensa": cantidad * 2, "salud": cantidad * 5}
+        col = col_map[stat]; bonus_gain = val_map[stat]
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                f"INSERT INTO fighter_levels (user_id, fighter_id, points, {col}) VALUES (?,?,?,?) "
+                f"ON CONFLICT(user_id, fighter_id) DO UPDATE SET points=points-?, {col}={col}+?",
+                (user_id, fid, -cantidad, bonus_gain, cantidad, bonus_gain)
+            )
+            await db.commit()
+        s2 = await get_fighter_stats(user_id, fid)
+        stat_emoji = {"ataque": "⚔️", "defensa": "🛡️", "salud": "❤️"}[stat]
+        embed = discord.Embed(title="📈 ¡Stat Mejorado!", color=0x00FF88)
+        embed.description = (
+            f"{stat_emoji} **{stat.capitalize()}** +{bonus_gain} puntos de stat\n"
+            f"🎯 Puntos restantes: **{s2['points']}**\n\n"
+            f"**Stats actuales de {s2['name']}:**\n"
+            f"❤️ HP: **{s2['hp']}** | ⚔️ ATK: **{s2['attack']}** | 🛡️ DEF: **{s2['defense']}**"
         )
         await message.channel.send(embed=embed)
 
