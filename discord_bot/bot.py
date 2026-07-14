@@ -350,7 +350,7 @@ async def get_bank(user_id: str) -> int:
             return row[0] if row else 0
 
 
-MAX_BALANCE = 5_000_000_000_000_000_000_000_000
+MAX_BALANCE = 1_000_000_000_000_000
 
 
 async def update_bank(user_id: str, amount: int):
