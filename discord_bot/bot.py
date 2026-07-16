@@ -155,8 +155,16 @@ RED_NUMBERS = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
 BLACK_NUMBERS = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
 
 def evaluate_roulette_bet(numero: int, bet: str) -> tuple[bool, int, str]:
-    """Returns (won, multiplier, display_name). multiplier=1 → 1:1, 2 → 2:1."""
+    """Returns (won, multiplier, display_name). multiplier=1→1:1, 2→2:1, 35→35:1."""
     bet = bet.lower().strip()
+    # Straight-up number bet (0–36) → 35:1
+    try:
+        target = int(bet)
+        if 0 <= target <= 36:
+            num_col = "🟢" if target == 0 else ("🔴" if target in RED_NUMBERS else "⚫")
+            return numero == target, 35, f"🎯 Número {num_col} {target}"
+    except ValueError:
+        pass
     if numero == 0:
         return False, 0, bet
     is_red  = numero in RED_NUMBERS
@@ -823,20 +831,37 @@ async def withdraw(interaction: discord.Interaction, cantidad: str):
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="roulette", description="Juega a la ruleta — rojo, negro, par, impar, 1ra/2da/3ra docena")
-@app_commands.describe(cantidad="Cantidad a apostar", apuesta="Elige tu apuesta")
+@tree.command(name="roulette", description="Juega a la ruleta — rojo, negro, par, impar, docenas o número exacto 35:1")
+@app_commands.describe(
+    cantidad="Cantidad a apostar",
+    apuesta="Tipo de apuesta (color/par/impar/docena)",
+    numero="Número exacto del 0 al 36 — paga 35:1 (ignora 'apuesta' si se usa)",
+)
 @app_commands.choices(apuesta=[
-    app_commands.Choice(name="🔴 Rojo (1:1)",           value="rojo"),
-    app_commands.Choice(name="⚫ Negro (1:1)",           value="negro"),
-    app_commands.Choice(name="🔵 Par / Even (1:1)",     value="even"),
-    app_commands.Choice(name="🟣 Impar / Odd (1:1)",    value="odd"),
-    app_commands.Choice(name="1️⃣ 1ra Docena 1-12 (2:1)", value="1st"),
+    app_commands.Choice(name="🔴 Rojo (1:1)",              value="rojo"),
+    app_commands.Choice(name="⚫ Negro (1:1)",              value="negro"),
+    app_commands.Choice(name="🔵 Par / Even (1:1)",        value="even"),
+    app_commands.Choice(name="🟣 Impar / Odd (1:1)",       value="odd"),
+    app_commands.Choice(name="1️⃣ 1ra Docena 1-12 (2:1)",  value="1st"),
     app_commands.Choice(name="2️⃣ 2da Docena 13-24 (2:1)", value="2nd"),
     app_commands.Choice(name="3️⃣ 3ra Docena 25-36 (2:1)", value="3rd"),
 ])
-async def roulette(interaction: discord.Interaction, cantidad: int, apuesta: str):
+async def roulette(
+    interaction: discord.Interaction,
+    cantidad: int,
+    apuesta: str | None = None,
+    numero: int | None = None,
+):
     if cantidad <= 0:
         await interaction.response.send_message("❌ La apuesta debe ser mayor a 0.", ephemeral=True)
+        return
+    if apuesta is None and numero is None:
+        await interaction.response.send_message(
+            "❌ Elige una `apuesta` (rojo/negro/…) **o** un `numero` exacto (0-36).", ephemeral=True
+        )
+        return
+    if numero is not None and not (0 <= numero <= 36):
+        await interaction.response.send_message("❌ El número debe estar entre 0 y 36.", ephemeral=True)
         return
 
     user_id = str(interaction.user.id)
@@ -849,23 +874,22 @@ async def roulette(interaction: discord.Interaction, cantidad: int, apuesta: str
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
-    numero = random.randint(0, 36)
-    if numero == 0:
-        num_emoji = "🟢"
-    elif numero in RED_NUMBERS:
-        num_emoji = "🔴"
-    else:
-        num_emoji = "⚫"
+    resultado = random.randint(0, 36)
+    num_emoji = "🟢" if resultado == 0 else ("🔴" if resultado in RED_NUMBERS else "⚫")
 
-    won, mult, bet_display = evaluate_roulette_bet(numero, apuesta)
+    # número exacto tiene prioridad
+    bet_key = str(numero) if numero is not None else apuesta
+    won, mult, bet_display = evaluate_roulette_bet(resultado, bet_key)
 
     if won:
         ganancia = cantidad * mult
         await update_balance(user_id, ganancia)
         new_balance = bal + ganancia
-        embed = discord.Embed(title="🎰 ¡GANASTE!", color=0x00FF88)
+        title = "🎰 ¡¡NÚMERO EXACTO!!" if mult == 35 else "🎰 ¡GANASTE!"
+        color = 0xFFD700 if mult == 35 else 0x00FF88
+        embed = discord.Embed(title=title, color=color)
         embed.description = (
-            f"La ruleta cayó en **{num_emoji} {numero}**\n"
+            f"La ruleta cayó en **{num_emoji} {resultado}**\n"
             f"Apostaste: **{bet_display}** ✅\n\n"
             f"💰 Ganaste **{ganancia:,}** 🪙 (x{mult})\n"
             f"Saldo actual: **{new_balance:,}** 🪙"
@@ -875,7 +899,7 @@ async def roulette(interaction: discord.Interaction, cantidad: int, apuesta: str
         new_balance = bal - cantidad
         embed = discord.Embed(title="🎰 Perdiste...", color=0xFF4444)
         embed.description = (
-            f"La ruleta cayó en **{num_emoji} {numero}**\n"
+            f"La ruleta cayó en **{num_emoji} {resultado}**\n"
             f"Apostaste: **{bet_display}** ❌\n\n"
             f"💸 Perdiste **{cantidad:,}** 🪙\n"
             f"Saldo actual: **{new_balance:,}** 🪙"
@@ -3065,10 +3089,12 @@ async def on_message(message: discord.Message):
         await get_or_create_user(user_id, message.author.name)
         bal = await get_balance(user_id)
 
-        args_str = " ".join(args).lower()
-        amount = None
-        bet_type = None
-
+        ROULETTE_HELP = (
+            "❌ Uso: `,roulette <cantidad|all> <apuesta>`\n"
+            "Apuestas: `red` `black` `even` `odd` `1st` `2nd` `3rd`\n"
+            "Número exacto (0-36): `,roulette 1000 17` — paga **35:1** 🎯\n"
+            "Ejemplos: `,roulette all red` · `,roulette 1000 even` · `,roulette 500 17`"
+        )
         BET_ALIASES = {
             "red": "red", "rojo": "red",
             "black": "black", "negro": "black",
@@ -3079,24 +3105,32 @@ async def on_message(message: discord.Message):
             "3rd": "3rd", "tercera": "3rd",
         }
 
-        if "all" in args_str:
+        if len(args) < 2:
+            await message.channel.send(ROULETTE_HELP)
+            return
+
+        amount_str = args[0].lower()
+        bet_str    = args[1].lower()
+
+        if amount_str == "all":
             amount = bal
-        for a in args:
-            al = a.lower()
-            if al in BET_ALIASES:
-                bet_type = BET_ALIASES[al]
-            else:
-                try:
-                    amount = int(a)
-                except ValueError:
-                    pass
+        else:
+            try:
+                amount = int(amount_str)
+            except ValueError:
+                await message.channel.send(ROULETTE_HELP)
+                return
+
+        if bet_str in BET_ALIASES:
+            bet_type = BET_ALIASES[bet_str]
+        elif bet_str.isdigit() and 0 <= int(bet_str) <= 36:
+            bet_type = bet_str          # número exacto 35:1
+        else:
+            await message.channel.send(ROULETTE_HELP)
+            return
 
         if amount is None or bet_type is None:
-            await message.channel.send(
-                "❌ Uso: `,roulette <cantidad|all> <apuesta>`\n"
-                "Apuestas: `red` `black` `even` `odd` `1st` `2nd` `3rd`\n"
-                "Ejemplos: `,roulette all red` · `,roulette 1000 even` · `,roulette 500 1st`"
-            )
+            await message.channel.send(ROULETTE_HELP)
             return
         if amount <= 0:
             await message.channel.send("❌ La apuesta debe ser mayor a 0.")
