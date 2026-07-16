@@ -351,6 +351,14 @@ async def init_db():
                 completed INTEGER DEFAULT 0,
                 reset_date TEXT,
                 PRIMARY KEY (user_id, mission_id)
+            );
+            CREATE TABLE IF NOT EXISTS bet_history (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id   TEXT    NOT NULL,
+                game      TEXT    NOT NULL,
+                amount_bet INTEGER NOT NULL,
+                net       INTEGER NOT NULL,
+                ts        TEXT    NOT NULL
             )
         """)
         await db.commit()
@@ -372,6 +380,16 @@ async def get_balance(user_id: str) -> int:
         async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
+
+
+async def log_bet(user_id: str, game: str, amount_bet: int, net: int):
+    """Record a completed bet in bet_history. net>0 = won, net<0 = lost."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO bet_history (user_id, game, amount_bet, net, ts) VALUES (?,?,?,?,?)",
+            (user_id, game, amount_bet, net, datetime.utcnow().isoformat())
+        )
+        await db.commit()
 
 
 async def get_bank(user_id: str) -> int:
@@ -950,6 +968,7 @@ async def roulette(
     embed, net = _build_multibets_embed(resultado, slots, bal)
     await update_balance(user_id, net)
     await track_mission(user_id, "roulette_played")
+    await log_bet(user_id, "🎰 Ruleta", sum(a for a, _ in slots), net)
     await interaction.response.send_message(embed=embed)
 
 
@@ -1027,6 +1046,7 @@ async def slots(interaction: discord.Interaction, cantidad: int):
         )
 
     await track_mission(user_id, "slots_played")
+    await log_bet(user_id, "🎰 Slots", cantidad, new_balance - bal)
     await interaction.response.send_message(embed=embed)
 
 
@@ -3246,6 +3266,7 @@ class LiveRouletteView(discord.ui.View):
             if credit > 0:
                 await update_balance(uid, credit)
             await track_mission(uid, "roulette_played")
+            await log_bet(uid, "🎰 Ruleta Viva", total_staked, credit - total_staked)
 
             true_net = credit - total_staked
             net_str = f"+{true_net:,}" if true_net >= 0 else f"{true_net:,}"
@@ -3269,6 +3290,55 @@ class LiveRouletteView(discord.ui.View):
                 await self.message.edit(embed=embed, view=self)
             except Exception:
                 pass
+
+
+@tree.command(name="historial", description="Muestra tus últimas 10 apuestas con ganancias/pérdidas")
+async def historial_slash(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    await get_or_create_user(user_id, interaction.user.name)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT game, amount_bet, net, ts FROM bet_history WHERE user_id=? ORDER BY id DESC LIMIT 10",
+            (user_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+        async with db.execute(
+            "SELECT COUNT(*), SUM(amount_bet), SUM(net) FROM bet_history WHERE user_id=?",
+            (user_id,)
+        ) as cur:
+            stats = await cur.fetchone()
+
+    embed = discord.Embed(title=f"📊 Historial de {interaction.user.display_name}", color=0x3498DB)
+    if not rows:
+        embed.description = "No tienes apuestas registradas todavía.\nJuega a la ruleta o slots para empezar."
+    else:
+        lines = []
+        for game, amount_bet, net, ts in rows:
+            try:
+                dt = datetime.fromisoformat(ts)
+                date_str = dt.strftime("%d/%m %H:%M")
+            except Exception:
+                date_str = "—"
+            icon = "✅" if net >= 0 else "❌"
+            net_str = f"+{net:,}" if net >= 0 else f"{net:,}"
+            lines.append(f"{icon} **{game}** — apostado: {amount_bet:,} 🪙 → **{net_str}** 🪙 _{date_str}_")
+        embed.description = "\n".join(lines)
+
+        total_games, total_wagered, total_net = stats
+        total_wagered = total_wagered or 0
+        total_net = total_net or 0
+        net_color = "🟢" if total_net >= 0 else "🔴"
+        total_net_str = f"+{total_net:,}" if total_net >= 0 else f"{total_net:,}"
+        embed.add_field(
+            name="📈 Estadísticas totales",
+            value=(
+                f"🎲 Partidas jugadas: **{total_games}**\n"
+                f"💸 Total apostado: **{total_wagered:,}** 🪙\n"
+                f"{net_color} Balance neto: **{total_net_str}** 🪙"
+            ),
+            inline=False,
+        )
+    await interaction.response.send_message(embed=embed)
 
 
 @tree.command(name="ruleta-en-vivo", description="Abre una mesa de ruleta — todos apuestan y el resultado es colectivo")
@@ -3468,6 +3538,7 @@ async def on_message(message: discord.Message):
         embed, net = _build_multibets_embed(resultado, slots, bal)
         await update_balance(user_id, net)
         await track_mission(user_id, "roulette_played")
+        await log_bet(user_id, "🎰 Ruleta", sum(a for a, _ in slots), net)
         await message.channel.send(embed=embed)
 
     # ,bj <cantidad|all>
@@ -4932,6 +5003,53 @@ async def on_message(message: discord.Message):
             f"Vendiste **{item_data['name']}** por **{sell_price:,}** 🪙 (50% del precio original).\n\n"
             f"Saldo actual: **{new_balance:,}** 🪙\nTe quedan **{qty - 1}** unidades en inventario."
         )
+        await message.channel.send(embed=embed)
+
+    # ,historial — últimas 10 apuestas
+    elif cmd in ("historial", "history", "stats"):
+        await get_or_create_user(user_id, message.author.name)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT game, amount_bet, net, ts FROM bet_history WHERE user_id=? ORDER BY id DESC LIMIT 10",
+                (user_id,)
+            ) as cur:
+                rows = await cur.fetchall()
+            async with db.execute(
+                "SELECT COUNT(*), SUM(amount_bet), SUM(net) FROM bet_history WHERE user_id=?",
+                (user_id,)
+            ) as cur:
+                stats = await cur.fetchone()
+
+        embed = discord.Embed(title=f"📊 Historial de {message.author.display_name}", color=0x3498DB)
+        if not rows:
+            embed.description = "No tienes apuestas registradas todavía.\nJuega a la ruleta o slots para empezar."
+        else:
+            lines = []
+            for game, amount_bet, net, ts in rows:
+                try:
+                    dt = datetime.fromisoformat(ts)
+                    date_str = dt.strftime("%d/%m %H:%M")
+                except Exception:
+                    date_str = "—"
+                icon = "✅" if net >= 0 else "❌"
+                net_str = f"+{net:,}" if net >= 0 else f"{net:,}"
+                lines.append(f"{icon} **{game}** — {amount_bet:,} 🪙 → **{net_str}** 🪙 _{date_str}_")
+            embed.description = "\n".join(lines)
+
+            total_games, total_wagered, total_net = stats
+            total_wagered = total_wagered or 0
+            total_net = total_net or 0
+            net_color = "🟢" if total_net >= 0 else "🔴"
+            total_net_str = f"+{total_net:,}" if total_net >= 0 else f"{total_net:,}"
+            embed.add_field(
+                name="📈 Estadísticas totales",
+                value=(
+                    f"🎲 Partidas jugadas: **{total_games}**\n"
+                    f"💸 Total apostado: **{total_wagered:,}** 🪙\n"
+                    f"{net_color} Balance neto: **{total_net_str}** 🪙"
+                ),
+                inline=False,
+            )
         await message.channel.send(embed=embed)
 
     # ,lroulette [segundos] — ruleta en vivo con temporizador
