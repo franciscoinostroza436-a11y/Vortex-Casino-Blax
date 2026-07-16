@@ -187,7 +187,6 @@ def evaluate_roulette_bet(numero: int, bet: str) -> tuple[bool, int, str]:
 
 # ───────────────────── TARJETAS DE FÚTBOL ─────────────────────────────────
 
-PACK_PRICE   = 10_000   # 🪙 por paquete
 CARDS_PER_PACK = 3
 
 RARITY_CONFIG = {
@@ -196,6 +195,45 @@ RARITY_CONFIG = {
     "raro":       {"emoji": "💙", "color": 0x3498DB, "label": "RARO",       "weight": 10},
     "poco_comun": {"emoji": "💚", "color": 0x2ECC71, "label": "POCO COMÚN", "weight": 25},
     "comun":      {"emoji": "🩶", "color": 0x95A5A6, "label": "COMÚN",      "weight": 60},
+}
+
+# 5 tipos de sobres — precio y rareza garantizada
+PACK_TYPES: dict[str, dict] = {
+    "comun": {
+        "label": "Sobre Común",       "emoji": "🩶", "price": 1_000,
+        "guaranteed": "comun",
+        "fill_pool": ["comun"],
+    },
+    "poco_comun": {
+        "label": "Sobre Poco Común",  "emoji": "💚", "price": 10_000,
+        "guaranteed": "poco_comun",
+        "fill_pool": ["comun", "poco_comun"],
+    },
+    "raro": {
+        "label": "Sobre Raro",        "emoji": "💙", "price": 50_000,
+        "guaranteed": "raro",
+        "fill_pool": ["comun", "poco_comun", "raro"],
+    },
+    "epico": {
+        "label": "Sobre Épico",       "emoji": "💜", "price": 150_000,
+        "guaranteed": "epico",
+        "fill_pool": ["poco_comun", "raro", "epico"],
+    },
+    "legendario": {
+        "label": "Sobre Legendario",  "emoji": "🌟", "price": 500_000,
+        "guaranteed": "legendario",
+        "fill_pool": ["raro", "epico", "legendario"],
+    },
+}
+
+# alias de texto → clave interna
+_PACK_ALIASES: dict[str, str] = {
+    "comun": "comun", "común": "comun", "c": "comun",
+    "poco_comun": "poco_comun", "pococ": "poco_comun", "pc": "poco_comun",
+    "poco": "poco_comun", "poco comun": "poco_comun",
+    "raro": "raro", "r": "raro",
+    "epico": "epico", "épico": "epico", "e": "epico",
+    "legendario": "legendario", "legend": "legendario", "l": "legendario",
 }
 
 FOOTBALL_CARDS: dict[str, dict] = {
@@ -270,19 +308,28 @@ FOOTBALL_CARDS: dict[str, dict] = {
     "havertz":     {"name": "Kai Havertz",         "team": "Alemania",        "pos": "DEL", "ovr": 84,  "rarity": "comun"},
 }
 
-# ─── pesos para el sorteo ────────────────────────────────────────────────
+# ─── índice por rareza ────────────────────────────────────────────────────
 _CARD_IDS_BY_RARITY: dict[str, list[str]] = {r: [] for r in RARITY_CONFIG}
 for _cid, _cdata in FOOTBALL_CARDS.items():
     _CARD_IDS_BY_RARITY[_cdata["rarity"]].append(_cid)
 
 
-def _draw_random_card() -> str:
-    """Pick a random card_id respecting rarity weights."""
-    rarities  = list(RARITY_CONFIG.keys())
-    weights   = [RARITY_CONFIG[r]["weight"] for r in rarities]
-    chosen_rarity = random.choices(rarities, weights=weights, k=1)[0]
-    pool = _CARD_IDS_BY_RARITY[chosen_rarity]
-    return random.choice(pool)
+def _draw_from_pool(pool_rarities: list[str]) -> str:
+    """Draw one card_id from a subset of rarities (weighted by RARITY_CONFIG weight)."""
+    weights = [RARITY_CONFIG[r]["weight"] for r in pool_rarities]
+    chosen = random.choices(pool_rarities, weights=weights, k=1)[0]
+    return random.choice(_CARD_IDS_BY_RARITY[chosen])
+
+
+def _draw_pack_cards(pack_key: str) -> list[str]:
+    """Draw CARDS_PER_PACK cards for the given pack type.
+    Slot 0 is always the guaranteed rarity; remaining slots come from fill_pool."""
+    pt = PACK_TYPES[pack_key]
+    guaranteed = random.choice(_CARD_IDS_BY_RARITY[pt["guaranteed"]])
+    fill = [_draw_from_pool(pt["fill_pool"]) for _ in range(CARDS_PER_PACK - 1)]
+    cards = [guaranteed] + fill
+    random.shuffle(cards)
+    return cards
 
 
 def _card_line(card_id: str, qty: int = 1) -> str:
@@ -300,6 +347,29 @@ async def _add_card(user_id: str, card_id: str):
             (user_id, card_id)
         )
         await db.commit()
+
+
+async def _remove_card(user_id: str, card_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE football_cards SET quantity = quantity - 1 WHERE user_id=? AND card_id=?",
+            (user_id, card_id)
+        )
+        await db.execute(
+            "DELETE FROM football_cards WHERE user_id=? AND card_id=? AND quantity <= 0",
+            (user_id, card_id)
+        )
+        await db.commit()
+
+
+async def _card_qty(user_id: str, card_id: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT quantity FROM football_cards WHERE user_id=? AND card_id=?",
+            (user_id, card_id)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
 
 
 async def _get_collection(user_id: str) -> list[tuple[str, int]]:
@@ -3429,35 +3499,43 @@ class LiveRouletteView(discord.ui.View):
                 pass
 
 
-@tree.command(name="abrirpaquete", description="Abre un paquete de tarjetas de fútbol — 10,000 🪙")
-async def abrirpaquete_slash(interaction: discord.Interaction):
+@tree.command(name="abrirpaquete", description="Abre un sobre de tarjetas de fútbol")
+@app_commands.describe(tipo="Tipo de sobre: comun / poco_comun / raro / epico / legendario")
+async def abrirpaquete_slash(interaction: discord.Interaction, tipo: str = "comun"):
+    pack_key = _PACK_ALIASES.get(tipo.lower().strip())
+    if not pack_key:
+        lines = "\n".join(
+            f"{pt['emoji']} `{k}` — {pt['label']} · **{pt['price']:,}** 🪙"
+            for k, pt in PACK_TYPES.items()
+        )
+        embed = discord.Embed(title="❌ Tipo de sobre inválido", color=0xFF4444,
+                               description=f"Tipos disponibles:\n{lines}")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    pt = PACK_TYPES[pack_key]
     user_id = str(interaction.user.id)
     await get_or_create_user(user_id, interaction.user.name)
     bal = await get_balance(user_id)
-    if bal < PACK_PRICE:
+    if bal < pt["price"]:
         embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
-        embed.description = f"Un paquete cuesta **{PACK_PRICE:,}** 🪙. Tienes **{bal:,}** 🪙."
+        embed.description = f"{pt['emoji']} **{pt['label']}** cuesta **{pt['price']:,}** 🪙. Tienes **{bal:,}** 🪙."
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
     await interaction.response.defer()
-    await update_balance(user_id, -PACK_PRICE)
-    drawn = [_draw_random_card() for _ in range(CARDS_PER_PACK)]
+    await update_balance(user_id, -pt["price"])
+    drawn = _draw_pack_cards(pack_key)
     for cid in drawn:
         await _add_card(user_id, cid)
-
-    # pick highest rarity for embed color
-    best_rarity = max((FOOTBALL_CARDS[cid]["rarity"] for cid in drawn),
-                      key=lambda r: RARITY_CONFIG[r]["weight"] * -1)  # lower weight = better
+    best_rarity = min((FOOTBALL_CARDS[cid]["rarity"] for cid in drawn),
+                      key=lambda r: RARITY_CONFIG[r]["weight"])
     color = RARITY_CONFIG[best_rarity]["color"]
-    has_legendary = any(FOOTBALL_CARDS[cid]["rarity"] == "legendario" for cid in drawn)
-    has_epic      = any(FOOTBALL_CARDS[cid]["rarity"] == "epico"       for cid in drawn)
-    title = "🌟 ¡LEGENDARIA!" if has_legendary else ("💜 ¡ÉPICA!" if has_epic else "⚽ ¡Paquete Abierto!")
-
+    rc = RARITY_CONFIG[best_rarity]
+    title = f"{rc['emoji']} {pt['label']} — ¡{rc['label']}!" if rc["weight"] <= 4 else f"{pt['emoji']} {pt['label']} abierto"
     embed = discord.Embed(title=title, color=color)
-    embed.description = f"**{interaction.user.display_name}** abrió un paquete y obtuvo:\n\n"
+    embed.description = f"**{interaction.user.display_name}** abrió un **{pt['label']}** y obtuvo:\n\n"
     embed.description += "\n".join(f"➤ {_card_line(cid)}" for cid in drawn)
     new_bal = await get_balance(user_id)
-    embed.set_footer(text=f"💰 Saldo restante: {new_bal:,} 🪙  •  {PACK_PRICE:,} 🪙 / paquete")
+    embed.set_footer(text=f"💰 Saldo restante: {new_bal:,} 🪙")
     await interaction.followup.send(embed=embed)
 
 
@@ -3499,22 +3577,163 @@ async def coleccion_slash(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="infocartas", description="Muestra las probabilidades y precio de los paquetes")
+@tree.command(name="infocartas", description="Muestra los tipos de sobres, precios y probabilidades")
 async def infocartas_slash(interaction: discord.Interaction):
-    total_weight = sum(rc["weight"] for rc in RARITY_CONFIG.values())
-    totals = {r: len(_CARD_IDS_BY_RARITY[r]) for r in RARITY_CONFIG}
-    lines = []
-    for rarity, rc in RARITY_CONFIG.items():
-        pct = rc["weight"] / total_weight * 100
-        lines.append(f"{rc['emoji']} **{rc['label']}** — {pct:.1f}% probabilidad · {totals[rarity]} cartas")
-    embed = discord.Embed(title="⚽ Tarjetas de Fútbol — Info", color=0x3498DB)
-    embed.description = (
-        f"💰 **Precio por paquete:** {PACK_PRICE:,} 🪙\n"
-        f"📦 **Cartas por paquete:** {CARDS_PER_PACK}\n"
-        f"🃏 **Total de cartas:** {len(FOOTBALL_CARDS)}\n\n"
-        + "\n".join(lines)
-    )
+    embed = discord.Embed(title="⚽ Sobres de Tarjetas de Fútbol", color=0x3498DB)
+    embed.description = f"📦 **{CARDS_PER_PACK} cartas** por sobre · **{len(FOOTBALL_CARDS)} cartas** en total\n\n"
+    for pack_key, pt in PACK_TYPES.items():
+        rc_g = RARITY_CONFIG[pt["guaranteed"]]
+        pool_labels = " / ".join(RARITY_CONFIG[r]["label"] for r in pt["fill_pool"])
+        n_guaranteed = len(_CARD_IDS_BY_RARITY[pt["guaranteed"]])
+        embed.add_field(
+            name=f"{pt['emoji']} {pt['label']} — {pt['price']:,} 🪙",
+            value=(
+                f"✅ **Garantizado:** {rc_g['emoji']} {rc_g['label']} ({n_guaranteed} posibles)\n"
+                f"🎲 Resto del sobre: {pool_labels}"
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="Usa /abrirpaquete <tipo>  •  Ej: /abrirpaquete raro")
     await interaction.response.send_message(embed=embed)
+
+
+class TradeView(discord.ui.View):
+    """Accept/Decline buttons for a card trade proposal."""
+
+    def __init__(self, from_uid: str, to_uid: str,
+                 from_card: str, to_card: str,
+                 from_name: str, to_name: str):
+        super().__init__(timeout=300)
+        self.from_uid   = from_uid
+        self.to_uid     = to_uid
+        self.from_card  = from_card   # card the proposer offers
+        self.to_card    = to_card     # card the receiver offers back (may be "")
+        self.from_name  = from_name
+        self.to_name    = to_name
+        self.done       = False
+
+    @discord.ui.button(label="✅ Aceptar", style=discord.ButtonStyle.success)
+    async def accept_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.to_uid:
+            await interaction.response.send_message("❌ Esta oferta no es para ti.", ephemeral=True)
+            return
+        if self.done:
+            await interaction.response.send_message("❌ Esta oferta ya fue procesada.", ephemeral=True)
+            return
+        self.done = True
+        self.stop()
+        # Verify cards still exist
+        from_has = await _card_qty(self.from_uid, self.from_card)
+        to_has   = await _card_qty(self.to_uid, self.to_card) if self.to_card else 1
+        fc = FOOTBALL_CARDS.get(self.from_card, {})
+        tc = FOOTBALL_CARDS.get(self.to_card, {}) if self.to_card else {}
+        if from_has < 1:
+            await interaction.response.edit_message(
+                content=f"❌ **{self.from_name}** ya no tiene **{fc.get('name','?')}**. Intercambio cancelado.",
+                embed=None, view=None)
+            return
+        if self.to_card and to_has < 1:
+            await interaction.response.edit_message(
+                content=f"❌ Ya no tienes **{tc.get('name','?')}**. Intercambio cancelado.",
+                embed=None, view=None)
+            return
+        # Execute swap
+        await _remove_card(self.from_uid, self.from_card)
+        await _add_card(self.to_uid,   self.from_card)
+        if self.to_card:
+            await _remove_card(self.to_uid,   self.to_card)
+            await _add_card(self.from_uid, self.to_card)
+        # Build result embed
+        rc_f = RARITY_CONFIG[fc["rarity"]]["emoji"]
+        desc = f"✅ ¡Intercambio completado!\n\n"
+        desc += f"**{self.from_name}** dio: {rc_f} **{fc['name']}**\n"
+        if self.to_card:
+            rc_t = RARITY_CONFIG[tc["rarity"]]["emoji"]
+            desc += f"**{self.to_name}** dio: {rc_t} **{tc['name']}**"
+        else:
+            desc += f"**{self.to_name}** recibió la carta como regalo."
+        embed = discord.Embed(title="🤝 Intercambio Exitoso", color=0x2ECC71, description=desc)
+        await interaction.response.edit_message(embed=embed, view=None, content=None)
+
+    @discord.ui.button(label="❌ Rechazar", style=discord.ButtonStyle.danger)
+    async def decline_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.to_uid:
+            await interaction.response.send_message("❌ Esta oferta no es para ti.", ephemeral=True)
+            return
+        if self.done:
+            await interaction.response.send_message("❌ Esta oferta ya fue procesada.", ephemeral=True)
+            return
+        self.done = True
+        self.stop()
+        await interaction.response.edit_message(
+            content=f"❌ **{self.to_name}** rechazó el intercambio.",
+            embed=None, view=None)
+
+    async def on_timeout(self):
+        self.done = True
+        for child in self.children:
+            child.disabled = True  # type: ignore
+
+
+@tree.command(name="intercambiar", description="Propone un intercambio de tarjetas con otro jugador")
+@app_commands.describe(
+    usuario="El jugador con quien intercambiar",
+    mi_carta="ID de tu carta (ej: messi, pele, cr7)",
+    su_carta="ID de la carta que pides a cambio (opcional — deja vacío para regalar)",
+)
+async def intercambiar_slash(interaction: discord.Interaction,
+                              usuario: discord.Member,
+                              mi_carta: str,
+                              su_carta: str = ""):
+    from_uid = str(interaction.user.id)
+    to_uid   = str(usuario.id)
+    if to_uid == from_uid:
+        await interaction.response.send_message("❌ No puedes intercambiar contigo mismo.", ephemeral=True)
+        return
+    if usuario.bot:
+        await interaction.response.send_message("❌ No puedes intercambiar con un bot.", ephemeral=True)
+        return
+    mi_carta  = mi_carta.strip().lower()
+    su_carta  = su_carta.strip().lower()
+    if mi_carta not in FOOTBALL_CARDS:
+        await interaction.response.send_message(f"❌ Carta `{mi_carta}` no existe.", ephemeral=True)
+        return
+    if su_carta and su_carta not in FOOTBALL_CARDS:
+        await interaction.response.send_message(f"❌ Carta `{su_carta}` no existe.", ephemeral=True)
+        return
+    await get_or_create_user(from_uid, interaction.user.name)
+    await get_or_create_user(to_uid, usuario.name)
+    my_qty = await _card_qty(from_uid, mi_carta)
+    if my_qty < 1:
+        await interaction.response.send_message(
+            f"❌ No tienes la carta **{FOOTBALL_CARDS[mi_carta]['name']}**.", ephemeral=True)
+        return
+    if su_carta:
+        their_qty = await _card_qty(to_uid, su_carta)
+        if their_qty < 1:
+            await interaction.response.send_message(
+                f"❌ **{usuario.display_name}** no tiene la carta **{FOOTBALL_CARDS[su_carta]['name']}**.",
+                ephemeral=True)
+            return
+    fc = FOOTBALL_CARDS[mi_carta]
+    rc_f = RARITY_CONFIG[fc["rarity"]]
+    desc  = f"**{interaction.user.display_name}** te ofrece:\n"
+    desc += f"➤ {_card_line(mi_carta)}\n\n"
+    if su_carta:
+        tc = FOOTBALL_CARDS[su_carta]
+        rc_t = RARITY_CONFIG[tc["rarity"]]
+        desc += f"A cambio pide tu:\n➤ {_card_line(su_carta)}\n\n"
+    else:
+        desc += "_Sin pedir nada a cambio (regalo)_\n\n"
+    desc += f"⏱️ Tienes **5 minutos** para responder."
+    embed = discord.Embed(
+        title=f"🤝 Propuesta de Intercambio para {usuario.display_name}",
+        color=rc_f["color"], description=desc)
+    view = TradeView(from_uid, to_uid, mi_carta, su_carta,
+                     interaction.user.display_name, usuario.display_name)
+    await interaction.response.send_message(
+        content=f"{usuario.mention} tienes una oferta de intercambio:",
+        embed=embed, view=view)
 
 
 @tree.command(name="historial", description="Muestra tus últimas 10 apuestas con ganancias/pérdidas")
@@ -5230,45 +5449,45 @@ async def on_message(message: discord.Message):
         )
         await message.channel.send(embed=embed)
 
-    # ,abrirpaquete / ,pack — abrir paquete de tarjetas de fútbol
-    elif cmd in ("abrirpaquete", "pack", "paquete", "carta"):
+    # ,abrirpaquete [tipo] / ,pack — abrir sobre de tarjetas de fútbol
+    elif cmd in ("abrirpaquete", "pack", "paquete", "sobre"):
         await get_or_create_user(user_id, message.author.name)
+        tipo_raw = args[0].lower().strip() if args else "comun"
+        pack_key = _PACK_ALIASES.get(tipo_raw)
+        if not pack_key:
+            lines = "\n".join(
+                f"{pt['emoji']} `,abrirpaquete {k}` — {pt['label']} · **{pt['price']:,}** 🪙"
+                for k, pt in PACK_TYPES.items()
+            )
+            embed = discord.Embed(title="❌ Tipo de sobre inválido", color=0xFF4444,
+                                   description=f"Tipos disponibles:\n{lines}")
+            await message.channel.send(embed=embed)
+            return
+        pt = PACK_TYPES[pack_key]
         bal = await get_balance(user_id)
-        # soporte ,abrirpaquete [n] para abrir varios a la vez (máx 5)
-        n_packs = 1
-        if args:
-            try:
-                n_packs = max(1, min(5, int(args[0])))
-            except ValueError:
-                pass
-        total_cost = PACK_PRICE * n_packs
-        if bal < total_cost:
+        if bal < pt["price"]:
             embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
             embed.description = (
-                f"{'Un paquete cuesta' if n_packs == 1 else f'{n_packs} paquetes cuestan'} "
-                f"**{total_cost:,}** 🪙. Tienes **{bal:,}** 🪙."
+                f"{pt['emoji']} **{pt['label']}** cuesta **{pt['price']:,}** 🪙. "
+                f"Tienes **{bal:,}** 🪙."
             )
             await message.channel.send(embed=embed)
             return
-        await update_balance(user_id, -total_cost)
-        all_drawn: list[str] = []
-        for _ in range(n_packs):
-            for _ in range(CARDS_PER_PACK):
-                all_drawn.append(_draw_random_card())
-        for cid in all_drawn:
+        await update_balance(user_id, -pt["price"])
+        drawn = _draw_pack_cards(pack_key)
+        for cid in drawn:
             await _add_card(user_id, cid)
-        best_rarity = max((FOOTBALL_CARDS[cid]["rarity"] for cid in all_drawn),
-                          key=lambda r: RARITY_CONFIG[r]["weight"] * -1)
+        best_rarity = min((FOOTBALL_CARDS[cid]["rarity"] for cid in drawn),
+                          key=lambda r: RARITY_CONFIG[r]["weight"])
         color = RARITY_CONFIG[best_rarity]["color"]
-        has_legendary = any(FOOTBALL_CARDS[cid]["rarity"] == "legendario" for cid in all_drawn)
-        has_epic      = any(FOOTBALL_CARDS[cid]["rarity"] == "epico"       for cid in all_drawn)
-        title = "🌟 ¡LEGENDARIA!" if has_legendary else ("💜 ¡ÉPICA!" if has_epic else "⚽ ¡Paquete Abierto!")
+        rc = RARITY_CONFIG[best_rarity]
+        title = (f"{rc['emoji']} {pt['label']} — ¡{rc['label']}!"
+                 if rc["weight"] <= 4 else f"{pt['emoji']} {pt['label']} abierto")
         embed = discord.Embed(title=title, color=color)
-        pack_label = f"{n_packs} paquetes" if n_packs > 1 else "un paquete"
-        embed.description = f"**{message.author.display_name}** abrió {pack_label} y obtuvo:\n\n"
-        embed.description += "\n".join(f"➤ {_card_line(cid)}" for cid in all_drawn)
+        embed.description = f"**{message.author.display_name}** abrió un **{pt['label']}** y obtuvo:\n\n"
+        embed.description += "\n".join(f"➤ {_card_line(cid)}" for cid in drawn)
         new_bal = await get_balance(user_id)
-        embed.set_footer(text=f"💰 Saldo restante: {new_bal:,} 🪙  •  {PACK_PRICE:,} 🪙 / paquete")
+        embed.set_footer(text=f"💰 Saldo restante: {new_bal:,} 🪙")
         await message.channel.send(embed=embed)
 
     # ,coleccion / ,album — ver colección de cartas
@@ -5277,7 +5496,7 @@ async def on_message(message: discord.Message):
         rows = await _get_collection(user_id)
         if not rows:
             embed = discord.Embed(title="📦 Colección vacía", color=0x95A5A6)
-            embed.description = "Aún no tienes tarjetas. Usa `,abrirpaquete` para conseguir las primeras."
+            embed.description = "Aún no tienes tarjetas. Usa `,abrirpaquete comun` para conseguir las primeras."
             await message.channel.send(embed=embed)
             return
         by_rarity: dict[str, list[tuple[str, int]]] = {r: [] for r in RARITY_CONFIG}
@@ -5306,23 +5525,80 @@ async def on_message(message: discord.Message):
             )
         await message.channel.send(embed=embed)
 
-    # ,infocartas — probabilidades y precio
-    elif cmd in ("infocartas", "infopaquete", "probabilidades"):
-        total_weight = sum(rc["weight"] for rc in RARITY_CONFIG.values())
-        lines = []
-        for rarity, rc in RARITY_CONFIG.items():
-            pct = rc["weight"] / total_weight * 100
-            n   = len(_CARD_IDS_BY_RARITY[rarity])
-            lines.append(f"{rc['emoji']} **{rc['label']}** — {pct:.1f}% · {n} cartas disponibles")
-        embed = discord.Embed(title="⚽ Tarjetas de Fútbol — Info", color=0x3498DB)
-        embed.description = (
-            f"💰 **Precio por paquete:** {PACK_PRICE:,} 🪙\n"
-            f"📦 **Cartas por paquete:** {CARDS_PER_PACK}\n"
-            f"🃏 **Total de cartas:** {len(FOOTBALL_CARDS)}\n\n"
-            + "\n".join(lines)
-            + f"\n\n_Abre hasta 5 paquetes a la vez: `,abrirpaquete 3`_"
-        )
+    # ,infocartas — tipos de sobres y precios
+    elif cmd in ("infocartas", "infopaquete", "probabilidades", "sobres"):
+        embed = discord.Embed(title="⚽ Sobres de Tarjetas de Fútbol", color=0x3498DB)
+        embed.description = f"📦 **{CARDS_PER_PACK} cartas** por sobre · **{len(FOOTBALL_CARDS)} cartas** en total\n\n"
+        for pack_key, pt in PACK_TYPES.items():
+            rc_g = RARITY_CONFIG[pt["guaranteed"]]
+            pool_labels = " / ".join(RARITY_CONFIG[r]["label"] for r in pt["fill_pool"])
+            n_g = len(_CARD_IDS_BY_RARITY[pt["guaranteed"]])
+            embed.add_field(
+                name=f"{pt['emoji']} {pt['label']} — {pt['price']:,} 🪙",
+                value=(
+                    f"✅ **Garantizado:** {rc_g['emoji']} {rc_g['label']} ({n_g} posibles)\n"
+                    f"🎲 Resto: {pool_labels}"
+                ),
+                inline=False,
+            )
+        embed.set_footer(text="Uso: ,abrirpaquete <tipo>  •  Ej: ,abrirpaquete raro")
         await message.channel.send(embed=embed)
+
+    # ,intercambiar @usuario <mi_carta> [<su_carta>] — proponer intercambio
+    elif cmd in ("intercambiar", "trade", "cambiar"):
+        await get_or_create_user(user_id, message.author.name)
+        if not message.mentions:
+            await message.channel.send("❌ Uso: `,intercambiar @usuario <mi_carta> [<su_carta>]`")
+            return
+        target = message.mentions[0]
+        if target.bot or str(target.id) == user_id:
+            await message.channel.send("❌ No puedes intercambiar contigo mismo ni con un bot.")
+            return
+        # args after stripping the mention
+        clean = message.content.split()
+        # remove prefix+cmd and any mention tokens (@xxx)
+        card_args = [a for a in clean[2:] if not a.startswith("<@")]
+        if not card_args:
+            await message.channel.send("❌ Uso: `,intercambiar @usuario <mi_carta> [<su_carta>]`")
+            return
+        mi_carta = card_args[0].lower()
+        su_carta = card_args[1].lower() if len(card_args) > 1 else ""
+        if mi_carta not in FOOTBALL_CARDS:
+            await message.channel.send(f"❌ Carta `{mi_carta}` no existe. Revisa los IDs en `,coleccion`.")
+            return
+        if su_carta and su_carta not in FOOTBALL_CARDS:
+            await message.channel.send(f"❌ Carta `{su_carta}` no existe.")
+            return
+        to_uid = str(target.id)
+        await get_or_create_user(to_uid, target.name)
+        my_qty = await _card_qty(user_id, mi_carta)
+        if my_qty < 1:
+            await message.channel.send(
+                f"❌ No tienes la carta **{FOOTBALL_CARDS[mi_carta]['name']}**.")
+            return
+        if su_carta:
+            their_qty = await _card_qty(to_uid, su_carta)
+            if their_qty < 1:
+                await message.channel.send(
+                    f"❌ **{target.display_name}** no tiene la carta **{FOOTBALL_CARDS[su_carta]['name']}**.")
+                return
+        fc = FOOTBALL_CARDS[mi_carta]
+        rc_f = RARITY_CONFIG[fc["rarity"]]
+        desc  = f"**{message.author.display_name}** te ofrece:\n"
+        desc += f"➤ {_card_line(mi_carta)}\n\n"
+        if su_carta:
+            desc += f"A cambio pide tu:\n➤ {_card_line(su_carta)}\n\n"
+        else:
+            desc += "_Sin pedir nada a cambio (regalo)_\n\n"
+        desc += "⏱️ Tienes **5 minutos** para responder."
+        embed = discord.Embed(
+            title=f"🤝 Propuesta de Intercambio para {target.display_name}",
+            color=rc_f["color"], description=desc)
+        view = TradeView(user_id, to_uid, mi_carta, su_carta,
+                         message.author.display_name, target.display_name)
+        await message.channel.send(
+            content=f"{target.mention} tienes una oferta de intercambio:",
+            embed=embed, view=view)
 
     # ,historial — últimas 10 apuestas
     elif cmd in ("historial", "history", "stats"):
