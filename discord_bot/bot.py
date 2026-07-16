@@ -831,80 +831,124 @@ async def withdraw(interaction: discord.Interaction, cantidad: str):
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="roulette", description="Juega a la ruleta — rojo, negro, par, impar, docenas o número exacto 35:1")
+_ROULETTE_CHOICES = [
+    app_commands.Choice(name="🔴 Rojo (1:1)",               value="rojo"),
+    app_commands.Choice(name="⚫ Negro (1:1)",               value="negro"),
+    app_commands.Choice(name="🔵 Par / Even (1:1)",         value="even"),
+    app_commands.Choice(name="🟣 Impar / Odd (1:1)",        value="odd"),
+    app_commands.Choice(name="1️⃣ 1ra Docena 1-12 (2:1)",   value="1st"),
+    app_commands.Choice(name="2️⃣ 2da Docena 13-24 (2:1)",  value="2nd"),
+    app_commands.Choice(name="3️⃣ 3ra Docena 25-36 (2:1)",  value="3rd"),
+]
+
+
+def _build_multibets_embed(resultado: int, bets: list[tuple[int, str]], bal_before: int) -> discord.Embed:
+    """Build embed for multi-bet roulette result. bets = [(amount, bet_key), ...]"""
+    num_emoji = "🟢" if resultado == 0 else ("🔴" if resultado in RED_NUMBERS else "⚫")
+    net = 0
+    lines = []
+    jackpot_hit = False
+    for i, (amt, bk) in enumerate(bets, 1):
+        won, mult, display = evaluate_roulette_bet(resultado, bk)
+        if won:
+            gain = amt * mult
+            net += gain
+            lines.append(f"**Apuesta {i}:** {display}\n  {amt:,} 🪙 → ✅ **+{gain:,}** (x{mult})")
+            if mult == 35:
+                jackpot_hit = True
+        else:
+            net -= amt
+            lines.append(f"**Apuesta {i}:** {display}\n  {amt:,} 🪙 → ❌ **-{amt:,}**")
+    new_balance = bal_before + net
+    net_str = f"+{net:,}" if net >= 0 else f"{net:,}"
+    if jackpot_hit and net > 0:
+        title, color = "🎰 ¡¡NÚMERO EXACTO!!", 0xFFD700
+    elif net > 0:
+        title, color = "🎰 ¡GANASTE!", 0x00FF88
+    elif net == 0:
+        title, color = "🎰 Empate", 0xAAAAAA
+    else:
+        title, color = "🎰 Perdiste...", 0xFF4444
+    embed = discord.Embed(title=title, color=color)
+    embed.description = (
+        f"La ruleta cayó en **{num_emoji} {resultado}**\n\n"
+        + "\n\n".join(lines)
+        + f"\n\n{'💰' if net >= 0 else '💸'} **Balance neto:** {net_str} 🪙\n"
+        f"💵 Saldo actual: **{new_balance:,}** 🪙"
+    )
+    return embed, net
+
+
+@tree.command(name="roulette", description="Ruleta — hasta 3 apuestas en el mismo spin")
 @app_commands.describe(
-    cantidad="Cantidad a apostar",
-    apuesta="Tipo de apuesta (color/par/impar/docena)",
-    numero="Número exacto del 0 al 36 — paga 35:1 (ignora 'apuesta' si se usa)",
+    cantidad="Cantidad apuesta 1",
+    apuesta="Tipo apuesta 1 (color/par/impar/docena)",
+    numero="Número exacto apuesta 1 (0-36) — paga 35:1",
+    cantidad2="Cantidad apuesta 2 (opcional)",
+    apuesta2="Tipo apuesta 2 (opcional)",
+    numero2="Número exacto apuesta 2 (opcional, 0-36)",
+    cantidad3="Cantidad apuesta 3 (opcional)",
+    apuesta3="Tipo apuesta 3 (opcional)",
+    numero3="Número exacto apuesta 3 (opcional, 0-36)",
 )
-@app_commands.choices(apuesta=[
-    app_commands.Choice(name="🔴 Rojo (1:1)",              value="rojo"),
-    app_commands.Choice(name="⚫ Negro (1:1)",              value="negro"),
-    app_commands.Choice(name="🔵 Par / Even (1:1)",        value="even"),
-    app_commands.Choice(name="🟣 Impar / Odd (1:1)",       value="odd"),
-    app_commands.Choice(name="1️⃣ 1ra Docena 1-12 (2:1)",  value="1st"),
-    app_commands.Choice(name="2️⃣ 2da Docena 13-24 (2:1)", value="2nd"),
-    app_commands.Choice(name="3️⃣ 3ra Docena 25-36 (2:1)", value="3rd"),
-])
+@app_commands.choices(apuesta=_ROULETTE_CHOICES, apuesta2=_ROULETTE_CHOICES, apuesta3=_ROULETTE_CHOICES)
 async def roulette(
     interaction: discord.Interaction,
     cantidad: int,
     apuesta: str | None = None,
     numero: int | None = None,
+    cantidad2: int | None = None,
+    apuesta2: str | None = None,
+    numero2: int | None = None,
+    cantidad3: int | None = None,
+    apuesta3: str | None = None,
+    numero3: int | None = None,
 ):
-    if cantidad <= 0:
-        await interaction.response.send_message("❌ La apuesta debe ser mayor a 0.", ephemeral=True)
-        return
-    if apuesta is None and numero is None:
-        await interaction.response.send_message(
-            "❌ Elige una `apuesta` (rojo/negro/…) **o** un `numero` exacto (0-36).", ephemeral=True
-        )
-        return
-    if numero is not None and not (0 <= numero <= 36):
-        await interaction.response.send_message("❌ El número debe estar entre 0 y 36.", ephemeral=True)
+    # Build slots list from provided params
+    raw_slots = [
+        (cantidad,  apuesta,  numero),
+        (cantidad2, apuesta2, numero2),
+        (cantidad3, apuesta3, numero3),
+    ]
+    slots: list[tuple[int, str]] = []
+    for i, (amt, ap, num) in enumerate(raw_slots, 1):
+        if amt is None:
+            continue
+        if amt <= 0:
+            await interaction.response.send_message(f"❌ La apuesta {i} debe ser mayor a 0.", ephemeral=True)
+            return
+        if ap is None and num is None:
+            await interaction.response.send_message(
+                f"❌ Apuesta {i}: elige un tipo **o** un número exacto (0-36).", ephemeral=True
+            )
+            return
+        if num is not None and not (0 <= num <= 36):
+            await interaction.response.send_message(f"❌ Apuesta {i}: el número debe estar entre 0 y 36.", ephemeral=True)
+            return
+        bet_key = str(num) if num is not None else ap
+        slots.append((amt, bet_key))
+
+    if not slots:
+        await interaction.response.send_message("❌ Debes hacer al menos una apuesta.", ephemeral=True)
         return
 
+    total_cost = sum(amt for amt, _ in slots)
     user_id = str(interaction.user.id)
     await get_or_create_user(user_id, interaction.user.name)
     bal = await get_balance(user_id)
 
-    if bal < cantidad:
+    if bal < total_cost:
         embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
-        embed.description = f"Tienes **{bal:,}** 🪙 y quieres apostar **{cantidad:,}** 🪙."
+        embed.description = (
+            f"El total de tus apuestas es **{total_cost:,}** 🪙\n"
+            f"Tienes **{bal:,}** 🪙."
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
     resultado = random.randint(0, 36)
-    num_emoji = "🟢" if resultado == 0 else ("🔴" if resultado in RED_NUMBERS else "⚫")
-
-    # número exacto tiene prioridad
-    bet_key = str(numero) if numero is not None else apuesta
-    won, mult, bet_display = evaluate_roulette_bet(resultado, bet_key)
-
-    if won:
-        ganancia = cantidad * mult
-        await update_balance(user_id, ganancia)
-        new_balance = bal + ganancia
-        title = "🎰 ¡¡NÚMERO EXACTO!!" if mult == 35 else "🎰 ¡GANASTE!"
-        color = 0xFFD700 if mult == 35 else 0x00FF88
-        embed = discord.Embed(title=title, color=color)
-        embed.description = (
-            f"La ruleta cayó en **{num_emoji} {resultado}**\n"
-            f"Apostaste: **{bet_display}** ✅\n\n"
-            f"💰 Ganaste **{ganancia:,}** 🪙 (x{mult})\n"
-            f"Saldo actual: **{new_balance:,}** 🪙"
-        )
-    else:
-        await update_balance(user_id, -cantidad)
-        new_balance = bal - cantidad
-        embed = discord.Embed(title="🎰 Perdiste...", color=0xFF4444)
-        embed.description = (
-            f"La ruleta cayó en **{num_emoji} {resultado}**\n"
-            f"Apostaste: **{bet_display}** ❌\n\n"
-            f"💸 Perdiste **{cantidad:,}** 🪙\n"
-            f"Saldo actual: **{new_balance:,}** 🪙"
-        )
-
+    embed, net = _build_multibets_embed(resultado, slots, bal)
+    await update_balance(user_id, net)
     await track_mission(user_id, "roulette_played")
     await interaction.response.send_message(embed=embed)
 
@@ -3090,10 +3134,11 @@ async def on_message(message: discord.Message):
         bal = await get_balance(user_id)
 
         ROULETTE_HELP = (
-            "❌ Uso: `,roulette <cantidad|all> <apuesta>`\n"
-            "Apuestas: `red` `black` `even` `odd` `1st` `2nd` `3rd`\n"
-            "Número exacto (0-36): `,roulette 1000 17` — paga **35:1** 🎯\n"
-            "Ejemplos: `,roulette all red` · `,roulette 1000 even` · `,roulette 500 17`"
+            "❌ Uso: `,roulette <cantidad|all> <apuesta> [cantidad2 apuesta2] ...`\n"
+            "Apuestas: `red` `black` `even` `odd` `1st` `2nd` `3rd` o un número **0-36** (35:1)\n"
+            "Hasta **5 apuestas** en el mismo spin:\n"
+            "  `,roulette 1000 red 500 17 200 even`\n"
+            "  `,roulette all 0   (todo al verde, 35:1)`"
         )
         BET_ALIASES = {
             "red": "red", "rojo": "red",
@@ -3109,64 +3154,54 @@ async def on_message(message: discord.Message):
             await message.channel.send(ROULETTE_HELP)
             return
 
-        amount_str = args[0].lower()
-        bet_str    = args[1].lower()
+        # Parse args as pairs: (amount, bet_key) — up to 5 bets
+        slots: list[tuple[int, str]] = []
+        i = 0
+        parse_error = None
+        while i < len(args) - 1 and len(slots) < 5:
+            a_str = args[i].lower()
+            b_str = args[i + 1].lower()
+            if a_str == "all":
+                amt = bal
+            else:
+                try:
+                    amt = int(a_str)
+                except ValueError:
+                    parse_error = f"❌ `{a_str}` no es una cantidad válida."
+                    break
+            if b_str in BET_ALIASES:
+                bk = BET_ALIASES[b_str]
+            elif b_str.isdigit() and 0 <= int(b_str) <= 36:
+                bk = b_str
+            else:
+                parse_error = f"❌ `{b_str}` no es una apuesta válida."
+                break
+            if amt <= 0:
+                parse_error = "❌ Todas las apuestas deben ser mayores a 0."
+                break
+            slots.append((amt, bk))
+            i += 2
 
-        if amount_str == "all":
-            amount = bal
-        else:
-            try:
-                amount = int(amount_str)
-            except ValueError:
-                await message.channel.send(ROULETTE_HELP)
-                return
-
-        if bet_str in BET_ALIASES:
-            bet_type = BET_ALIASES[bet_str]
-        elif bet_str.isdigit() and 0 <= int(bet_str) <= 36:
-            bet_type = bet_str          # número exacto 35:1
-        else:
+        if parse_error:
+            await message.channel.send(f"{parse_error}\n{ROULETTE_HELP}")
+            return
+        if not slots:
             await message.channel.send(ROULETTE_HELP)
             return
 
-        if amount is None or bet_type is None:
-            await message.channel.send(ROULETTE_HELP)
-            return
-        if amount <= 0:
-            await message.channel.send("❌ La apuesta debe ser mayor a 0.")
-            return
-        if bal < amount:
+        total_cost = sum(a for a, _ in slots)
+        if bal < total_cost:
             embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
-            embed.description = f"Tienes **{bal:,}** 🪙 y quieres apostar **{amount:,}** 🪙."
+            embed.description = (
+                f"El total de tus apuestas es **{total_cost:,}** 🪙\n"
+                f"Tienes **{bal:,}** 🪙."
+            )
             await message.channel.send(embed=embed)
             return
 
-        numero = random.randint(0, 36)
-        num_emoji = "🟢" if numero == 0 else ("🔴" if numero in RED_NUMBERS else "⚫")
-        won, mult, bet_display = evaluate_roulette_bet(numero, bet_type)
-
-        if won:
-            ganancia = amount * mult
-            await update_balance(user_id, ganancia)
-            new_balance = bal + ganancia
-            embed = discord.Embed(title="🎰 ¡GANASTE!", color=0x00FF88)
-            embed.description = (
-                f"La ruleta cayó en **{num_emoji} {numero}**\n"
-                f"Apostaste: **{bet_display}** ✅\n\n"
-                f"💰 Ganaste **{ganancia:,}** 🪙 (x{mult})\n"
-                f"Saldo actual: **{new_balance:,}** 🪙"
-            )
-        else:
-            await update_balance(user_id, -amount)
-            new_balance = bal - amount
-            embed = discord.Embed(title="🎰 Perdiste...", color=0xFF4444)
-            embed.description = (
-                f"La ruleta cayó en **{num_emoji} {numero}**\n"
-                f"Apostaste: **{bet_display}** ❌\n\n"
-                f"💸 Perdiste **{amount:,}** 🪙\n"
-                f"Saldo actual: **{new_balance:,}** 🪙"
-            )
-
+        resultado = random.randint(0, 36)
+        embed, net = _build_multibets_embed(resultado, slots, bal)
+        await update_balance(user_id, net)
         await track_mission(user_id, "roulette_played")
         await message.channel.send(embed=embed)
 
