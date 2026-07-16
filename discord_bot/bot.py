@@ -568,6 +568,15 @@ async def init_db():
                 PRIMARY KEY (user_id, card_id)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS card_market (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                seller_id TEXT    NOT NULL,
+                card_id   TEXT    NOT NULL,
+                price     INTEGER NOT NULL,
+                ts        TEXT    NOT NULL
+            )
+        """)
         await db.commit()
 
 
@@ -3597,6 +3606,234 @@ async def infocartas_slash(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+# ─────────────────────────── MERCADO DE CARTAS ───────────────────────────
+
+MAX_LISTINGS_PER_USER = 5
+
+
+async def _market_listings(rarity_filter: str = "") -> list[tuple]:
+    """Return open listings: (id, seller_id, card_id, price, ts)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        if rarity_filter:
+            cards_in_rarity = [cid for cid, c in FOOTBALL_CARDS.items()
+                               if c["rarity"] == rarity_filter]
+            placeholders = ",".join("?" for _ in cards_in_rarity)
+            if not placeholders:
+                return []
+            async with db.execute(
+                f"SELECT id, seller_id, card_id, price, ts FROM card_market "
+                f"WHERE card_id IN ({placeholders}) ORDER BY price ASC LIMIT 20",
+                cards_in_rarity
+            ) as cur:
+                return await cur.fetchall()
+        async with db.execute(
+            "SELECT id, seller_id, card_id, price, ts FROM card_market ORDER BY price ASC LIMIT 20"
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def _market_count_seller(seller_id: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM card_market WHERE seller_id=?", (seller_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+
+async def _market_get_listing(listing_id: int) -> tuple | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, seller_id, card_id, price, ts FROM card_market WHERE id=?",
+            (listing_id,)
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def _market_delete_listing(listing_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM card_market WHERE id=?", (listing_id,))
+        await db.commit()
+
+
+def _market_embed(listings: list[tuple], title: str, footer: str = "") -> discord.Embed:
+    embed = discord.Embed(title=title, color=0xF39C12)
+    if not listings:
+        embed.description = "No hay cartas en venta ahora mismo. ¡Sé el primero en publicar una!"
+        return embed
+    lines = []
+    for lid, seller_id, card_id, price, ts in listings:
+        c = FOOTBALL_CARDS.get(card_id, {})
+        rc = RARITY_CONFIG.get(c.get("rarity", "comun"), RARITY_CONFIG["comun"])
+        lines.append(
+            f"`#{lid}` {rc['emoji']} **{c.get('name','?')}** `{c.get('pos','?')}` "
+            f"— **{price:,}** 🪙"
+        )
+    embed.description = "\n".join(lines)
+    if footer:
+        embed.set_footer(text=footer)
+    return embed
+
+
+@tree.command(name="vender", description="Publica una carta en el mercado para que otros la compren")
+@app_commands.describe(
+    carta="ID de la carta a vender (ej: messi, pele, cr7)",
+    precio="Precio en monedas (mínimo 100)"
+)
+async def vender_slash(interaction: discord.Interaction, carta: str, precio: int):
+    user_id = str(interaction.user.id)
+    await get_or_create_user(user_id, interaction.user.name)
+    carta = carta.strip().lower()
+    if carta not in FOOTBALL_CARDS:
+        await interaction.response.send_message(f"❌ Carta `{carta}` no existe.", ephemeral=True)
+        return
+    if precio < 100:
+        await interaction.response.send_message("❌ El precio mínimo es **100** 🪙.", ephemeral=True)
+        return
+    qty = await _card_qty(user_id, carta)
+    if qty < 1:
+        c = FOOTBALL_CARDS[carta]
+        await interaction.response.send_message(
+            f"❌ No tienes la carta **{c['name']}**.", ephemeral=True)
+        return
+    count = await _market_count_seller(user_id)
+    if count >= MAX_LISTINGS_PER_USER:
+        await interaction.response.send_message(
+            f"❌ Ya tienes **{MAX_LISTINGS_PER_USER}** cartas en venta. Cancela alguna primero.",
+            ephemeral=True)
+        return
+    # Escrow: remove from collection, add to market
+    await _remove_card(user_id, carta)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO card_market (seller_id, card_id, price, ts) VALUES (?,?,?,?)",
+            (user_id, carta, precio, datetime.utcnow().isoformat())
+        )
+        await db.commit()
+    c = FOOTBALL_CARDS[carta]
+    rc = RARITY_CONFIG[c["rarity"]]
+    embed = discord.Embed(title="🏪 ¡Carta publicada!", color=rc["color"])
+    embed.description = (
+        f"➤ {_card_line(carta)}\n\n"
+        f"💰 Precio: **{precio:,}** 🪙\n"
+        f"La carta fue retirada de tu colección hasta que se venda o la canceles."
+    )
+    embed.set_footer(text="Usa /cancelarventa <id> para retirarla del mercado")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="mercado", description="Explora las cartas en venta")
+@app_commands.describe(rareza="Filtrar por rareza: comun / poco_comun / raro / epico / legendario")
+async def mercado_slash(interaction: discord.Interaction, rareza: str = ""):
+    rarity_key = _PACK_ALIASES.get(rareza.lower().strip(), "") if rareza else ""
+    listings = await _market_listings(rarity_key)
+    title = "🏪 Mercado de Cartas"
+    if rarity_key:
+        rc = RARITY_CONFIG[rarity_key]
+        title += f" — {rc['emoji']} {rc['label']}"
+    embed = _market_embed(listings, title,
+                          footer="Comprar: /comprar <#id>  •  Vender: /vender <carta> <precio>")
+    embed.set_footer(text=f"{'Mostrando hasta 20 resultados' if listings else ''} · "
+                         f"/comprar <id> para comprar · /vender <carta> <precio> para vender")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="comprar", description="Compra una carta del mercado")
+@app_commands.describe(id="Número de la publicación (el #id que aparece en /mercado)")
+async def comprar_slash(interaction: discord.Interaction, id: int):
+    user_id = str(interaction.user.id)
+    await get_or_create_user(user_id, interaction.user.name)
+    listing = await _market_get_listing(id)
+    if not listing:
+        await interaction.response.send_message(f"❌ La publicación **#{id}** no existe o ya fue vendida.",
+                                                  ephemeral=True)
+        return
+    lid, seller_id, card_id, price, ts = listing
+    if seller_id == user_id:
+        await interaction.response.send_message("❌ No puedes comprar tu propia carta.", ephemeral=True)
+        return
+    bal = await get_balance(user_id)
+    if bal < price:
+        await interaction.response.send_message(
+            f"❌ Necesitas **{price:,}** 🪙 pero tienes **{bal:,}** 🪙.", ephemeral=True)
+        return
+    # Execute purchase
+    await _market_delete_listing(lid)
+    await update_balance(user_id, -price)
+    await update_balance(seller_id, price)
+    await _add_card(user_id, card_id)
+    c = FOOTBALL_CARDS[card_id]
+    rc = RARITY_CONFIG[c["rarity"]]
+    embed = discord.Embed(title="🎉 ¡Compra exitosa!", color=rc["color"])
+    embed.description = (
+        f"➤ {_card_line(card_id)}\n\n"
+        f"💸 Pagaste: **{price:,}** 🪙\n"
+        f"La carta fue añadida a tu colección."
+    )
+    new_bal = await get_balance(user_id)
+    embed.set_footer(text=f"Saldo restante: {new_bal:,} 🪙")
+    await interaction.response.send_message(embed=embed)
+    # Notify seller in DMs if possible
+    try:
+        seller = await client.fetch_user(int(seller_id))
+        dm_embed = discord.Embed(title="💰 ¡Vendiste una carta!", color=0x2ECC71)
+        dm_embed.description = (
+            f"**{interaction.user.display_name}** compró tu:\n"
+            f"➤ {_card_line(card_id)}\n\n"
+            f"Recibiste **{price:,}** 🪙 en tu balance."
+        )
+        await seller.send(embed=dm_embed)
+    except Exception:
+        pass
+
+
+@tree.command(name="cancelarventa", description="Retira tu carta del mercado y devuélvela a tu colección")
+@app_commands.describe(id="Número de la publicación a cancelar")
+async def cancelarventa_slash(interaction: discord.Interaction, id: int):
+    user_id = str(interaction.user.id)
+    listing = await _market_get_listing(id)
+    if not listing:
+        await interaction.response.send_message(f"❌ La publicación **#{id}** no existe.", ephemeral=True)
+        return
+    lid, seller_id, card_id, price, ts = listing
+    if seller_id != user_id:
+        await interaction.response.send_message("❌ Esa publicación no es tuya.", ephemeral=True)
+        return
+    await _market_delete_listing(lid)
+    await _add_card(user_id, card_id)
+    c = FOOTBALL_CARDS[card_id]
+    embed = discord.Embed(title="↩️ Venta cancelada", color=0x95A5A6)
+    embed.description = f"➤ {_card_line(card_id)}\n\nLa carta fue devuelta a tu colección."
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="misventas", description="Muestra tus cartas actualmente en venta")
+async def misventas_slash(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, card_id, price, ts FROM card_market WHERE seller_id=? ORDER BY id",
+            (user_id,)
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        embed = discord.Embed(title="📦 Sin ventas activas", color=0x95A5A6,
+                               description="No tienes cartas en el mercado.\nUsa `/vender <carta> <precio>` para publicar una.")
+        await interaction.response.send_message(embed=embed)
+        return
+    embed = discord.Embed(title="🏷️ Mis cartas en venta", color=0xF39C12)
+    lines = []
+    for lid, card_id, price, ts in rows:
+        c = FOOTBALL_CARDS.get(card_id, {})
+        rc = RARITY_CONFIG.get(c.get("rarity", "comun"), RARITY_CONFIG["comun"])
+        lines.append(f"`#{lid}` {rc['emoji']} **{c.get('name','?')}** — **{price:,}** 🪙")
+    embed.description = "\n".join(lines)
+    embed.set_footer(text=f"{len(rows)}/{MAX_LISTINGS_PER_USER} slots usados · /cancelarventa <id> para retirar")
+    await interaction.response.send_message(embed=embed)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+
 class TradeView(discord.ui.View):
     """Accept/Decline buttons for a card trade proposal."""
 
@@ -5526,6 +5763,165 @@ async def on_message(message: discord.Message):
         await message.channel.send(embed=embed)
 
     # ,infocartas — tipos de sobres y precios
+    # ,vender <carta> <precio> — publicar carta en el mercado
+    elif cmd in ("vender", "sell"):
+        await get_or_create_user(user_id, message.author.name)
+        if len(args) < 2:
+            await message.channel.send("❌ Uso: `,vender <carta> <precio>`  Ej: `,vender messi 50000`")
+            return
+        carta = args[0].lower()
+        try:
+            precio = int(args[1].replace(",", "").replace(".", ""))
+        except ValueError:
+            await message.channel.send("❌ El precio debe ser un número. Ej: `,vender messi 50000`")
+            return
+        if carta not in FOOTBALL_CARDS:
+            await message.channel.send(f"❌ Carta `{carta}` no existe. Revisa los IDs en `,coleccion`.")
+            return
+        if precio < 100:
+            await message.channel.send("❌ El precio mínimo es **100** 🪙.")
+            return
+        qty = await _card_qty(user_id, carta)
+        if qty < 1:
+            c = FOOTBALL_CARDS[carta]
+            await message.channel.send(f"❌ No tienes la carta **{c['name']}**.")
+            return
+        count = await _market_count_seller(user_id)
+        if count >= MAX_LISTINGS_PER_USER:
+            await message.channel.send(
+                f"❌ Ya tienes **{MAX_LISTINGS_PER_USER}** cartas en venta. Cancela alguna primero.")
+            return
+        await _remove_card(user_id, carta)
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO card_market (seller_id, card_id, price, ts) VALUES (?,?,?,?)",
+                (user_id, carta, precio, datetime.utcnow().isoformat())
+            )
+            await db.commit()
+        c = FOOTBALL_CARDS[carta]
+        rc = RARITY_CONFIG[c["rarity"]]
+        embed = discord.Embed(title="🏪 ¡Carta publicada!", color=rc["color"])
+        embed.description = (
+            f"➤ {_card_line(carta)}\n\n"
+            f"💰 Precio: **{precio:,}** 🪙\n"
+            f"La carta fue retirada de tu colección hasta que se venda o la canceles."
+        )
+        embed.set_footer(text="Cancela con: ,cancelarventa <id>")
+        await message.channel.send(embed=embed)
+
+    # ,mercado [rareza] — ver cartas en venta
+    elif cmd in ("mercado", "market", "tienda"):
+        rarity_raw = args[0].lower() if args else ""
+        rarity_key = _PACK_ALIASES.get(rarity_raw, "") if rarity_raw else ""
+        listings = await _market_listings(rarity_key)
+        title = "🏪 Mercado de Cartas"
+        if rarity_key:
+            rc = RARITY_CONFIG[rarity_key]
+            title += f" — {rc['emoji']} {rc['label']}"
+        embed = _market_embed(listings, title)
+        embed.set_footer(text="Comprar: ,comprar <id>  •  Vender: ,vender <carta> <precio>")
+        await message.channel.send(embed=embed)
+
+    # ,comprar <id> — comprar carta del mercado
+    elif cmd in ("comprar", "buy"):
+        await get_or_create_user(user_id, message.author.name)
+        if not args:
+            await message.channel.send("❌ Uso: `,comprar <id>`  Ej: `,comprar 5`")
+            return
+        try:
+            lid = int(args[0].lstrip("#"))
+        except ValueError:
+            await message.channel.send("❌ El ID debe ser un número. Ej: `,comprar 5`")
+            return
+        listing = await _market_get_listing(lid)
+        if not listing:
+            await message.channel.send(f"❌ La publicación **#{lid}** no existe o ya fue vendida.")
+            return
+        _lid, seller_id, card_id, price, ts = listing
+        if seller_id == user_id:
+            await message.channel.send("❌ No puedes comprar tu propia carta.")
+            return
+        bal = await get_balance(user_id)
+        if bal < price:
+            await message.channel.send(
+                f"❌ Necesitas **{price:,}** 🪙 pero tienes **{bal:,}** 🪙.")
+            return
+        await _market_delete_listing(_lid)
+        await update_balance(user_id, -price)
+        await update_balance(seller_id, price)
+        await _add_card(user_id, card_id)
+        c = FOOTBALL_CARDS[card_id]
+        rc = RARITY_CONFIG[c["rarity"]]
+        embed = discord.Embed(title="🎉 ¡Compra exitosa!", color=rc["color"])
+        embed.description = (
+            f"➤ {_card_line(card_id)}\n\n"
+            f"💸 Pagaste: **{price:,}** 🪙\n"
+            f"La carta fue añadida a tu colección."
+        )
+        new_bal = await get_balance(user_id)
+        embed.set_footer(text=f"Saldo restante: {new_bal:,} 🪙")
+        await message.channel.send(embed=embed)
+        try:
+            seller = await client.fetch_user(int(seller_id))
+            dm_embed = discord.Embed(title="💰 ¡Vendiste una carta!", color=0x2ECC71)
+            dm_embed.description = (
+                f"**{message.author.display_name}** compró tu:\n"
+                f"➤ {_card_line(card_id)}\n\n"
+                f"Recibiste **{price:,}** 🪙 en tu balance."
+            )
+            await seller.send(embed=dm_embed)
+        except Exception:
+            pass
+
+    # ,cancelarventa <id> — retirar carta del mercado
+    elif cmd in ("cancelarventa", "cancelventa", "retirar"):
+        if not args:
+            await message.channel.send("❌ Uso: `,cancelarventa <id>`  Ej: `,cancelarventa 5`")
+            return
+        try:
+            lid = int(args[0].lstrip("#"))
+        except ValueError:
+            await message.channel.send("❌ El ID debe ser un número.")
+            return
+        listing = await _market_get_listing(lid)
+        if not listing:
+            await message.channel.send(f"❌ La publicación **#{lid}** no existe.")
+            return
+        _lid, seller_id, card_id, price, ts = listing
+        if seller_id != user_id:
+            await message.channel.send("❌ Esa publicación no es tuya.")
+            return
+        await _market_delete_listing(_lid)
+        await _add_card(user_id, card_id)
+        c = FOOTBALL_CARDS[card_id]
+        embed = discord.Embed(title="↩️ Venta cancelada", color=0x95A5A6)
+        embed.description = f"➤ {_card_line(card_id)}\n\nLa carta fue devuelta a tu colección."
+        await message.channel.send(embed=embed)
+
+    # ,misventas — ver tus cartas en venta
+    elif cmd in ("misventas", "mylistings", "ventas"):
+        await get_or_create_user(user_id, message.author.name)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT id, card_id, price, ts FROM card_market WHERE seller_id=? ORDER BY id",
+                (user_id,)
+            ) as cur:
+                rows = await cur.fetchall()
+        if not rows:
+            embed = discord.Embed(title="📦 Sin ventas activas", color=0x95A5A6,
+                                   description="No tienes cartas en el mercado.\nUsa `,vender <carta> <precio>` para publicar una.")
+            await message.channel.send(embed=embed)
+            return
+        embed = discord.Embed(title="🏷️ Mis cartas en venta", color=0xF39C12)
+        lines = []
+        for lid, card_id, price, ts in rows:
+            c = FOOTBALL_CARDS.get(card_id, {})
+            rc = RARITY_CONFIG.get(c.get("rarity", "comun"), RARITY_CONFIG["comun"])
+            lines.append(f"`#{lid}` {rc['emoji']} **{c.get('name','?')}** — **{price:,}** 🪙")
+        embed.description = "\n".join(lines)
+        embed.set_footer(text=f"{len(rows)}/{MAX_LISTINGS_PER_USER} slots · ,cancelarventa <id> para retirar")
+        await message.channel.send(embed=embed)
+
     elif cmd in ("infocartas", "infopaquete", "probabilidades", "sobres"):
         embed = discord.Embed(title="⚽ Sobres de Tarjetas de Fútbol", color=0x3498DB)
         embed.description = f"📦 **{CARDS_PER_PACK} cartas** por sobre · **{len(FOOTBALL_CARDS)} cartas** en total\n\n"
