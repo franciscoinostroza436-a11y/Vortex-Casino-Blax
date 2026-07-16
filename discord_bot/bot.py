@@ -185,6 +185,133 @@ def evaluate_roulette_bet(numero: int, bet: str) -> tuple[bool, int, str]:
         return 25 <= numero <= 36, 2, "3️⃣ 3ra Docena (25-36)"
     return False, 0, bet
 
+# ───────────────────── TARJETAS DE FÚTBOL ─────────────────────────────────
+
+PACK_PRICE   = 10_000   # 🪙 por paquete
+CARDS_PER_PACK = 3
+
+RARITY_CONFIG = {
+    "legendario": {"emoji": "🌟", "color": 0xFFD700, "label": "LEGENDARIO", "weight": 1},
+    "epico":      {"emoji": "💜", "color": 0x9B59B6, "label": "ÉPICO",      "weight": 4},
+    "raro":       {"emoji": "💙", "color": 0x3498DB, "label": "RARO",       "weight": 10},
+    "poco_comun": {"emoji": "💚", "color": 0x2ECC71, "label": "POCO COMÚN", "weight": 25},
+    "comun":      {"emoji": "🩶", "color": 0x95A5A6, "label": "COMÚN",      "weight": 60},
+}
+
+FOOTBALL_CARDS: dict[str, dict] = {
+    # ─── LEGENDARIOS ──────────────────────────────────────────────────────
+    "pele":        {"name": "Pelé",               "team": "Brasil",          "pos": "DEL", "ovr": 100, "rarity": "legendario"},
+    "maradona":    {"name": "Diego Maradona",      "team": "Argentina",       "pos": "DEL", "ovr": 99,  "rarity": "legendario"},
+    "cruyff":      {"name": "Johan Cruyff",        "team": "Países Bajos",    "pos": "DEL", "ovr": 98,  "rarity": "legendario"},
+    "r9":          {"name": "Ronaldo Fenômeno",    "team": "Brasil",          "pos": "DEL", "ovr": 98,  "rarity": "legendario"},
+    "zidane":      {"name": "Zinedine Zidane",     "team": "Francia",         "pos": "MC",  "ovr": 98,  "rarity": "legendario"},
+    "ronaldinho":  {"name": "Ronaldinho",           "team": "Brasil",          "pos": "DEL", "ovr": 97,  "rarity": "legendario"},
+    "beckenbauer": {"name": "Franz Beckenbauer",   "team": "Alemania",        "pos": "DEF", "ovr": 97,  "rarity": "legendario"},
+    "best":        {"name": "George Best",         "team": "Manchester Utd",  "pos": "DEL", "ovr": 96,  "rarity": "legendario"},
+    # ─── ÉPICOS ────────────────────────────────────────────────────────────
+    "messi":       {"name": "Lionel Messi",        "team": "Argentina",       "pos": "DEL", "ovr": 95,  "rarity": "epico"},
+    "cr7":         {"name": "Cristiano Ronaldo",   "team": "Portugal",        "pos": "DEL", "ovr": 94,  "rarity": "epico"},
+    "neymar":      {"name": "Neymar Jr",           "team": "Brasil",          "pos": "DEL", "ovr": 92,  "rarity": "epico"},
+    "lewandowski": {"name": "R. Lewandowski",      "team": "Polonia",         "pos": "DEL", "ovr": 92,  "rarity": "epico"},
+    "modric":      {"name": "Luka Modrić",         "team": "Croacia",         "pos": "MC",  "ovr": 91,  "rarity": "epico"},
+    "benzema":     {"name": "Karim Benzema",       "team": "Francia",         "pos": "DEL", "ovr": 91,  "rarity": "epico"},
+    "bellingham":  {"name": "Jude Bellingham",     "team": "Real Madrid",     "pos": "MC",  "ovr": 90,  "rarity": "epico"},
+    "buffon":      {"name": "Gianluigi Buffon",    "team": "Italia",          "pos": "POR", "ovr": 95,  "rarity": "epico"},
+    "maldini":     {"name": "Paolo Maldini",       "team": "AC Milan",        "pos": "DEF", "ovr": 97,  "rarity": "epico"},
+    "xavi":        {"name": "Xavi Hernández",      "team": "España",          "pos": "MC",  "ovr": 94,  "rarity": "epico"},
+    # ─── RAROS ─────────────────────────────────────────────────────────────
+    "mbappe":      {"name": "Kylian Mbappé",       "team": "Francia",         "pos": "DEL", "ovr": 92,  "rarity": "raro"},
+    "haaland":     {"name": "Erling Haaland",      "team": "Noruega",         "pos": "DEL", "ovr": 91,  "rarity": "raro"},
+    "debruyne":    {"name": "Kevin De Bruyne",     "team": "Bélgica",         "pos": "MC",  "ovr": 91,  "rarity": "raro"},
+    "salah":       {"name": "Mohamed Salah",       "team": "Egipto",          "pos": "DEL", "ovr": 90,  "rarity": "raro"},
+    "vvd":         {"name": "Virgil van Dijk",     "team": "Países Bajos",    "pos": "DEF", "ovr": 90,  "rarity": "raro"},
+    "neuer":       {"name": "Manuel Neuer",        "team": "Alemania",        "pos": "POR", "ovr": 90,  "rarity": "raro"},
+    "courtois":    {"name": "Thibaut Courtois",    "team": "Bélgica",         "pos": "POR", "ovr": 90,  "rarity": "raro"},
+    "son":         {"name": "Heung-min Son",       "team": "Corea del Sur",   "pos": "DEL", "ovr": 89,  "rarity": "raro"},
+    "kane":        {"name": "Harry Kane",          "team": "Inglaterra",      "pos": "DEL", "ovr": 89,  "rarity": "raro"},
+    "vinijr":      {"name": "Vinicius Jr",         "team": "Brasil",          "pos": "DEL", "ovr": 89,  "rarity": "raro"},
+    "iniesta":     {"name": "Andrés Iniesta",      "team": "España",          "pos": "MC",  "ovr": 93,  "rarity": "raro"},
+    "kaka":        {"name": "Kaká",                "team": "Brasil",          "pos": "MC",  "ovr": 93,  "rarity": "raro"},
+    # ─── POCO COMUNES ──────────────────────────────────────────────────────
+    "griezmann":   {"name": "Antoine Griezmann",   "team": "Francia",         "pos": "DEL", "ovr": 87,  "rarity": "poco_comun"},
+    "casemiro":    {"name": "Casemiro",            "team": "Brasil",          "pos": "MC",  "ovr": 87,  "rarity": "poco_comun"},
+    "brunof":      {"name": "Bruno Fernandes",     "team": "Portugal",        "pos": "MC",  "ovr": 87,  "rarity": "poco_comun"},
+    "pedri":       {"name": "Pedri",               "team": "España",          "pos": "MC",  "ovr": 87,  "rarity": "poco_comun"},
+    "gavi":        {"name": "Gavi",                "team": "España",          "pos": "MC",  "ovr": 86,  "rarity": "poco_comun"},
+    "saka":        {"name": "Bukayo Saka",         "team": "Inglaterra",      "pos": "DEL", "ovr": 86,  "rarity": "poco_comun"},
+    "rodri":       {"name": "Rodri",               "team": "España",          "pos": "MC",  "ovr": 88,  "rarity": "poco_comun"},
+    "declanrice":  {"name": "Declan Rice",         "team": "Inglaterra",      "pos": "MC",  "ovr": 85,  "rarity": "poco_comun"},
+    "alisson":     {"name": "Alisson Becker",      "team": "Brasil",          "pos": "POR", "ovr": 89,  "rarity": "poco_comun"},
+    "oblak":       {"name": "Jan Oblak",           "team": "Eslovenia",       "pos": "POR", "ovr": 88,  "rarity": "poco_comun"},
+    "rudiger":     {"name": "Antonio Rüdiger",     "team": "Alemania",        "pos": "DEF", "ovr": 85,  "rarity": "poco_comun"},
+    "camavinga":   {"name": "Eduardo Camavinga",   "team": "Francia",         "pos": "MC",  "ovr": 84,  "rarity": "poco_comun"},
+    "yamal":       {"name": "Lamine Yamal",        "team": "España",          "pos": "DEL", "ovr": 87,  "rarity": "poco_comun"},
+    "valverde":    {"name": "Federico Valverde",   "team": "Uruguay",         "pos": "MC",  "ovr": 87,  "rarity": "poco_comun"},
+    # ─── COMUNES ───────────────────────────────────────────────────────────
+    "rashford":    {"name": "Marcus Rashford",     "team": "Inglaterra",      "pos": "DEL", "ovr": 82,  "rarity": "comun"},
+    "carvajal":    {"name": "Dani Carvajal",       "team": "España",          "pos": "DEF", "ovr": 83,  "rarity": "comun"},
+    "mendy":       {"name": "Ferland Mendy",       "team": "Francia",         "pos": "DEF", "ovr": 82,  "rarity": "comun"},
+    "tchouameni":  {"name": "A. Tchouaméni",       "team": "Francia",         "pos": "MC",  "ovr": 84,  "rarity": "comun"},
+    "luisdiaz":    {"name": "Luis Díaz",           "team": "Colombia",        "pos": "DEL", "ovr": 84,  "rarity": "comun"},
+    "nunez":       {"name": "Darwin Núñez",        "team": "Uruguay",         "pos": "DEL", "ovr": 82,  "rarity": "comun"},
+    "emimartinez": {"name": "Emiliano Martínez",   "team": "Argentina",       "pos": "POR", "ovr": 85,  "rarity": "comun"},
+    "thuram":      {"name": "Marcus Thuram",       "team": "Francia",         "pos": "DEL", "ovr": 83,  "rarity": "comun"},
+    "dembele":     {"name": "Ousmane Dembélé",     "team": "Francia",         "pos": "DEL", "ovr": 83,  "rarity": "comun"},
+    "goretzka":    {"name": "Leon Goretzka",       "team": "Alemania",        "pos": "MC",  "ovr": 83,  "rarity": "comun"},
+    "stones":      {"name": "John Stones",         "team": "Inglaterra",      "pos": "DEF", "ovr": 83,  "rarity": "comun"},
+    "robertson":   {"name": "Andy Robertson",     "team": "Escocia",         "pos": "DEF", "ovr": 84,  "rarity": "comun"},
+    "trippier":    {"name": "Kieran Trippier",     "team": "Inglaterra",      "pos": "DEF", "ovr": 83,  "rarity": "comun"},
+    "dimarco":     {"name": "Federico Dimarco",    "team": "Italia",          "pos": "DEF", "ovr": 83,  "rarity": "comun"},
+    "barella":     {"name": "Nicolò Barella",      "team": "Italia",          "pos": "MC",  "ovr": 85,  "rarity": "comun"},
+    "depay":       {"name": "Memphis Depay",       "team": "Países Bajos",    "pos": "DEL", "ovr": 82,  "rarity": "comun"},
+    "dybala":      {"name": "Paulo Dybala",        "team": "Argentina",       "pos": "DEL", "ovr": 84,  "rarity": "comun"},
+    "lautaro":     {"name": "Lautaro Martínez",    "team": "Argentina",       "pos": "DEL", "ovr": 87,  "rarity": "comun"},
+    "chiesa":      {"name": "Federico Chiesa",     "team": "Italia",          "pos": "DEL", "ovr": 83,  "rarity": "comun"},
+    "havertz":     {"name": "Kai Havertz",         "team": "Alemania",        "pos": "DEL", "ovr": 84,  "rarity": "comun"},
+}
+
+# ─── pesos para el sorteo ────────────────────────────────────────────────
+_CARD_IDS_BY_RARITY: dict[str, list[str]] = {r: [] for r in RARITY_CONFIG}
+for _cid, _cdata in FOOTBALL_CARDS.items():
+    _CARD_IDS_BY_RARITY[_cdata["rarity"]].append(_cid)
+
+
+def _draw_random_card() -> str:
+    """Pick a random card_id respecting rarity weights."""
+    rarities  = list(RARITY_CONFIG.keys())
+    weights   = [RARITY_CONFIG[r]["weight"] for r in rarities]
+    chosen_rarity = random.choices(rarities, weights=weights, k=1)[0]
+    pool = _CARD_IDS_BY_RARITY[chosen_rarity]
+    return random.choice(pool)
+
+
+def _card_line(card_id: str, qty: int = 1) -> str:
+    c = FOOTBALL_CARDS[card_id]
+    rc = RARITY_CONFIG[c["rarity"]]
+    qty_str = f" x{qty}" if qty > 1 else ""
+    return f"{rc['emoji']} **{c['name']}** `{c['pos']}` {c['team']} — OVR **{c['ovr']}** _{rc['label']}{qty_str}_"
+
+
+async def _add_card(user_id: str, card_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO football_cards (user_id, card_id, quantity) VALUES (?,?,1) "
+            "ON CONFLICT(user_id, card_id) DO UPDATE SET quantity = quantity + 1",
+            (user_id, card_id)
+        )
+        await db.commit()
+
+
+async def _get_collection(user_id: str) -> list[tuple[str, int]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT card_id, quantity FROM football_cards WHERE user_id=? ORDER BY card_id",
+            (user_id,)
+        ) as cur:
+            return await cur.fetchall()
+
+# ──────────────────────────────────────────────────────────────────────────
+
 SLOTS_SYMBOLS = ["🍒", "🍋", "🍊", "🍇", "🔔", "⭐", "💎", "7️⃣"]
 SLOTS_WEIGHTS = [30, 25, 20, 15, 12, 8, 5, 3]
 SLOTS_PAYOUTS = {
@@ -351,7 +478,9 @@ async def init_db():
                 completed INTEGER DEFAULT 0,
                 reset_date TEXT,
                 PRIMARY KEY (user_id, mission_id)
-            );
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS bet_history (
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id   TEXT    NOT NULL,
@@ -359,6 +488,14 @@ async def init_db():
                 amount_bet INTEGER NOT NULL,
                 net       INTEGER NOT NULL,
                 ts        TEXT    NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS football_cards (
+                user_id  TEXT NOT NULL,
+                card_id  TEXT NOT NULL,
+                quantity INTEGER DEFAULT 1,
+                PRIMARY KEY (user_id, card_id)
             )
         """)
         await db.commit()
@@ -3292,6 +3429,94 @@ class LiveRouletteView(discord.ui.View):
                 pass
 
 
+@tree.command(name="abrirpaquete", description="Abre un paquete de tarjetas de fútbol — 10,000 🪙")
+async def abrirpaquete_slash(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    await get_or_create_user(user_id, interaction.user.name)
+    bal = await get_balance(user_id)
+    if bal < PACK_PRICE:
+        embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
+        embed.description = f"Un paquete cuesta **{PACK_PRICE:,}** 🪙. Tienes **{bal:,}** 🪙."
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    await interaction.response.defer()
+    await update_balance(user_id, -PACK_PRICE)
+    drawn = [_draw_random_card() for _ in range(CARDS_PER_PACK)]
+    for cid in drawn:
+        await _add_card(user_id, cid)
+
+    # pick highest rarity for embed color
+    best_rarity = max((FOOTBALL_CARDS[cid]["rarity"] for cid in drawn),
+                      key=lambda r: RARITY_CONFIG[r]["weight"] * -1)  # lower weight = better
+    color = RARITY_CONFIG[best_rarity]["color"]
+    has_legendary = any(FOOTBALL_CARDS[cid]["rarity"] == "legendario" for cid in drawn)
+    has_epic      = any(FOOTBALL_CARDS[cid]["rarity"] == "epico"       for cid in drawn)
+    title = "🌟 ¡LEGENDARIA!" if has_legendary else ("💜 ¡ÉPICA!" if has_epic else "⚽ ¡Paquete Abierto!")
+
+    embed = discord.Embed(title=title, color=color)
+    embed.description = f"**{interaction.user.display_name}** abrió un paquete y obtuvo:\n\n"
+    embed.description += "\n".join(f"➤ {_card_line(cid)}" for cid in drawn)
+    new_bal = await get_balance(user_id)
+    embed.set_footer(text=f"💰 Saldo restante: {new_bal:,} 🪙  •  {PACK_PRICE:,} 🪙 / paquete")
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="coleccion", description="Muestra tu colección de tarjetas de fútbol")
+async def coleccion_slash(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    await get_or_create_user(user_id, interaction.user.name)
+    rows = await _get_collection(user_id)
+    if not rows:
+        embed = discord.Embed(title="📦 Colección vacía", color=0x95A5A6)
+        embed.description = "Aún no tienes tarjetas. Usa `/abrirpaquete` para conseguir las primeras."
+        await interaction.response.send_message(embed=embed)
+        return
+    # Group by rarity
+    by_rarity: dict[str, list[tuple[str, int]]] = {r: [] for r in RARITY_CONFIG}
+    total_cards = sum(q for _, q in rows)
+    unique_cards = len(rows)
+    for cid, qty in rows:
+        c = FOOTBALL_CARDS.get(cid)
+        if c:
+            by_rarity[c["rarity"]].append((cid, qty))
+    embed = discord.Embed(
+        title=f"⚽ Colección de {interaction.user.display_name}",
+        color=0xE91E63,
+        description=f"**{unique_cards}** cartas únicas · **{total_cards}** total\n\n",
+    )
+    for rarity in RARITY_CONFIG:
+        cards = by_rarity[rarity]
+        if not cards:
+            continue
+        rc = RARITY_CONFIG[rarity]
+        lines = [_card_line(cid, qty) for cid, qty in
+                 sorted(cards, key=lambda x: -FOOTBALL_CARDS[x[0]]["ovr"])]
+        embed.add_field(
+            name=f"{rc['emoji']} {rc['label']} ({len(cards)})",
+            value="\n".join(lines) or "_Ninguna_",
+            inline=False,
+        )
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="infocartas", description="Muestra las probabilidades y precio de los paquetes")
+async def infocartas_slash(interaction: discord.Interaction):
+    total_weight = sum(rc["weight"] for rc in RARITY_CONFIG.values())
+    totals = {r: len(_CARD_IDS_BY_RARITY[r]) for r in RARITY_CONFIG}
+    lines = []
+    for rarity, rc in RARITY_CONFIG.items():
+        pct = rc["weight"] / total_weight * 100
+        lines.append(f"{rc['emoji']} **{rc['label']}** — {pct:.1f}% probabilidad · {totals[rarity]} cartas")
+    embed = discord.Embed(title="⚽ Tarjetas de Fútbol — Info", color=0x3498DB)
+    embed.description = (
+        f"💰 **Precio por paquete:** {PACK_PRICE:,} 🪙\n"
+        f"📦 **Cartas por paquete:** {CARDS_PER_PACK}\n"
+        f"🃏 **Total de cartas:** {len(FOOTBALL_CARDS)}\n\n"
+        + "\n".join(lines)
+    )
+    await interaction.response.send_message(embed=embed)
+
+
 @tree.command(name="historial", description="Muestra tus últimas 10 apuestas con ganancias/pérdidas")
 async def historial_slash(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
@@ -5002,6 +5227,100 @@ async def on_message(message: discord.Message):
         embed.description = (
             f"Vendiste **{item_data['name']}** por **{sell_price:,}** 🪙 (50% del precio original).\n\n"
             f"Saldo actual: **{new_balance:,}** 🪙\nTe quedan **{qty - 1}** unidades en inventario."
+        )
+        await message.channel.send(embed=embed)
+
+    # ,abrirpaquete / ,pack — abrir paquete de tarjetas de fútbol
+    elif cmd in ("abrirpaquete", "pack", "paquete", "carta"):
+        await get_or_create_user(user_id, message.author.name)
+        bal = await get_balance(user_id)
+        # soporte ,abrirpaquete [n] para abrir varios a la vez (máx 5)
+        n_packs = 1
+        if args:
+            try:
+                n_packs = max(1, min(5, int(args[0])))
+            except ValueError:
+                pass
+        total_cost = PACK_PRICE * n_packs
+        if bal < total_cost:
+            embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
+            embed.description = (
+                f"{'Un paquete cuesta' if n_packs == 1 else f'{n_packs} paquetes cuestan'} "
+                f"**{total_cost:,}** 🪙. Tienes **{bal:,}** 🪙."
+            )
+            await message.channel.send(embed=embed)
+            return
+        await update_balance(user_id, -total_cost)
+        all_drawn: list[str] = []
+        for _ in range(n_packs):
+            for _ in range(CARDS_PER_PACK):
+                all_drawn.append(_draw_random_card())
+        for cid in all_drawn:
+            await _add_card(user_id, cid)
+        best_rarity = max((FOOTBALL_CARDS[cid]["rarity"] for cid in all_drawn),
+                          key=lambda r: RARITY_CONFIG[r]["weight"] * -1)
+        color = RARITY_CONFIG[best_rarity]["color"]
+        has_legendary = any(FOOTBALL_CARDS[cid]["rarity"] == "legendario" for cid in all_drawn)
+        has_epic      = any(FOOTBALL_CARDS[cid]["rarity"] == "epico"       for cid in all_drawn)
+        title = "🌟 ¡LEGENDARIA!" if has_legendary else ("💜 ¡ÉPICA!" if has_epic else "⚽ ¡Paquete Abierto!")
+        embed = discord.Embed(title=title, color=color)
+        pack_label = f"{n_packs} paquetes" if n_packs > 1 else "un paquete"
+        embed.description = f"**{message.author.display_name}** abrió {pack_label} y obtuvo:\n\n"
+        embed.description += "\n".join(f"➤ {_card_line(cid)}" for cid in all_drawn)
+        new_bal = await get_balance(user_id)
+        embed.set_footer(text=f"💰 Saldo restante: {new_bal:,} 🪙  •  {PACK_PRICE:,} 🪙 / paquete")
+        await message.channel.send(embed=embed)
+
+    # ,coleccion / ,album — ver colección de cartas
+    elif cmd in ("coleccion", "album", "cartas", "miscartas"):
+        await get_or_create_user(user_id, message.author.name)
+        rows = await _get_collection(user_id)
+        if not rows:
+            embed = discord.Embed(title="📦 Colección vacía", color=0x95A5A6)
+            embed.description = "Aún no tienes tarjetas. Usa `,abrirpaquete` para conseguir las primeras."
+            await message.channel.send(embed=embed)
+            return
+        by_rarity: dict[str, list[tuple[str, int]]] = {r: [] for r in RARITY_CONFIG}
+        total_cards = sum(q for _, q in rows)
+        unique_cards = len(rows)
+        for cid, qty in rows:
+            c = FOOTBALL_CARDS.get(cid)
+            if c:
+                by_rarity[c["rarity"]].append((cid, qty))
+        embed = discord.Embed(
+            title=f"⚽ Colección de {message.author.display_name}",
+            color=0xE91E63,
+            description=f"**{unique_cards}** cartas únicas · **{total_cards}** total\n\n",
+        )
+        for rarity in RARITY_CONFIG:
+            cards = by_rarity[rarity]
+            if not cards:
+                continue
+            rc = RARITY_CONFIG[rarity]
+            lines = [_card_line(cid, qty) for cid, qty in
+                     sorted(cards, key=lambda x: -FOOTBALL_CARDS[x[0]]["ovr"])]
+            embed.add_field(
+                name=f"{rc['emoji']} {rc['label']} ({len(cards)})",
+                value="\n".join(lines) or "_Ninguna_",
+                inline=False,
+            )
+        await message.channel.send(embed=embed)
+
+    # ,infocartas — probabilidades y precio
+    elif cmd in ("infocartas", "infopaquete", "probabilidades"):
+        total_weight = sum(rc["weight"] for rc in RARITY_CONFIG.values())
+        lines = []
+        for rarity, rc in RARITY_CONFIG.items():
+            pct = rc["weight"] / total_weight * 100
+            n   = len(_CARD_IDS_BY_RARITY[rarity])
+            lines.append(f"{rc['emoji']} **{rc['label']}** — {pct:.1f}% · {n} cartas disponibles")
+        embed = discord.Embed(title="⚽ Tarjetas de Fútbol — Info", color=0x3498DB)
+        embed.description = (
+            f"💰 **Precio por paquete:** {PACK_PRICE:,} 🪙\n"
+            f"📦 **Cartas por paquete:** {CARDS_PER_PACK}\n"
+            f"🃏 **Total de cartas:** {len(FOOTBALL_CARDS)}\n\n"
+            + "\n".join(lines)
+            + f"\n\n_Abre hasta 5 paquetes a la vez: `,abrirpaquete 3`_"
         )
         await message.channel.send(embed=embed)
 
