@@ -3548,41 +3548,60 @@ async def abrirpaquete_slash(interaction: discord.Interaction, tipo: str = "comu
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(name="coleccion", description="Muestra tu colección de tarjetas de fútbol")
-async def coleccion_slash(interaction: discord.Interaction):
-    user_id = str(interaction.user.id)
-    await get_or_create_user(user_id, interaction.user.name)
-    rows = await _get_collection(user_id)
+@tree.command(name="coleccion", description="Muestra la colección de tarjetas de fútbol (tuya o de otro jugador)")
+@app_commands.describe(usuario="El jugador cuya colección quieres ver (deja vacío para la tuya)")
+async def coleccion_slash(interaction: discord.Interaction, usuario: discord.Member | None = None):
+    target     = usuario or interaction.user
+    target_id  = str(target.id)
+    is_own     = target_id == str(interaction.user.id)
+    await get_or_create_user(target_id, target.name)
+    rows = await _get_collection(target_id)
     if not rows:
         embed = discord.Embed(title="📦 Colección vacía", color=0x95A5A6)
-        embed.description = "Aún no tienes tarjetas. Usa `/abrirpaquete` para conseguir las primeras."
+        if is_own:
+            embed.description = "Aún no tienes tarjetas. Usa `/abrirpaquete` para conseguir las primeras."
+        else:
+            embed.description = f"**{target.display_name}** aún no tiene tarjetas."
         await interaction.response.send_message(embed=embed)
         return
-    # Group by rarity
     by_rarity: dict[str, list[tuple[str, int]]] = {r: [] for r in RARITY_CONFIG}
-    total_cards = sum(q for _, q in rows)
+    total_cards  = sum(q for _, q in rows)
     unique_cards = len(rows)
+    total_ovr    = sum(FOOTBALL_CARDS[cid]["ovr"] * qty for cid, qty in rows if cid in FOOTBALL_CARDS)
+    best_card_id = max((cid for cid, _ in rows if cid in FOOTBALL_CARDS),
+                       key=lambda cid: FOOTBALL_CARDS[cid]["ovr"], default=None)
     for cid, qty in rows:
         c = FOOTBALL_CARDS.get(cid)
         if c:
             by_rarity[c["rarity"]].append((cid, qty))
-    embed = discord.Embed(
-        title=f"⚽ Colección de {interaction.user.display_name}",
-        color=0xE91E63,
-        description=f"**{unique_cards}** cartas únicas · **{total_cards}** total\n\n",
+    # Choose embed colour from best rarity owned
+    best_rarity_owned = next(
+        (r for r in RARITY_CONFIG if by_rarity[r]), "comun"
     )
+    embed = discord.Embed(
+        title=f"⚽ Colección de {target.display_name}",
+        color=RARITY_CONFIG[best_rarity_owned]["color"],
+    )
+    # Summary line
+    summary = f"🃏 **{unique_cards}** únicas · **{total_cards}** total"
+    if best_card_id:
+        bc = FOOTBALL_CARDS[best_card_id]
+        summary += f"\n⭐ Mejor carta: {RARITY_CONFIG[bc['rarity']]['emoji']} **{bc['name']}** OVR {bc['ovr']}"
+    embed.description = summary + "\n\u200b"
     for rarity in RARITY_CONFIG:
         cards = by_rarity[rarity]
         if not cards:
             continue
         rc = RARITY_CONFIG[rarity]
-        lines = [_card_line(cid, qty) for cid, qty in
-                 sorted(cards, key=lambda x: -FOOTBALL_CARDS[x[0]]["ovr"])]
+        sorted_cards = sorted(cards, key=lambda x: -FOOTBALL_CARDS[x[0]]["ovr"])
+        lines = [_card_line(cid, qty) for cid, qty in sorted_cards]
         embed.add_field(
             name=f"{rc['emoji']} {rc['label']} ({len(cards)})",
             value="\n".join(lines) or "_Ninguna_",
             inline=False,
         )
+    if not is_own:
+        embed.set_footer(text=f"💡 Usa /intercambiar {target.display_name} para proponer un intercambio")
     await interaction.response.send_message(embed=embed)
 
 
@@ -5729,25 +5748,40 @@ async def on_message(message: discord.Message):
 
     # ,coleccion / ,album — ver colección de cartas
     elif cmd in ("coleccion", "album", "cartas", "miscartas"):
-        await get_or_create_user(user_id, message.author.name)
-        rows = await _get_collection(user_id)
+        # Support: ,coleccion  OR  ,coleccion @usuario
+        target_member = message.mentions[0] if message.mentions else None
+        target_id     = str(target_member.id) if target_member else user_id
+        target_name   = target_member.display_name if target_member else message.author.display_name
+        is_own        = target_id == user_id
+        await get_or_create_user(target_id, target_name)
+        rows = await _get_collection(target_id)
         if not rows:
             embed = discord.Embed(title="📦 Colección vacía", color=0x95A5A6)
-            embed.description = "Aún no tienes tarjetas. Usa `,abrirpaquete comun` para conseguir las primeras."
+            if is_own:
+                embed.description = "Aún no tienes tarjetas. Usa `,abrirpaquete comun` para conseguir las primeras."
+            else:
+                embed.description = f"**{target_name}** aún no tiene tarjetas."
             await message.channel.send(embed=embed)
             return
         by_rarity: dict[str, list[tuple[str, int]]] = {r: [] for r in RARITY_CONFIG}
-        total_cards = sum(q for _, q in rows)
+        total_cards  = sum(q for _, q in rows)
         unique_cards = len(rows)
+        best_card_id = max((cid for cid, _ in rows if cid in FOOTBALL_CARDS),
+                           key=lambda cid: FOOTBALL_CARDS[cid]["ovr"], default=None)
         for cid, qty in rows:
             c = FOOTBALL_CARDS.get(cid)
             if c:
                 by_rarity[c["rarity"]].append((cid, qty))
+        best_rarity_owned = next((r for r in RARITY_CONFIG if by_rarity[r]), "comun")
         embed = discord.Embed(
-            title=f"⚽ Colección de {message.author.display_name}",
-            color=0xE91E63,
-            description=f"**{unique_cards}** cartas únicas · **{total_cards}** total\n\n",
+            title=f"⚽ Colección de {target_name}",
+            color=RARITY_CONFIG[best_rarity_owned]["color"],
         )
+        summary = f"🃏 **{unique_cards}** únicas · **{total_cards}** total"
+        if best_card_id:
+            bc = FOOTBALL_CARDS[best_card_id]
+            summary += f"\n⭐ Mejor carta: {RARITY_CONFIG[bc['rarity']]['emoji']} **{bc['name']}** OVR {bc['ovr']}"
+        embed.description = summary + "\n\u200b"
         for rarity in RARITY_CONFIG:
             cards = by_rarity[rarity]
             if not cards:
@@ -5760,6 +5794,8 @@ async def on_message(message: discord.Message):
                 value="\n".join(lines) or "_Ninguna_",
                 inline=False,
             )
+        if not is_own and target_member:
+            embed.set_footer(text=f"💡 Usa ,intercambiar @{target_name} para proponer un intercambio")
         await message.channel.send(embed=embed)
 
     # ,infocartas — tipos de sobres y precios
