@@ -3020,6 +3020,271 @@ async def addlevel_slash(interaction: discord.Interaction, usuario: discord.Memb
     await interaction.followup.send(embed=embed)
 
 
+# ───────────────────────────── RULETA EN VIVO ─────────────────────────────
+
+_LIVE_BET_ALIASES = {
+    "red": "red", "rojo": "red",
+    "black": "black", "negro": "black",
+    "even": "even", "par": "even", "eleven": "even",
+    "odd": "odd", "impar": "odd",
+    "1st": "1st", "primera": "1st",
+    "2nd": "2nd", "segunda": "2nd",
+    "3rd": "3rd", "tercera": "3rd",
+}
+
+def _parse_live_bet_field(raw: str) -> tuple[int, str] | None:
+    """Parse 'cantidad apuesta' string. Returns (amount, bet_key) or None."""
+    parts = raw.lower().split()
+    if len(parts) < 2:
+        return None
+    try:
+        amt = int(parts[0])
+    except ValueError:
+        return None
+    b = parts[1]
+    if b in _LIVE_BET_ALIASES:
+        return amt, _LIVE_BET_ALIASES[b]
+    if b.isdigit() and 0 <= int(b) <= 36:
+        return amt, b
+    return None
+
+
+class LiveBetModal(discord.ui.Modal, title="🎰 Tus Apuestas"):
+    apuesta1 = discord.ui.TextInput(
+        label="Apuesta 1",
+        placeholder="ej: 1000 red  |  500 17  |  all even",
+        required=True,
+        max_length=30,
+    )
+    apuesta2 = discord.ui.TextInput(
+        label="Apuesta 2 (opcional)",
+        placeholder="ej: 200 black  |  300 1st",
+        required=False,
+        max_length=30,
+    )
+    apuesta3 = discord.ui.TextInput(
+        label="Apuesta 3 (opcional)",
+        placeholder="ej: 100 odd  |  50 0",
+        required=False,
+        max_length=30,
+    )
+
+    def __init__(self, live_view: "LiveRouletteView", bal: int):
+        super().__init__()
+        self._live_view = live_view
+        self._bal = bal
+
+    async def on_submit(self, interaction: discord.Interaction):
+        user_id = str(interaction.user.id)
+        bal = self._bal
+        raw_fields = [self.apuesta1.value.strip(), self.apuesta2.value.strip(), self.apuesta3.value.strip()]
+        slots: list[tuple[int, str]] = []
+
+        for raw in raw_fields:
+            if not raw:
+                continue
+            # support "all" as amount
+            parts = raw.lower().split()
+            if parts[0] == "all" and len(parts) >= 2:
+                raw = f"{bal} {parts[1]}"
+            parsed = _parse_live_bet_field(raw)
+            if parsed is None:
+                await interaction.response.send_message(
+                    f"❌ Formato inválido: `{raw}`\nUsa `cantidad apuesta` — ej: `1000 red` · `500 17` · `200 even`",
+                    ephemeral=True,
+                )
+                return
+            amt, bk = parsed
+            if amt <= 0:
+                await interaction.response.send_message("❌ Las apuestas deben ser mayores a 0.", ephemeral=True)
+                return
+            slots.append((amt, bk))
+
+        if not slots:
+            await interaction.response.send_message("❌ Debes hacer al menos una apuesta.", ephemeral=True)
+            return
+
+        total_cost = sum(a for a, _ in slots)
+        if bal < total_cost:
+            await interaction.response.send_message(
+                f"❌ Saldo insuficiente. Necesitas **{total_cost:,}** 🪙, tienes **{bal:,}** 🪙.",
+                ephemeral=True,
+            )
+            return
+
+        # Reserve funds immediately
+        await update_balance(user_id, -total_cost)
+        self._live_view.player_bets[user_id] = (interaction.user.display_name, slots, total_cost)
+
+        await interaction.response.send_message(
+            f"✅ **{total_cost:,}** 🪙 reservados. ¡Espera el giro!", ephemeral=True
+        )
+        await self._live_view.refresh_embed()
+
+
+class LiveRouletteView(discord.ui.View):
+    MAX_PLAYERS = 10
+
+    def __init__(self, host_id: str, host_name: str, timeout_secs: int = 60):
+        super().__init__(timeout=float(timeout_secs))
+        self.host_id = host_id
+        self.host_name = host_name
+        self.timeout_secs = timeout_secs
+        # uid → (display_name, slots, total_cost)
+        self.player_bets: dict[str, tuple[str, list[tuple[int, str]], int]] = {}
+        self.message: discord.Message | None = None
+        self.spun = False
+
+    def make_embed(self) -> discord.Embed:
+        embed = discord.Embed(title="🎰 Ruleta en Vivo", color=0xE91E63)
+        n = len(self.player_bets)
+        embed.description = (
+            f"**Anfitrión:** {self.host_name}\n"
+            f"⏳ **{self.timeout_secs}s** para hacer tus apuestas\n\n"
+            f"Pulsa **🎲 Apostar** para participar (hasta 3 apuestas).\n"
+            f"Solo el anfitrión puede girar antes del tiempo."
+        )
+        if self.player_bets:
+            lines = []
+            for uid, (name, slots, total) in self.player_bets.items():
+                bet_parts = []
+                for amt, bk in slots:
+                    _, _, disp = evaluate_roulette_bet(1, bk)  # dummy numero≠0
+                    bet_parts.append(f"{amt:,} {disp}")
+                lines.append(f"🎯 **{name}** — {total:,} 🪙 → " + " · ".join(bet_parts))
+            embed.add_field(
+                name=f"👥 Jugadores ({n}/{self.MAX_PLAYERS})",
+                value="\n".join(lines),
+                inline=False,
+            )
+        else:
+            embed.add_field(name="👥 Jugadores (0)", value="_Nadie ha apostado aún..._", inline=False)
+        return embed
+
+    async def refresh_embed(self):
+        if self.message:
+            try:
+                await self.message.edit(embed=self.make_embed(), view=self)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="🎲 Apostar", style=discord.ButtonStyle.primary, emoji="🎲")
+    async def bet_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if self.spun:
+            await interaction.response.send_message("❌ La ruleta ya fue girada.", ephemeral=True)
+            return
+        uid = str(interaction.user.id)
+        if uid in self.player_bets:
+            await interaction.response.send_message("✅ Ya tienes apuestas registradas en este spin.", ephemeral=True)
+            return
+        if len(self.player_bets) >= self.MAX_PLAYERS:
+            await interaction.response.send_message("❌ Mesa llena (máx. 10 jugadores).", ephemeral=True)
+            return
+        await get_or_create_user(uid, interaction.user.name)
+        bal = await get_balance(uid)
+        if bal <= 0:
+            await interaction.response.send_message("❌ No tienes saldo para apostar.", ephemeral=True)
+            return
+        modal = LiveBetModal(self, bal)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="🎰 Girar ahora", style=discord.ButtonStyle.danger, emoji="🎰")
+    async def spin_btn(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if str(interaction.user.id) != self.host_id:
+            await interaction.response.send_message("❌ Solo el anfitrión puede girar.", ephemeral=True)
+            return
+        if self.spun:
+            await interaction.response.send_message("❌ Ya fue girada.", ephemeral=True)
+            return
+        if not self.player_bets:
+            await interaction.response.send_message("❌ Nadie ha apostado todavía.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        await self._do_spin()
+
+    async def on_timeout(self):
+        if self.spun:
+            return
+        if self.player_bets:
+            await self._do_spin()
+        else:
+            for item in self.children:
+                item.disabled = True
+            if self.message:
+                embed = discord.Embed(title="🎰 Ruleta en Vivo — Cancelada", color=0x888888)
+                embed.description = "⏰ Tiempo agotado sin participantes."
+                try:
+                    await self.message.edit(embed=embed, view=self)
+                except Exception:
+                    pass
+
+    async def _do_spin(self):
+        self.spun = True
+        for item in self.children:
+            item.disabled = True
+
+        resultado = random.randint(0, 36)
+        num_emoji = "🟢" if resultado == 0 else ("🔴" if resultado in RED_NUMBERS else "⚫")
+
+        jackpot = False
+        player_lines = []
+
+        for uid, (name, slots, total_staked) in self.player_bets.items():
+            credit = 0
+            lines = []
+            for amt, bk in slots:
+                won, mult, disp = evaluate_roulette_bet(resultado, bk)
+                if won:
+                    payout = amt + amt * mult
+                    credit += payout
+                    lines.append(f"  {disp} — {amt:,} → ✅ **+{amt*mult:,}** (x{mult})")
+                    if mult == 35:
+                        jackpot = True
+                else:
+                    lines.append(f"  {disp} — {amt:,} → ❌")
+
+            if credit > 0:
+                await update_balance(uid, credit)
+            await track_mission(uid, "roulette_played")
+
+            true_net = credit - total_staked
+            net_str = f"+{true_net:,}" if true_net >= 0 else f"{true_net:,}"
+            net_icon = "💰" if true_net >= 0 else "💸"
+            player_lines.append(f"**{name}**\n" + "\n".join(lines) + f"\n{net_icon} Neto: **{net_str}** 🪙")
+
+        color = 0xFFD700 if jackpot else 0x00FF88 if any(
+            sum(
+                (amt * mult if evaluate_roulette_bet(resultado, bk)[0] else -amt)
+                for amt, bk in slots
+            ) > 0
+            for _, (_, slots, _) in self.player_bets.items()
+        ) else 0xFF4444
+
+        embed = discord.Embed(title=f"🎰 Ruleta en Vivo — ¡Resultado!", color=color)
+        embed.description = f"## {num_emoji} **Número {resultado}**\n\n" + "\n\n".join(player_lines)
+        embed.set_footer(text=f"🎰 {len(self.player_bets)} jugadores • Anfitrión: {self.host_name}")
+
+        if self.message:
+            try:
+                await self.message.edit(embed=embed, view=self)
+            except Exception:
+                pass
+
+
+@tree.command(name="ruleta-en-vivo", description="Abre una mesa de ruleta — todos apuestan y el resultado es colectivo")
+@app_commands.describe(tiempo="Segundos para apostar (10-120, default 60)")
+async def live_roulette_slash(interaction: discord.Interaction, tiempo: int = 60):
+    if not (10 <= tiempo <= 120):
+        await interaction.response.send_message("❌ El tiempo debe estar entre 10 y 120 segundos.", ephemeral=True)
+        return
+    host_id = str(interaction.user.id)
+    await get_or_create_user(host_id, interaction.user.name)
+    view = LiveRouletteView(host_id=host_id, host_name=interaction.user.display_name, timeout_secs=tiempo)
+    embed = view.make_embed()
+    await interaction.response.send_message(embed=embed, view=view)
+    view.message = await interaction.original_response()
+
+
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -4668,6 +4933,28 @@ async def on_message(message: discord.Message):
             f"Saldo actual: **{new_balance:,}** 🪙\nTe quedan **{qty - 1}** unidades en inventario."
         )
         await message.channel.send(embed=embed)
+
+    # ,lroulette [segundos] — ruleta en vivo con temporizador
+    elif cmd in ("lroulette", "liveroulette", "ruleta"):
+        await get_or_create_user(user_id, message.author.name)
+        tiempo = 60
+        if args:
+            try:
+                t = int(args[0])
+                if 10 <= t <= 120:
+                    tiempo = t
+                else:
+                    await message.channel.send("❌ El tiempo debe estar entre 10 y 120 segundos.")
+                    return
+            except ValueError:
+                pass
+        view = LiveRouletteView(
+            host_id=user_id,
+            host_name=message.author.display_name,
+            timeout_secs=tiempo,
+        )
+        sent = await message.channel.send(embed=view.make_embed(), view=view)
+        view.message = sent
 
     # ,help / ,ayuda
     elif cmd in ("help", "ayuda", "comandos"):
