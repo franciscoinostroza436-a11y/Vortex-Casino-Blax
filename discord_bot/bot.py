@@ -2775,6 +2775,17 @@ async def help_cmd(interaction: discord.Interaction):
     )
 
     embed.add_field(
+        name="⚽ Cartas de fútbol",
+        value=(
+            "`/comprarsobre tipo` — Comprar y abrir un sobre\n"
+            "`/inventariocartas` — Ver tus cartas y duplicados\n"
+            "`/coleccion [usuario]` — Ver una colección\n"
+            "`/infocartas` — Ver sobres y precios"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
         name="📋 Misiones",
         value="`/missions` — Ver misiones diarias y progreso",
         inline=False
@@ -3508,9 +3519,7 @@ class LiveRouletteView(discord.ui.View):
                 pass
 
 
-@tree.command(name="abrirpaquete", description="Abre un sobre de tarjetas de fútbol")
-@app_commands.describe(tipo="Tipo de sobre: comun / poco_comun / raro / epico / legendario")
-async def abrirpaquete_slash(interaction: discord.Interaction, tipo: str = "comun"):
+async def _open_card_pack(interaction: discord.Interaction, tipo: str):
     pack_key = _PACK_ALIASES.get(tipo.lower().strip())
     if not pack_key:
         lines = "\n".join(
@@ -3548,61 +3557,96 @@ async def abrirpaquete_slash(interaction: discord.Interaction, tipo: str = "comu
     await interaction.followup.send(embed=embed)
 
 
-@tree.command(name="coleccion", description="Muestra la colección de tarjetas de fútbol (tuya o de otro jugador)")
-@app_commands.describe(usuario="El jugador cuya colección quieres ver (deja vacío para la tuya)")
-async def coleccion_slash(interaction: discord.Interaction, usuario: discord.Member | None = None):
-    target     = usuario or interaction.user
-    target_id  = str(target.id)
-    is_own     = target_id == str(interaction.user.id)
+@tree.command(name="abrirpaquete", description="Compra y abre un sobre de tarjetas de fútbol")
+@app_commands.describe(tipo="Tipo de sobre: comun / poco_comun / raro / epico / legendario")
+async def abrirpaquete_slash(interaction: discord.Interaction, tipo: str = "comun"):
+    await _open_card_pack(interaction, tipo)
+
+
+@tree.command(name="comprarsobre", description="Compra y abre un sobre de tarjetas de fútbol")
+@app_commands.choices(tipo=[
+    app_commands.Choice(name="Común — 1.000 monedas", value="comun"),
+    app_commands.Choice(name="Poco común — 10.000 monedas", value="poco_comun"),
+    app_commands.Choice(name="Raro — 50.000 monedas", value="raro"),
+    app_commands.Choice(name="Épico — 150.000 monedas", value="epico"),
+    app_commands.Choice(name="Legendario — 500.000 monedas", value="legendario"),
+])
+async def comprarsobre_slash(
+    interaction: discord.Interaction,
+    tipo: app_commands.Choice[str],
+):
+    await _open_card_pack(interaction, tipo.value)
+
+
+async def _send_card_collection(
+    interaction: discord.Interaction,
+    target: discord.Member | discord.User,
+    title_prefix: str = "Colección",
+):
+    target_id = str(target.id)
+    is_own = target_id == str(interaction.user.id)
     await get_or_create_user(target_id, target.name)
     rows = await _get_collection(target_id)
     if not rows:
-        embed = discord.Embed(title="📦 Colección vacía", color=0x95A5A6)
+        embed = discord.Embed(title="📦 Inventario de cartas vacío", color=0x95A5A6)
         if is_own:
-            embed.description = "Aún no tienes tarjetas. Usa `/abrirpaquete` para conseguir las primeras."
+            embed.description = "Aún no tienes tarjetas. Usa `/comprarsobre` para conseguir las primeras."
         else:
             embed.description = f"**{target.display_name}** aún no tiene tarjetas."
         await interaction.response.send_message(embed=embed)
         return
     by_rarity: dict[str, list[tuple[str, int]]] = {r: [] for r in RARITY_CONFIG}
-    total_cards  = sum(q for _, q in rows)
+    total_cards = sum(q for _, q in rows)
     unique_cards = len(rows)
-    total_ovr    = sum(FOOTBALL_CARDS[cid]["ovr"] * qty for cid, qty in rows if cid in FOOTBALL_CARDS)
-    best_card_id = max((cid for cid, _ in rows if cid in FOOTBALL_CARDS),
-                       key=lambda cid: FOOTBALL_CARDS[cid]["ovr"], default=None)
+    best_card_id = max(
+        (cid for cid, _ in rows if cid in FOOTBALL_CARDS),
+        key=lambda cid: FOOTBALL_CARDS[cid]["ovr"],
+        default=None,
+    )
     for cid, qty in rows:
-        c = FOOTBALL_CARDS.get(cid)
-        if c:
-            by_rarity[c["rarity"]].append((cid, qty))
-    # Choose embed colour from best rarity owned
+        card = FOOTBALL_CARDS.get(cid)
+        if card:
+            by_rarity[card["rarity"]].append((cid, qty))
     best_rarity_owned = next(
-        (r for r in RARITY_CONFIG if by_rarity[r]), "comun"
+        (rarity for rarity in RARITY_CONFIG if by_rarity[rarity]), "comun"
     )
     embed = discord.Embed(
-        title=f"⚽ Colección de {target.display_name}",
+        title=f"⚽ {title_prefix} de {target.display_name}",
         color=RARITY_CONFIG[best_rarity_owned]["color"],
     )
-    # Summary line
     summary = f"🃏 **{unique_cards}** únicas · **{total_cards}** total"
     if best_card_id:
-        bc = FOOTBALL_CARDS[best_card_id]
-        summary += f"\n⭐ Mejor carta: {RARITY_CONFIG[bc['rarity']]['emoji']} **{bc['name']}** OVR {bc['ovr']}"
+        best_card = FOOTBALL_CARDS[best_card_id]
+        summary += (
+            f"\n⭐ Mejor carta: {RARITY_CONFIG[best_card['rarity']]['emoji']} "
+            f"**{best_card['name']}** OVR {best_card['ovr']}"
+        )
     embed.description = summary + "\n\u200b"
     for rarity in RARITY_CONFIG:
         cards = by_rarity[rarity]
         if not cards:
             continue
-        rc = RARITY_CONFIG[rarity]
-        sorted_cards = sorted(cards, key=lambda x: -FOOTBALL_CARDS[x[0]]["ovr"])
-        lines = [_card_line(cid, qty) for cid, qty in sorted_cards]
+        rarity_config = RARITY_CONFIG[rarity]
+        sorted_cards = sorted(cards, key=lambda item: -FOOTBALL_CARDS[item[0]]["ovr"])
         embed.add_field(
-            name=f"{rc['emoji']} {rc['label']} ({len(cards)})",
-            value="\n".join(lines) or "_Ninguna_",
+            name=f"{rarity_config['emoji']} {rarity_config['label']} ({len(cards)})",
+            value="\n".join(_card_line(card_id, quantity) for card_id, quantity in sorted_cards),
             inline=False,
         )
     if not is_own:
         embed.set_footer(text=f"💡 Usa /intercambiar {target.display_name} para proponer un intercambio")
     await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="coleccion", description="Muestra la colección de tarjetas de fútbol (tuya o de otro jugador)")
+@app_commands.describe(usuario="El jugador cuya colección quieres ver (deja vacío para la tuya)")
+async def coleccion_slash(interaction: discord.Interaction, usuario: discord.Member | None = None):
+    await _send_card_collection(interaction, usuario or interaction.user)
+
+
+@tree.command(name="inventariocartas", description="Muestra tus cartas de fútbol y duplicados")
+async def inventariocartas_slash(interaction: discord.Interaction):
+    await _send_card_collection(interaction, interaction.user, "Inventario de cartas")
 
 
 @tree.command(name="infocartas", description="Muestra los tipos de sobres, precios y probabilidades")
@@ -3621,7 +3665,7 @@ async def infocartas_slash(interaction: discord.Interaction):
             ),
             inline=False,
         )
-    embed.set_footer(text="Usa /abrirpaquete <tipo>  •  Ej: /abrirpaquete raro")
+    embed.set_footer(text="Usa /comprarsobre <tipo>  •  Ej: /comprarsobre raro")
     await interaction.response.send_message(embed=embed)
 
 
