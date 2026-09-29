@@ -197,32 +197,38 @@ RARITY_CONFIG = {
     "comun":      {"emoji": "🩶", "color": 0x95A5A6, "label": "COMÚN",      "weight": 60},
 }
 
-# 5 tipos de sobres — precio y rareza garantizada
+# Cada sobre ofrece una distribución de probabilidades por carta.
+# Las probabilidades de cada sobre suman 100; ninguna rareza está garantizada.
 PACK_TYPES: dict[str, dict] = {
     "comun": {
         "label": "Sobre Común",       "emoji": "🩶", "price": 1_000,
-        "guaranteed": "comun",
-        "fill_pool": ["comun"],
+        "probabilities": {
+            "comun": 90, "poco_comun": 8, "raro": 1, "epico": 0.9, "legendario": 0.1,
+        },
     },
     "poco_comun": {
         "label": "Sobre Poco Común",  "emoji": "💚", "price": 10_000,
-        "guaranteed": "poco_comun",
-        "fill_pool": ["comun", "poco_comun"],
+        "probabilities": {
+            "comun": 70, "poco_comun": 20, "raro": 8, "epico": 1.5, "legendario": 0.5,
+        },
     },
     "raro": {
         "label": "Sobre Raro",        "emoji": "💙", "price": 50_000,
-        "guaranteed": "raro",
-        "fill_pool": ["comun", "poco_comun", "raro"],
+        "probabilities": {
+            "comun": 45, "poco_comun": 30, "raro": 18, "epico": 6, "legendario": 1,
+        },
     },
     "epico": {
         "label": "Sobre Épico",       "emoji": "💜", "price": 150_000,
-        "guaranteed": "epico",
-        "fill_pool": ["poco_comun", "raro", "epico"],
+        "probabilities": {
+            "comun": 25, "poco_comun": 30, "raro": 27, "epico": 15, "legendario": 3,
+        },
     },
     "legendario": {
         "label": "Sobre Legendario",  "emoji": "🌟", "price": 500_000,
-        "guaranteed": "legendario",
-        "fill_pool": ["raro", "epico", "legendario"],
+        "probabilities": {
+            "comun": 10, "poco_comun": 20, "raro": 30, "epico": 25, "legendario": 15,
+        },
     },
 }
 
@@ -314,22 +320,30 @@ for _cid, _cdata in FOOTBALL_CARDS.items():
     _CARD_IDS_BY_RARITY[_cdata["rarity"]].append(_cid)
 
 
-def _draw_from_pool(pool_rarities: list[str]) -> str:
-    """Draw one card_id from a subset of rarities (weighted by RARITY_CONFIG weight)."""
-    weights = [RARITY_CONFIG[r]["weight"] for r in pool_rarities]
-    chosen = random.choices(pool_rarities, weights=weights, k=1)[0]
+def _draw_from_pack(pack_key: str) -> str:
+    """Draw one random card using the pack's rarity probabilities."""
+    probabilities = PACK_TYPES[pack_key]["probabilities"]
+    rarities = list(probabilities)
+    chosen = random.choices(
+        rarities,
+        weights=[probabilities[rarity] for rarity in rarities],
+        k=1,
+    )[0]
     return random.choice(_CARD_IDS_BY_RARITY[chosen])
 
 
 def _draw_pack_cards(pack_key: str) -> list[str]:
-    """Draw CARDS_PER_PACK cards for the given pack type.
-    Slot 0 is always the guaranteed rarity; remaining slots come from fill_pool."""
-    pt = PACK_TYPES[pack_key]
-    guaranteed = random.choice(_CARD_IDS_BY_RARITY[pt["guaranteed"]])
-    fill = [_draw_from_pool(pt["fill_pool"]) for _ in range(CARDS_PER_PACK - 1)]
-    cards = [guaranteed] + fill
-    random.shuffle(cards)
-    return cards
+    """Draw every card independently; no rarity is guaranteed by the pack."""
+    return [_draw_from_pack(pack_key) for _ in range(CARDS_PER_PACK)]
+
+
+def _format_pack_probabilities(pack: dict) -> str:
+    lines = []
+    for rarity, probability in pack["probabilities"].items():
+        config = RARITY_CONFIG[rarity]
+        percentage = f"{probability:g}"
+        lines.append(f"{config['emoji']} {config['label']}: **{percentage}%**")
+    return "\n".join(lines)
 
 
 def _card_line(card_id: str, qty: int = 1) -> str:
@@ -3652,17 +3666,14 @@ async def inventariocartas_slash(interaction: discord.Interaction):
 @tree.command(name="infocartas", description="Muestra los tipos de sobres, precios y probabilidades")
 async def infocartas_slash(interaction: discord.Interaction):
     embed = discord.Embed(title="⚽ Sobres de Tarjetas de Fútbol", color=0x3498DB)
-    embed.description = f"📦 **{CARDS_PER_PACK} cartas** por sobre · **{len(FOOTBALL_CARDS)} cartas** en total\n\n"
+    embed.description = (
+        f"📦 **{CARDS_PER_PACK} cartas** por sobre · **{len(FOOTBALL_CARDS)} cartas** en total\n"
+        "🎲 Porcentajes por carta; las tres se sortean independientemente. No hay rarezas garantizadas.\n"
+    )
     for pack_key, pt in PACK_TYPES.items():
-        rc_g = RARITY_CONFIG[pt["guaranteed"]]
-        pool_labels = " / ".join(RARITY_CONFIG[r]["label"] for r in pt["fill_pool"])
-        n_guaranteed = len(_CARD_IDS_BY_RARITY[pt["guaranteed"]])
         embed.add_field(
             name=f"{pt['emoji']} {pt['label']} — {pt['price']:,} 🪙",
-            value=(
-                f"✅ **Garantizado:** {rc_g['emoji']} {rc_g['label']} ({n_guaranteed} posibles)\n"
-                f"🎲 Resto del sobre: {pool_labels}"
-            ),
+            value=_format_pack_probabilities(pt),
             inline=False,
         )
     embed.set_footer(text="Usa /comprarsobre <tipo>  •  Ej: /comprarsobre raro")
@@ -6004,17 +6015,14 @@ async def on_message(message: discord.Message):
 
     elif cmd in ("infocartas", "infopaquete", "probabilidades", "sobres"):
         embed = discord.Embed(title="⚽ Sobres de Tarjetas de Fútbol", color=0x3498DB)
-        embed.description = f"📦 **{CARDS_PER_PACK} cartas** por sobre · **{len(FOOTBALL_CARDS)} cartas** en total\n\n"
+        embed.description = (
+            f"📦 **{CARDS_PER_PACK} cartas** por sobre · **{len(FOOTBALL_CARDS)} cartas** en total\n"
+            "🎲 Porcentajes por carta; las tres se sortean independientemente. No hay rarezas garantizadas.\n"
+        )
         for pack_key, pt in PACK_TYPES.items():
-            rc_g = RARITY_CONFIG[pt["guaranteed"]]
-            pool_labels = " / ".join(RARITY_CONFIG[r]["label"] for r in pt["fill_pool"])
-            n_g = len(_CARD_IDS_BY_RARITY[pt["guaranteed"]])
             embed.add_field(
                 name=f"{pt['emoji']} {pt['label']} — {pt['price']:,} 🪙",
-                value=(
-                    f"✅ **Garantizado:** {rc_g['emoji']} {rc_g['label']} ({n_g} posibles)\n"
-                    f"🎲 Resto: {pool_labels}"
-                ),
+                value=_format_pack_probabilities(pt),
                 inline=False,
             )
         embed.set_footer(text="Uso: ,abrirpaquete <tipo>  •  Ej: ,abrirpaquete raro")
