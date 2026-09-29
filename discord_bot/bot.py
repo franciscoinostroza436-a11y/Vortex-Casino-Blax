@@ -81,26 +81,26 @@ SHOP_ITEMS = {
     "role_plata": {
         "name": "🥈 Rol: Plata",
         "price": 150_000_000,
-        "description": "Gana **+60,000,000** 🪙 cada 4h con `/collect`.",
+        "description": "Gana **+60,000,000** 🪙 cada 5h con `/collect`.",
         "category": "rol",
         "collect_bonus": 60_000_000,
-        "collect_hours": 4,
+        "collect_hours": 5,
     },
     "role_oro": {
         "name": "🥇 Rol: Oro",
         "price": 200_000_000,
-        "description": "Gana **+70,000,000** 🪙 cada 4h con `/collect`.",
+        "description": "Gana **+70,000,000** 🪙 cada 6h con `/collect`.",
         "category": "rol",
         "collect_bonus": 70_000_000,
-        "collect_hours": 4,
+        "collect_hours": 6,
     },
     "role_diamante": {
         "name": "💎 Rol: Diamante",
         "price": 250_000_000,
-        "description": "Gana **+160,000,000** 🪙 cada 4h con `/collect`.",
+        "description": "Gana **+160,000,000** 🪙 cada 7h con `/collect`.",
         "category": "rol",
         "collect_bonus": 160_000_000,
-        "collect_hours": 4,
+        "collect_hours": 7,
     },
 }
 
@@ -535,6 +535,31 @@ async def init_db():
                 UNIQUE(user_id, item_id)
             )
         """)
+        async with db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='role_collects'"
+        ) as cursor:
+            role_collects_table_exists = await cursor.fetchone() is not None
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS role_collects (
+                user_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                last_collect TEXT NOT NULL,
+                PRIMARY KEY (user_id, item_id)
+            )
+        """)
+        if not role_collects_table_exists:
+            role_placeholders = ",".join("?" for _ in ROLE_ITEMS)
+            await db.execute(
+                f"""
+                INSERT OR IGNORE INTO role_collects (user_id, item_id, last_collect)
+                SELECT inventory.user_id, inventory.item_id, users.last_collect
+                FROM inventory
+                JOIN users ON users.user_id = inventory.user_id
+                WHERE inventory.item_id IN ({role_placeholders})
+                  AND users.last_collect IS NOT NULL
+                """,
+                ROLE_ITEMS,
+            )
         await db.execute("""
             CREATE TABLE IF NOT EXISTS lottery_tickets (
                 user_id TEXT PRIMARY KEY,
@@ -680,6 +705,80 @@ async def remove_from_inventory(user_id: str, item_id: str):
             (user_id, item_id)
         )
         await db.commit()
+
+
+async def collect_available_role_earnings(
+    user_id: str,
+    now: datetime | None = None,
+) -> tuple[list[str], list[str], list[tuple[str, datetime]]]:
+    """Collect only roles whose individual cooldown has expired."""
+    role_placeholders = ",".join("?" for _ in ROLE_ITEMS)
+    now = now or datetime.utcnow()
+    owned_roles: list[str] = []
+    ready_roles: list[str] = []
+    waiting_roles: list[tuple[str, datetime]] = []
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            f"SELECT item_id FROM inventory WHERE user_id=? AND quantity > 0 "
+            f"AND item_id IN ({role_placeholders})",
+            (user_id, *ROLE_ITEMS),
+        ) as cursor:
+            owned_roles = [row[0] for row in await cursor.fetchall()]
+
+        if not owned_roles:
+            await db.commit()
+            return [], [], []
+
+        async with db.execute(
+            "SELECT item_id, last_collect FROM role_collects WHERE user_id=?",
+            (user_id,),
+        ) as cursor:
+            last_collect_by_role = dict(await cursor.fetchall())
+
+        for role_id in owned_roles:
+            last_collect = last_collect_by_role.get(role_id)
+            cooldown = timedelta(hours=SHOP_ITEMS[role_id]["collect_hours"])
+            if not last_collect or now - datetime.fromisoformat(last_collect) >= cooldown:
+                ready_roles.append(role_id)
+            else:
+                next_collect = datetime.fromisoformat(last_collect) + cooldown
+                waiting_roles.append((role_id, next_collect))
+
+        if ready_roles:
+            total_bonus = sum(SHOP_ITEMS[role_id]["collect_bonus"] for role_id in ready_roles)
+            for role_id in ready_roles:
+                await db.execute(
+                    "INSERT INTO role_collects (user_id, item_id, last_collect) VALUES (?, ?, ?) "
+                    "ON CONFLICT(user_id, item_id) DO UPDATE SET last_collect=excluded.last_collect",
+                    (user_id, role_id, now.isoformat()),
+                )
+            await db.execute(
+                "UPDATE users SET balance=MIN(balance + ?, ?), last_collect=? WHERE user_id=?",
+                (total_bonus, MAX_BALANCE, now.isoformat(), user_id),
+            )
+
+        await db.commit()
+
+    return owned_roles, ready_roles, waiting_roles
+
+
+async def get_role_last_collect(user_id: str, role_id: str) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT last_collect FROM role_collects WHERE user_id=? AND item_id=?",
+            (user_id, role_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+
+def format_collect_wait(next_collect: datetime, now: datetime | None = None) -> str:
+    remaining = max(0, int((next_collect - (now or datetime.utcnow())).total_seconds()))
+    hours, remainder = divmod(remaining, 3600)
+    minutes = remainder // 60
+    return f"{hours}h {minutes}m"
 
 
 async def get_today() -> str:
@@ -912,64 +1011,51 @@ async def daily(interaction: discord.Interaction):
 async def collect(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     await get_or_create_user(user_id, interaction.user.name)
-
-    owned_roles = []
-    for role_id in ROLE_ITEMS:
-        qty = await get_item_quantity(user_id, role_id)
-        if qty > 0:
-            owned_roles.append(role_id)
+    owned_roles, ready_roles, waiting_roles = await collect_available_role_earnings(user_id)
 
     if not owned_roles:
         embed = discord.Embed(title="❌ Sin Roles", color=0xFF4444)
         embed.description = (
             "No tienes ningún rol activo.\n"
-            "Compra un rol en `/shop` para ganar monedas con `/collect`.\n\n"
-            "🎩 **Casino VIP** — +300 🪙 cada 12h\n"
-            "🎮 **Viciado Casino** — +700 🪙 cada 8h\n"
-            "👑 **Casino Supremo** — +1,500 🪙 cada 6h"
+            "Compra un rol desde `/buy` para ganar monedas con `/collect`.\n\n"
+            "🥉 **Bronce** — +50,000,000 🪙 cada 4h\n"
+            "🥈 **Plata** — +60,000,000 🪙 cada 5h\n"
+            "🥇 **Oro** — +70,000,000 🪙 cada 6h\n"
+            "💎 **Diamante** — +160,000,000 🪙 cada 7h"
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
-    min_hours = min(SHOP_ITEMS[r]["collect_hours"] for r in owned_roles)
-    total_bonus = sum(SHOP_ITEMS[r]["collect_bonus"] for r in owned_roles)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT last_collect FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            last_collect = row[0] if row else None
-
-    now = datetime.utcnow()
-    if last_collect:
-        last_dt = datetime.fromisoformat(last_collect)
-        diff = now - last_dt
-        if diff < timedelta(hours=min_hours):
-            remaining = timedelta(hours=min_hours) - diff
-            hours, remainder = divmod(int(remaining.total_seconds()), 3600)
-            minutes = remainder // 60
-            embed = discord.Embed(title="⏰ Collect No Disponible", color=0xFF4444)
-            embed.description = f"Ya recogiste tus ganancias.\nVuelve en **{hours}h {minutes}m**."
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET balance = balance + ?, last_collect = ? WHERE user_id = ?",
-            (total_bonus, now.isoformat(), user_id)
+    if not ready_roles:
+        embed = discord.Embed(title="⏰ Ningún collect listo todavía", color=0xFFAA00)
+        embed.description = "\n".join(
+            f"{SHOP_ITEMS[role_id]['name']}: vuelve en **{format_collect_wait(next_collect)}**"
+            for role_id, next_collect in waiting_roles
         )
-        await db.commit()
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
 
+    total_bonus = sum(SHOP_ITEMS[r]["collect_bonus"] for r in ready_roles)
     new_balance = await get_balance(user_id)
     embed = discord.Embed(title="💰 ¡Ganancias Recogidas!", color=0x00FF88)
     lines = "\n".join(
         f"{SHOP_ITEMS[r]['name']} → +**{SHOP_ITEMS[r]['collect_bonus']:,}** 🪙"
-        for r in owned_roles
+        for r in ready_roles
     )
     embed.description = (
         f"{lines}\n\n"
         f"**Total:** +**{total_bonus:,}** 🪙\n"
         f"Saldo actual: **{new_balance:,}** 🪙"
     )
+    if waiting_roles:
+        embed.add_field(
+            name="⏳ Aún en espera",
+            value="\n".join(
+                f"{SHOP_ITEMS[role_id]['name']}: **{format_collect_wait(next_collect)}**"
+                for role_id, next_collect in waiting_roles
+            ),
+            inline=False,
+        )
     await interaction.response.send_message(embed=embed)
 
 
@@ -1434,66 +1520,143 @@ async def resetmoney_slash(interaction: discord.Interaction, usuario: discord.Me
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="shop", description="Muestra los objetos disponibles en la tienda")
-async def shop(interaction: discord.Interaction):
-    embed = discord.Embed(title="🏪 Tienda del Casino", color=0x9B59B6)
-    embed.description = "Usa `/buy <id_item>` para comprar. Los roles se usan con `/collect`.\n"
-
-    categorias = {
+def build_shop_embed(panel: bool = False) -> discord.Embed:
+    embed = discord.Embed(
+        title="🛍️ Tienda del Casino" if panel else "🏪 Tienda del Casino",
+        color=0x9B59B6,
+    )
+    embed.description = (
+        "Selecciona un objeto en el menú para comprarlo."
+        if panel
+        else "Usa `/buy` para abrir el panel de compra o `/buy <id_item>` para comprar por ID."
+    )
+    categories = {
         "proteccion": "🛡️ Protección",
         "rol": "👑 Roles con /collect",
         "decorativo": "🎭 Decorativos",
     }
+    for category, title in categories.items():
+        entries = [
+            (item_id, item)
+            for item_id, item in SHOP_ITEMS.items()
+            if item["category"] == category
+        ]
+        if entries:
+            lines = [
+                f"**{item['name']}** — **{item['price']:,}** 🪙\n"
+                f"{item['description']}\n`ID: {item_id}`"
+                for item_id, item in entries
+            ]
+            embed.add_field(name=title, value="\n\n".join(lines), inline=False)
+    return embed
 
-    for cat_key, cat_name in categorias.items():
-        items_in_cat = [(k, v) for k, v in SHOP_ITEMS.items() if v["category"] == cat_key]
-        if not items_in_cat:
-            continue
-        lines = []
-        for item_id, item in items_in_cat:
-            lines.append(f"**{item['name']}** — {item['price']:,} 🪙\n{item['description']}\n`ID: {item_id}`")
-        embed.add_field(name=cat_name, value="\n\n".join(lines), inline=False)
 
-    await interaction.response.send_message(embed=embed)
+async def complete_shop_purchase(user: discord.User | discord.Member, item_id: str) -> discord.Embed:
+    item_data = SHOP_ITEMS[item_id]
+    user_id = str(user.id)
+    await get_or_create_user(user_id, user.name)
+    balance = await get_balance(user_id)
 
-
-@tree.command(name="buy", description="Compra un objeto de la tienda")
-@app_commands.describe(item="ID del objeto a comprar")
-async def buy(interaction: discord.Interaction, item: str):
-    item = item.lower().strip()
-    if item not in SHOP_ITEMS:
-        ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
-        await interaction.response.send_message(f"❌ Objeto no encontrado. IDs válidos: {ids}", ephemeral=True)
-        return
-
-    user_id = str(interaction.user.id)
-    await get_or_create_user(user_id, interaction.user.name)
-
-    item_data = SHOP_ITEMS[item]
-    bal = await get_balance(user_id)
-
-    if bal < item_data["price"]:
+    if balance < item_data["price"]:
         embed = discord.Embed(title="❌ Saldo Insuficiente", color=0xFF4444)
-        embed.description = f"Necesitas **{item_data['price']:,}** 🪙 y tienes **{bal:,}** 🪙."
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
+        embed.description = (
+            f"Necesitas **{item_data['price']:,}** 🪙 y tienes **{balance:,}** 🪙."
+        )
+        return embed
 
     await update_balance(user_id, -item_data["price"])
-    await add_to_inventory(user_id, item)
+    await add_to_inventory(user_id, item_id)
     new_balance = await get_balance(user_id)
 
     embed = discord.Embed(title="🛍️ ¡Compra Exitosa!", color=0x00FF88)
-    desc = (
+    description = (
         f"Compraste **{item_data['name']}**.\n"
         f"{item_data['description']}\n\n"
         f"Gastaste: **{item_data['price']:,}** 🪙\n"
         f"Saldo restante: **{new_balance:,}** 🪙"
     )
     if item_data["category"] == "rol":
-        desc += "\n\n💡 Usa `/collect` para reclamar tus ganancias de rol."
+        description += "\n\n💡 Usa `/collect` para reclamar las ganancias disponibles."
     if item_data["category"] == "proteccion":
-        desc += "\n\n💡 Se activa automáticamente si alguien intenta robarte."
-    embed.description = desc
+        description += "\n\n💡 Se activa automáticamente si alguien intenta robarte."
+    embed.description = description
+    return embed
+
+
+class ShopBuySelect(discord.ui.Select):
+    def __init__(self, owner_id: str):
+        self.owner_id = owner_id
+        options = []
+        for item_id, item in SHOP_ITEMS.items():
+            category = "Rol" if item["category"] == "rol" else item["category"].title()
+            detail = f"{item['price']:,} monedas · {category}"
+            if item["category"] == "rol":
+                detail += f" · +{item['collect_bonus']:,} cada {item['collect_hours']}h"
+            options.append(
+                discord.SelectOption(
+                    label=item["name"],
+                    value=item_id,
+                    description=detail[:100],
+                )
+            )
+        super().__init__(
+            placeholder="Elige un objeto para comprar",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.owner_id:
+            await interaction.response.send_message(
+                "Este panel pertenece a otra persona.", ephemeral=True
+            )
+            return
+        view = self.view
+        if view is None or view.purchase_completed:
+            await interaction.response.send_message(
+                "Este panel de compra ya fue utilizado. Ejecuta `/buy` para abrir otro.",
+                ephemeral=True,
+            )
+            return
+        view.purchase_completed = True
+        result = await complete_shop_purchase(interaction.user, self.values[0])
+        await interaction.response.edit_message(embed=result, view=None)
+
+
+class ShopBuyView(discord.ui.View):
+    def __init__(self, owner_id: str):
+        super().__init__(timeout=180)
+        self.purchase_completed = False
+        self.add_item(ShopBuySelect(owner_id))
+
+
+@tree.command(name="shop", description="Muestra los objetos disponibles en la tienda")
+async def shop(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=build_shop_embed())
+
+
+@tree.command(name="buy", description="Abre el panel de compra o compra un objeto por ID")
+@app_commands.describe(item="ID del objeto; déjalo vacío para abrir el panel")
+async def buy(interaction: discord.Interaction, item: str | None = None):
+    if item is None:
+        await get_or_create_user(str(interaction.user.id), interaction.user.name)
+        await interaction.response.send_message(
+            embed=build_shop_embed(panel=True),
+            view=ShopBuyView(str(interaction.user.id)),
+            ephemeral=True,
+        )
+        return
+
+    item = item.lower().strip()
+    if item not in SHOP_ITEMS:
+        ids = ", ".join(f"`{item_id}`" for item_id in SHOP_ITEMS)
+        await interaction.response.send_message(
+            f"❌ Objeto no encontrado. IDs válidos: {ids}", ephemeral=True
+        )
+        return
+
+    embed = await complete_shop_purchase(interaction.user, item)
     await interaction.response.send_message(embed=embed)
 
 
@@ -2163,25 +2326,7 @@ async def crash(interaction: discord.Interaction, cantidad: int):
 
 @tree.command(name="store", description="Muestra la tienda del casino (alias de /shop)")
 async def store(interaction: discord.Interaction):
-    embed = discord.Embed(title="🏪 Tienda del Casino", color=0x9B59B6)
-    embed.description = "Usa `/buy <id_item>` para comprar. Los roles se usan con `/collect`.\n"
-
-    categorias = {
-        "proteccion": "🛡️ Protección",
-        "rol": "👑 Roles con /collect",
-        "decorativo": "🎭 Decorativos",
-    }
-
-    for cat_key, cat_name in categorias.items():
-        items_in_cat = [(k, v) for k, v in SHOP_ITEMS.items() if v["category"] == cat_key]
-        if not items_in_cat:
-            continue
-        lines = []
-        for item_id, item in items_in_cat:
-            lines.append(f"**{item['name']}** — {item['price']:,} 🪙\n{item['description']}\n`ID: {item_id}`")
-        embed.add_field(name=cat_name, value="\n\n".join(lines), inline=False)
-
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=build_shop_embed())
 
 
 @tree.command(name="iteminfo", description="Muestra los detalles completos de un objeto de la tienda")
@@ -2227,8 +2372,8 @@ async def iteminfo(interaction: discord.Interaction, item: str):
             value=(
                 "• Compra el rol con `/buy`\n"
                 "• Usa `/collect` para reclamar tus ganancias\n"
-                "• Si tienes varios roles, los bonuses se suman\n"
-                "• El cooldown es el menor entre tus roles activos"
+                "• Cada rol tiene su propio cooldown\n"
+                "• `/collect` paga solo los roles que ya están listos"
             ),
             inline=False
         )
@@ -2320,21 +2465,14 @@ async def use(interaction: discord.Interaction, item: str):
         await interaction.response.send_message(embed=embed)
 
     elif item_data["category"] == "rol":
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT last_collect FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-                last_collect = row[0] if row else None
-
+        last_collect = await get_role_last_collect(user_id, item)
         now = datetime.utcnow()
         cooldown_hours = item_data["collect_hours"]
         if last_collect:
             last_dt = datetime.fromisoformat(last_collect)
-            diff = now - last_dt
-            if diff < timedelta(hours=cooldown_hours):
-                remaining = timedelta(hours=cooldown_hours) - diff
-                hrs, rem = divmod(int(remaining.total_seconds()), 3600)
-                mins = rem // 60
-                next_collect = f"en **{hrs}h {mins}m**"
+            next_collect_at = last_dt + timedelta(hours=cooldown_hours)
+            if now < next_collect_at:
+                next_collect = f"en **{format_collect_wait(next_collect_at, now)}**"
             else:
                 next_collect = "**¡Ahora mismo!** Usa `/collect`"
         else:
@@ -2778,7 +2916,7 @@ async def help_cmd(interaction: discord.Interaction):
         name="🛍️ Tienda e Inventario",
         value=(
             "`/shop` — Ver la tienda\n"
-            "`/buy item` — Comprar un objeto\n"
+            "`/buy [item]` — Abrir panel de compra o comprar por ID\n"
             "`/inventory` — Ver tu inventario\n"
             "`/iteminfo item` — Info de un objeto\n"
             "`/use item` — Usar un objeto\n"
@@ -4142,7 +4280,10 @@ async def on_message(message: discord.Message):
     # ,shop
     elif cmd == "shop":
         embed = discord.Embed(title="🏪 Tienda del Casino", color=0x9B59B6)
-        embed.description = "Usa `,buy <id_item>` o `/buy <id_item>` para comprar. Los roles se usan con `,collect`.\n"
+        embed.description = (
+            "Usa `/buy` para abrir el panel de compra, `/buy <id_item>` o "
+            "`,buy <id_item>` para comprar por ID. Los roles se cobran con `,collect`.\n"
+        )
         categorias = {
             "proteccion": "🛡️ Protección",
             "rol": "👑 Roles con /collect",
@@ -4162,60 +4303,51 @@ async def on_message(message: discord.Message):
     # ,collect
     elif cmd == "collect":
         await get_or_create_user(user_id, message.author.name)
-        owned_roles = []
-        for role_id in ROLE_ITEMS:
-            qty = await get_item_quantity(user_id, role_id)
-            if qty > 0:
-                owned_roles.append(role_id)
+        owned_roles, ready_roles, waiting_roles = await collect_available_role_earnings(user_id)
 
         if not owned_roles:
             embed = discord.Embed(title="❌ Sin Roles", color=0xFF4444)
             embed.description = (
                 "No tienes ningún rol activo.\n"
-                "Compra un rol en `,shop` para ganar monedas con `,collect`."
+                "Compra un rol con `,buy` para ganar monedas con `,collect`.\n\n"
+                "🥉 **Bronce** — +50,000,000 🪙 cada 4h\n"
+                "🥈 **Plata** — +60,000,000 🪙 cada 5h\n"
+                "🥇 **Oro** — +70,000,000 🪙 cada 6h\n"
+                "💎 **Diamante** — +160,000,000 🪙 cada 7h"
             )
             await message.channel.send(embed=embed)
             return
 
-        min_hours = min(SHOP_ITEMS[r]["collect_hours"] for r in owned_roles)
-        total_bonus = sum(SHOP_ITEMS[r]["collect_bonus"] for r in owned_roles)
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT last_collect FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-                last_collect = row[0] if row else None
-
-        now = datetime.utcnow()
-        if last_collect:
-            last_dt = datetime.fromisoformat(last_collect)
-            diff = now - last_dt
-            if diff < timedelta(hours=min_hours):
-                remaining = timedelta(hours=min_hours) - diff
-                hrs, remainder = divmod(int(remaining.total_seconds()), 3600)
-                mins = remainder // 60
-                embed = discord.Embed(title="⏰ Collect No Disponible", color=0xFF4444)
-                embed.description = f"Ya recogiste tus ganancias.\nVuelve en **{hrs}h {mins}m**."
-                await message.channel.send(embed=embed)
-                return
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "UPDATE users SET balance = balance + ?, last_collect = ? WHERE user_id = ?",
-                (total_bonus, now.isoformat(), user_id)
+        if not ready_roles:
+            embed = discord.Embed(title="⏰ Ningún collect listo todavía", color=0xFFAA00)
+            embed.description = "\n".join(
+                f"{SHOP_ITEMS[role_id]['name']}: vuelve en **{format_collect_wait(next_collect)}**"
+                for role_id, next_collect in waiting_roles
             )
-            await db.commit()
+            await message.channel.send(embed=embed)
+            return
 
+        total_bonus = sum(SHOP_ITEMS[r]["collect_bonus"] for r in ready_roles)
         new_balance = await get_balance(user_id)
         embed = discord.Embed(title="💰 ¡Ganancias Recogidas!", color=0x00FF88)
         lines = "\n".join(
             f"{SHOP_ITEMS[r]['name']} → +**{SHOP_ITEMS[r]['collect_bonus']:,}** 🪙"
-            for r in owned_roles
+            for r in ready_roles
         )
         embed.description = (
             f"{lines}\n\n"
             f"**Total:** +**{total_bonus:,}** 🪙\n"
             f"Saldo actual: **{new_balance:,}** 🪙"
         )
+        if waiting_roles:
+            embed.add_field(
+                name="⏳ Aún en espera",
+                value="\n".join(
+                    f"{SHOP_ITEMS[role_id]['name']}: **{format_collect_wait(next_collect)}**"
+                    for role_id, next_collect in waiting_roles
+                ),
+                inline=False,
+            )
         await message.channel.send(embed=embed)
 
     # ,roulette <cantidad|all> <red|rojo|black|negro>
