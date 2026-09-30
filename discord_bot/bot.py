@@ -46,7 +46,7 @@ SHOP_ITEMS = {
         "description": "Para que nadie lea tu cara. Decorativo.",
         "category": "decorativo",
     },
-    "role_vip": {
+    "vip": {
         "name": "🎩 Rol: Casino VIP",
         "price": 3000,
         "description": "Gana **+300** 🪙 cada 12h con `/collect`.",
@@ -54,7 +54,7 @@ SHOP_ITEMS = {
         "collect_bonus": 300,
         "collect_hours": 12,
     },
-    "role_viciado": {
+    "viciado": {
         "name": "🎮 Rol: Viciado Casino",
         "price": 7000,
         "description": "Gana **+700** 🪙 cada 8h con `/collect`.",
@@ -62,7 +62,7 @@ SHOP_ITEMS = {
         "collect_bonus": 700,
         "collect_hours": 8,
     },
-    "role_supremo": {
+    "supremo": {
         "name": "👑 Rol: Casino Supremo",
         "price": 15000,
         "description": "Gana **+1,500** 🪙 cada 6h con `/collect`.",
@@ -70,7 +70,7 @@ SHOP_ITEMS = {
         "collect_bonus": 1500,
         "collect_hours": 6,
     },
-    "role_bronce": {
+    "bronce": {
         "name": "🥉 Rol: Bronce",
         "price": 50_000_000,
         "description": "Gana **+50,000,000** 🪙 cada 4h con `/collect`.",
@@ -78,7 +78,7 @@ SHOP_ITEMS = {
         "collect_bonus": 50_000_000,
         "collect_hours": 4,
     },
-    "role_plata": {
+    "plata": {
         "name": "🥈 Rol: Plata",
         "price": 150_000_000,
         "description": "Gana **+60,000,000** 🪙 cada 5h con `/collect`.",
@@ -86,7 +86,7 @@ SHOP_ITEMS = {
         "collect_bonus": 60_000_000,
         "collect_hours": 5,
     },
-    "role_oro": {
+    "oro": {
         "name": "🥇 Rol: Oro",
         "price": 200_000_000,
         "description": "Gana **+70,000,000** 🪙 cada 6h con `/collect`.",
@@ -94,7 +94,7 @@ SHOP_ITEMS = {
         "collect_bonus": 70_000_000,
         "collect_hours": 6,
     },
-    "role_diamante": {
+    "diamante": {
         "name": "💎 Rol: Diamante",
         "price": 250_000_000,
         "description": "Gana **+160,000,000** 🪙 cada 7h con `/collect`.",
@@ -102,9 +102,55 @@ SHOP_ITEMS = {
         "collect_bonus": 160_000_000,
         "collect_hours": 7,
     },
+    "ruby": {
+        "name": "🔴 Rol: Ruby",
+        "price": 350_000_000,
+        "description": "Gana **+200,000,000** 🪙 cada 8h con `/collect`.",
+        "category": "rol",
+        "collect_bonus": 200_000_000,
+        "collect_hours": 8,
+    },
+    "esmeralda": {
+        "name": "🟢 Rol: Esmeralda",
+        "price": 500_000_000,
+        "description": "Gana **+250,000,000** 🪙 cada 9h con `/collect`.",
+        "category": "rol",
+        "collect_bonus": 250_000_000,
+        "collect_hours": 9,
+    },
+    "zafiro": {
+        "name": "🔷 Rol: Zafiro",
+        "price": 750_000_000,
+        "description": "Gana **+350,000,000** 🪙 cada 10h con `/collect`.",
+        "category": "rol",
+        "collect_bonus": 350_000_000,
+        "collect_hours": 10,
+    },
+    "obsidiana": {
+        "name": "⚫ Rol: Obsidiana",
+        "price": 1_000_000_000,
+        "description": "Gana **+500,000,000** 🪙 cada 11h con `/collect`.",
+        "category": "rol",
+        "collect_bonus": 500_000_000,
+        "collect_hours": 11,
+    },
 }
 
 ROLE_ITEMS = [k for k, v in SHOP_ITEMS.items() if v["category"] == "rol"]
+LEGACY_ROLE_ITEM_IDS = {
+    "role_vip": "vip",
+    "role_viciado": "viciado",
+    "role_supremo": "supremo",
+    "role_bronce": "bronce",
+    "role_plata": "plata",
+    "role_oro": "oro",
+    "role_diamante": "diamante",
+}
+
+
+def normalize_shop_item_id(item_id: str) -> str:
+    item_id = item_id.strip().lower()
+    return LEGACY_ROLE_ITEM_IDS.get(item_id, item_id)
 
 FIGHTERS = {
     "novato": {
@@ -547,6 +593,39 @@ async def init_db():
                 PRIMARY KEY (user_id, item_id)
             )
         """)
+        for legacy_id, current_id in LEGACY_ROLE_ITEM_IDS.items():
+            async with db.execute(
+                "SELECT user_id, quantity FROM inventory WHERE item_id=?",
+                (legacy_id,),
+            ) as cursor:
+                old_inventory_rows = await cursor.fetchall()
+            for user_id, quantity in old_inventory_rows:
+                await db.execute(
+                    """
+                    INSERT INTO inventory (user_id, item_id, quantity) VALUES (?, ?, ?)
+                    ON CONFLICT(user_id, item_id)
+                    DO UPDATE SET quantity = inventory.quantity + excluded.quantity
+                    """,
+                    (user_id, current_id, quantity),
+                )
+            await db.execute("DELETE FROM inventory WHERE item_id=?", (legacy_id,))
+
+            async with db.execute(
+                "SELECT user_id, last_collect FROM role_collects WHERE item_id=?",
+                (legacy_id,),
+            ) as cursor:
+                old_collect_rows = await cursor.fetchall()
+            for user_id, last_collect in old_collect_rows:
+                await db.execute(
+                    """
+                    INSERT INTO role_collects (user_id, item_id, last_collect) VALUES (?, ?, ?)
+                    ON CONFLICT(user_id, item_id)
+                    DO UPDATE SET last_collect = MAX(role_collects.last_collect, excluded.last_collect)
+                    """,
+                    (user_id, current_id, last_collect),
+                )
+            await db.execute("DELETE FROM role_collects WHERE item_id=?", (legacy_id,))
+
         if not role_collects_table_exists:
             role_placeholders = ",".join("?" for _ in ROLE_ITEMS)
             await db.execute(
@@ -1021,7 +1100,11 @@ async def collect(interaction: discord.Interaction):
             "🥉 **Bronce** — +50,000,000 🪙 cada 4h\n"
             "🥈 **Plata** — +60,000,000 🪙 cada 5h\n"
             "🥇 **Oro** — +70,000,000 🪙 cada 6h\n"
-            "💎 **Diamante** — +160,000,000 🪙 cada 7h"
+            "💎 **Diamante** — +160,000,000 🪙 cada 7h\n"
+            "🔴 **Ruby** — +200,000,000 🪙 cada 8h\n"
+            "🟢 **Esmeralda** — +250,000,000 🪙 cada 9h\n"
+            "🔷 **Zafiro** — +350,000,000 🪙 cada 10h\n"
+            "⚫ **Obsidiana** — +500,000,000 🪙 cada 11h"
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
@@ -1542,12 +1625,22 @@ def build_shop_embed(panel: bool = False) -> discord.Embed:
             if item["category"] == category
         ]
         if entries:
-            lines = [
-                f"**{item['name']}** — **{item['price']:,}** 🪙\n"
-                f"{item['description']}\n`ID: {item_id}`"
-                for item_id, item in entries
-            ]
-            embed.add_field(name=title, value="\n\n".join(lines), inline=False)
+            lines: list[str] = []
+            field_number = 1
+            for item_id, item in entries:
+                line = (
+                    f"**{item['name']}** — **{item['price']:,}** 🪙\n"
+                    f"{item['description']}\n`ID: {item_id}`"
+                )
+                if lines and len("\n\n".join([*lines, line])) > 1024:
+                    field_title = title if field_number == 1 else f"{title} (continuación)"
+                    embed.add_field(name=field_title, value="\n\n".join(lines), inline=False)
+                    field_number += 1
+                    lines = []
+                lines.append(line)
+            if lines:
+                field_title = title if field_number == 1 else f"{title} (continuación)"
+                embed.add_field(name=field_title, value="\n\n".join(lines), inline=False)
     return embed
 
 
@@ -1648,7 +1741,7 @@ async def buy(interaction: discord.Interaction, item: str | None = None):
         )
         return
 
-    item = item.lower().strip()
+    item = normalize_shop_item_id(item)
     if item not in SHOP_ITEMS:
         ids = ", ".join(f"`{item_id}`" for item_id in SHOP_ITEMS)
         await interaction.response.send_message(
@@ -1706,13 +1799,17 @@ async def leaderboard(interaction: discord.Interaction):
 @tree.command(name="ranking", description="Top 10 jugadores más ricos con sus roles")
 async def ranking(interaction: discord.Interaction):
     ROLE_BADGES = {
-        "role_diamante": "💎",
-        "role_oro": "🥇",
-        "role_plata": "🥈",
-        "role_bronce": "🥉",
-        "role_supremo": "👑",
-        "role_viciado": "🎮",
-        "role_vip": "🎩",
+        "obsidiana": "⚫",
+        "zafiro": "🔷",
+        "esmeralda": "🟢",
+        "ruby": "🔴",
+        "diamante": "💎",
+        "oro": "🥇",
+        "plata": "🥈",
+        "bronce": "🥉",
+        "supremo": "👑",
+        "viciado": "🎮",
+        "vip": "🎩",
     }
 
     async with aiosqlite.connect(DB_PATH) as db:
@@ -2332,7 +2429,7 @@ async def store(interaction: discord.Interaction):
 @tree.command(name="iteminfo", description="Muestra los detalles completos de un objeto de la tienda")
 @app_commands.describe(item="ID del objeto a consultar")
 async def iteminfo(interaction: discord.Interaction, item: str):
-    item = item.lower().strip()
+    item = normalize_shop_item_id(item)
     if item not in SHOP_ITEMS:
         ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
         await interaction.response.send_message(
@@ -2422,7 +2519,7 @@ async def missions(interaction: discord.Interaction):
 @tree.command(name="use", description="Usa un objeto de tu inventario")
 @app_commands.describe(item="ID del objeto a usar")
 async def use(interaction: discord.Interaction, item: str):
-    item = item.lower().strip()
+    item = normalize_shop_item_id(item)
     if item not in SHOP_ITEMS:
         ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
         await interaction.response.send_message(
@@ -2624,7 +2721,7 @@ async def bet(interaction: discord.Interaction, usuario: discord.Member, cantida
 @tree.command(name="gift", description="Regala un objeto de tu inventario a otro usuario")
 @app_commands.describe(usuario="El usuario que recibirá el regalo", item="ID del objeto a regalar")
 async def gift(interaction: discord.Interaction, usuario: discord.Member, item: str):
-    item = item.lower().strip()
+    item = normalize_shop_item_id(item)
     if item not in SHOP_ITEMS:
         ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
         await interaction.response.send_message(f"❌ Objeto no encontrado. IDs válidos:\n{ids}", ephemeral=True)
@@ -2664,7 +2761,7 @@ async def gift(interaction: discord.Interaction, usuario: discord.Member, item: 
 @tree.command(name="sell", description="Vende un objeto de tu inventario por el 50% de su valor")
 @app_commands.describe(item="ID del objeto a vender")
 async def sell(interaction: discord.Interaction, item: str):
-    item = item.lower().strip()
+    item = normalize_shop_item_id(item)
     if item not in SHOP_ITEMS:
         ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
         await interaction.response.send_message(f"❌ Objeto no encontrado. IDs válidos:\n{ids}", ephemeral=True)
@@ -4313,7 +4410,11 @@ async def on_message(message: discord.Message):
                 "🥉 **Bronce** — +50,000,000 🪙 cada 4h\n"
                 "🥈 **Plata** — +60,000,000 🪙 cada 5h\n"
                 "🥇 **Oro** — +70,000,000 🪙 cada 6h\n"
-                "💎 **Diamante** — +160,000,000 🪙 cada 7h"
+                "💎 **Diamante** — +160,000,000 🪙 cada 7h\n"
+                "🔴 **Ruby** — +200,000,000 🪙 cada 8h\n"
+                "🟢 **Esmeralda** — +250,000,000 🪙 cada 9h\n"
+                "🔷 **Zafiro** — +350,000,000 🪙 cada 10h\n"
+                "⚫ **Obsidiana** — +500,000,000 🪙 cada 11h"
             )
             await message.channel.send(embed=embed)
             return
@@ -5689,7 +5790,7 @@ async def on_message(message: discord.Message):
             ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
             await message.channel.send(f"❌ Uso: `,buy <item_id>`\nIDs disponibles: {ids}")
             return
-        item = args[0].lower()
+        item = normalize_shop_item_id(args[0])
         if item not in SHOP_ITEMS:
             ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
             await message.channel.send(f"❌ Objeto no encontrado. IDs válidos: {ids}")
@@ -5734,7 +5835,7 @@ async def on_message(message: discord.Message):
             ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
             await message.channel.send(f"❌ Uso: `,use <item_id>`\nIDs: {ids}")
             return
-        item = args[0].lower()
+        item = normalize_shop_item_id(args[0])
         if item not in SHOP_ITEMS:
             ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
             await message.channel.send(f"❌ Objeto no encontrado. IDs válidos:\n{ids}")
@@ -5837,7 +5938,7 @@ async def on_message(message: discord.Message):
         if not remaining:
             await message.channel.send("❌ Uso: `,gift @usuario <item_id>`")
             return
-        item = remaining[0].lower()
+        item = normalize_shop_item_id(remaining[0])
         if item not in SHOP_ITEMS:
             ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
             await message.channel.send(f"❌ Objeto no encontrado. IDs válidos:\n{ids}")
@@ -5869,7 +5970,7 @@ async def on_message(message: discord.Message):
             ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
             await message.channel.send(f"❌ Uso: `,sell <item_id>`\nIDs: {ids}")
             return
-        item = args[0].lower()
+        item = normalize_shop_item_id(args[0])
         if item not in SHOP_ITEMS:
             ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
             await message.channel.send(f"❌ Objeto no encontrado. IDs válidos:\n{ids}")
