@@ -1014,7 +1014,7 @@ async def on_ready():
     await init_db()
     await tree.sync()
     asyncio.create_task(lottery_loop())
-    print(f"Bot conectado como {client.user}")
+    print(f"Bot conectado como {client.user} (ID público: {client.user.id})")
 
 
 @tree.command(name="balance", description="Muestra tu saldo actual")

@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Vortex Casino Bot"
+description = "A promotional website for the Vortex Discord casino bot, explaining its game economy, ranks, and moderation features and providing a path to invite it to a Discord server."
+version = "1.0.0"
+id = "artifacts/vortex-casino-site"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 22994
+
+[services.development]
+run = "pnpm --filter @workspace/vortex-casino-site run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/vortex-casino-site", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/vortex-casino-site/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "22994"
+BASE_PATH = "/"
