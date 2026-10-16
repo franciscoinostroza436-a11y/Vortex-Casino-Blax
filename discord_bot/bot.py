@@ -1603,6 +1603,406 @@ async def resetmoney_slash(interaction: discord.Interaction, usuario: discord.Me
     await interaction.response.send_message(embed=embed)
 
 
+async def send_moderation_message(interaction: discord.Interaction, content: str):
+    if interaction.response.is_done():
+        await interaction.followup.send(content, ephemeral=True)
+    else:
+        await interaction.response.send_message(content, ephemeral=True)
+
+
+async def ensure_moderation_access(
+    interaction: discord.Interaction,
+    actor_permission: str,
+    bot_permission: str,
+) -> discord.Member | None:
+    guild = interaction.guild
+    actor = interaction.user
+    if guild is None or not isinstance(actor, discord.Member):
+        await send_moderation_message(interaction, "Este comando solo funciona dentro de un servidor.")
+        return None
+
+    actor_permissions = actor.guild_permissions
+    actor_has_permission = (
+        actor_permissions.administrator
+        or getattr(actor_permissions, actor_permission, False)
+    )
+    if not actor_has_permission:
+        permission_names = {
+            "administrator": "Administrador",
+            "ban_members": "Banear miembros",
+            "kick_members": "Expulsar miembros",
+        }
+        needed = permission_names.get(actor_permission, actor_permission)
+        await send_moderation_message(
+            interaction,
+            f"Necesitas el permiso **{needed}** para usar este comando.",
+        )
+        return None
+
+    bot_member = guild.me
+    if bot_member is None and client.user is not None:
+        try:
+            bot_member = await guild.fetch_member(client.user.id)
+        except discord.HTTPException:
+            bot_member = None
+    if bot_member is None:
+        await send_moderation_message(interaction, "No pude verificar los permisos del bot en este servidor.")
+        return None
+
+    bot_permissions = bot_member.guild_permissions
+    bot_has_permission = (
+        bot_permissions.administrator
+        or getattr(bot_permissions, bot_permission, False)
+    )
+    if not bot_has_permission:
+        bot_permission_names = {
+            "ban_members": "Banear miembros",
+            "kick_members": "Expulsar miembros",
+            "moderate_members": "Moderar miembros",
+            "manage_messages": "Gestionar mensajes",
+            "manage_channels": "Gestionar canales",
+            "manage_roles": "Gestionar roles",
+        }
+        needed = bot_permission_names.get(bot_permission, bot_permission)
+        await send_moderation_message(
+            interaction,
+            f"El bot necesita el permiso **{needed}** para completar esta acción.",
+        )
+        return None
+    return bot_member
+
+
+def moderation_target_hierarchy_error(
+    actor: discord.Member,
+    target: discord.Member,
+    bot_member: discord.Member,
+    guild: discord.Guild,
+) -> str | None:
+    if target.id == guild.owner_id:
+        return "No se puede moderar al propietario del servidor."
+    if target.id == bot_member.id:
+        return "El bot no puede aplicarse esta acción a sí mismo."
+    if actor.id != guild.owner_id and target.top_role >= actor.top_role:
+        return "No puedes moderar a alguien con un rol igual o superior al tuyo."
+    if target.top_role >= bot_member.top_role:
+        return "El rol más alto de esa persona debe estar por debajo del rol más alto del bot."
+    return None
+
+
+async def validate_moderation_target(
+    interaction: discord.Interaction,
+    target: discord.Member,
+    bot_member: discord.Member,
+) -> bool:
+    actor = interaction.user
+    guild = interaction.guild
+    if not isinstance(actor, discord.Member) or guild is None:
+        await send_moderation_message(interaction, "Este comando solo funciona dentro de un servidor.")
+        return False
+    error = moderation_target_hierarchy_error(actor, target, bot_member, guild)
+    if error:
+        await send_moderation_message(interaction, error)
+        return False
+    return True
+
+
+@tree.command(name="ban", description="Banea a un miembro del servidor")
+@app_commands.guild_only()
+@app_commands.default_permissions(ban_members=True)
+@app_commands.describe(usuario="Miembro que será baneado", razon="Motivo del baneo")
+async def ban_command(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    razon: str | None = None,
+):
+    bot_member = await ensure_moderation_access(interaction, "ban_members", "ban_members")
+    if bot_member is None or not await validate_moderation_target(interaction, usuario, bot_member):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await usuario.ban(reason=razon or f"Ban solicitado por {interaction.user}")
+        await interaction.followup.send(
+            f"🔨 **{usuario}** fue baneado. Motivo: {razon or 'No especificado'}.",
+            ephemeral=True,
+        )
+    except discord.Forbidden:
+        await interaction.followup.send("No tengo permisos suficientes para banear a ese miembro.", ephemeral=True)
+    except discord.HTTPException:
+        await interaction.followup.send("Discord no pudo completar el baneo. Inténtalo de nuevo.", ephemeral=True)
+
+
+@tree.command(name="kick", description="Expulsa a un miembro del servidor")
+@app_commands.guild_only()
+@app_commands.default_permissions(kick_members=True)
+@app_commands.describe(usuario="Miembro que será expulsado", razon="Motivo de la expulsión")
+async def kick_command(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    razon: str | None = None,
+):
+    bot_member = await ensure_moderation_access(interaction, "kick_members", "kick_members")
+    if bot_member is None or not await validate_moderation_target(interaction, usuario, bot_member):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await usuario.kick(reason=razon or f"Kick solicitado por {interaction.user}")
+        await interaction.followup.send(
+            f"👢 **{usuario}** fue expulsado. Motivo: {razon or 'No especificado'}.",
+            ephemeral=True,
+        )
+    except discord.Forbidden:
+        await interaction.followup.send("No tengo permisos suficientes para expulsar a ese miembro.", ephemeral=True)
+    except discord.HTTPException:
+        await interaction.followup.send("Discord no pudo completar la expulsión. Inténtalo de nuevo.", ephemeral=True)
+
+
+@tree.command(name="unban", description="Quita el baneo de un usuario por su ID")
+@app_commands.guild_only()
+@app_commands.default_permissions(ban_members=True)
+@app_commands.describe(user_id="ID de Discord del usuario", razon="Motivo para quitar el baneo")
+async def unban_command(
+    interaction: discord.Interaction,
+    user_id: str,
+    razon: str | None = None,
+):
+    bot_member = await ensure_moderation_access(interaction, "ban_members", "ban_members")
+    if bot_member is None:
+        return
+    try:
+        target = discord.Object(id=int(user_id))
+    except ValueError:
+        await send_moderation_message(interaction, "El ID debe ser un número de Discord válido.")
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ban_entry = await interaction.guild.fetch_ban(target)
+        await interaction.guild.unban(
+            ban_entry.user,
+            reason=razon or f"Unban solicitado por {interaction.user}",
+        )
+        await interaction.followup.send(f"✅ Se quitó el baneo de **{ban_entry.user}**.", ephemeral=True)
+    except discord.NotFound:
+        await interaction.followup.send("Ese usuario no está baneado en este servidor.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send("No tengo permisos suficientes para quitar ese baneo.", ephemeral=True)
+    except discord.HTTPException:
+        await interaction.followup.send("Discord no pudo quitar el baneo. Inténtalo de nuevo.", ephemeral=True)
+
+
+@tree.command(name="mute", description="Aplica timeout temporal a un miembro")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(
+    usuario="Miembro que recibirá el timeout",
+    minutos="Duración de 1 a 40320 minutos (máximo 28 días)",
+    razon="Motivo del timeout",
+)
+async def mute_command(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    minutos: int,
+    razon: str | None = None,
+):
+    bot_member = await ensure_moderation_access(interaction, "administrator", "moderate_members")
+    if bot_member is None:
+        return
+    if not 1 <= minutos <= 40_320:
+        await send_moderation_message(interaction, "La duración debe estar entre 1 y 40320 minutos (28 días).")
+        return
+    if not await validate_moderation_target(interaction, usuario, bot_member):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await usuario.timeout(
+            timedelta(minutes=minutos),
+            reason=razon or f"Timeout solicitado por {interaction.user}",
+        )
+        await interaction.followup.send(
+            f"🔇 **{usuario}** recibió timeout durante **{minutos} minutos**.",
+            ephemeral=True,
+        )
+    except discord.Forbidden:
+        await interaction.followup.send("No puedo aplicar timeout a ese miembro.", ephemeral=True)
+    except discord.HTTPException:
+        await interaction.followup.send("Discord no pudo aplicar el timeout. Inténtalo de nuevo.", ephemeral=True)
+
+
+@tree.command(name="unmute", description="Retira el timeout de un miembro")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(usuario="Miembro al que se le retirará el timeout", razon="Motivo")
+async def unmute_command(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    razon: str | None = None,
+):
+    bot_member = await ensure_moderation_access(interaction, "administrator", "moderate_members")
+    if bot_member is None or not await validate_moderation_target(interaction, usuario, bot_member):
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await usuario.timeout(None, reason=razon or f"Timeout retirado por {interaction.user}")
+        await interaction.followup.send(f"🔊 Se retiró el timeout de **{usuario}**.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send("No puedo retirar el timeout de ese miembro.", ephemeral=True)
+    except discord.HTTPException:
+        await interaction.followup.send("Discord no pudo retirar el timeout. Inténtalo de nuevo.", ephemeral=True)
+
+
+@tree.command(name="clear", description="Borra mensajes recientes de un canal")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(cantidad="Cantidad de mensajes a borrar (1 a 100)", canal="Canal de texto (por defecto, este canal)")
+async def clear_command(
+    interaction: discord.Interaction,
+    cantidad: int,
+    canal: discord.TextChannel | None = None,
+):
+    bot_member = await ensure_moderation_access(interaction, "administrator", "manage_messages")
+    if bot_member is None:
+        return
+    if not 1 <= cantidad <= 100:
+        await send_moderation_message(interaction, "La cantidad debe estar entre 1 y 100 mensajes.")
+        return
+    target_channel = canal or interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        await send_moderation_message(interaction, "Selecciona un canal de texto válido.")
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        deleted = await target_channel.purge(
+            limit=cantidad,
+            reason=f"Limpieza solicitada por {interaction.user}",
+        )
+        await interaction.followup.send(
+            f"🧹 Se borraron **{len(deleted)}** mensajes de {target_channel.mention}.",
+            ephemeral=True,
+        )
+    except discord.Forbidden:
+        await interaction.followup.send("No tengo permisos para borrar mensajes en ese canal.", ephemeral=True)
+    except discord.HTTPException:
+        await interaction.followup.send(
+            "Discord no pudo borrar esos mensajes. Algunos pueden ser demasiado antiguos.",
+            ephemeral=True,
+        )
+
+
+async def set_channel_lock(
+    interaction: discord.Interaction,
+    canal: discord.TextChannel | None,
+    locked: bool,
+):
+    bot_member = await ensure_moderation_access(interaction, "administrator", "manage_channels")
+    if bot_member is None:
+        return
+    target_channel = canal or interaction.channel
+    if not isinstance(target_channel, discord.TextChannel):
+        await send_moderation_message(interaction, "Selecciona un canal de texto válido.")
+        return
+
+    overwrite = target_channel.overwrites_for(interaction.guild.default_role)
+    overwrite.send_messages = False if locked else None
+    await interaction.response.defer(ephemeral=True)
+    try:
+        await target_channel.set_permissions(
+            interaction.guild.default_role,
+            overwrite=overwrite,
+            reason=f"Canal {'bloqueado' if locked else 'desbloqueado'} por {interaction.user}",
+        )
+        action = "bloqueado" if locked else "desbloqueado (permiso heredado)"
+        await interaction.followup.send(f"🔒 {target_channel.mention} quedó {action}.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send("No tengo permisos para cambiar los permisos de ese canal.", ephemeral=True)
+    except discord.HTTPException:
+        await interaction.followup.send("Discord no pudo cambiar los permisos del canal.", ephemeral=True)
+
+
+@tree.command(name="lock", description="Bloquea el envío de mensajes para todos en un canal")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(canal="Canal de texto (por defecto, este canal)")
+async def lock_command(interaction: discord.Interaction, canal: discord.TextChannel | None = None):
+    await set_channel_lock(interaction, canal, True)
+
+
+@tree.command(name="unlock", description="Restablece el permiso heredado para enviar mensajes")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(canal="Canal de texto (por defecto, este canal)")
+async def unlock_command(interaction: discord.Interaction, canal: discord.TextChannel | None = None):
+    await set_channel_lock(interaction, canal, False)
+
+
+async def change_member_role(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    rol: discord.Role,
+    razon: str | None,
+    add: bool,
+):
+    bot_member = await ensure_moderation_access(interaction, "administrator", "manage_roles")
+    if bot_member is None:
+        return
+    actor = interaction.user
+    guild = interaction.guild
+    if rol.is_default() or rol.managed:
+        await send_moderation_message(interaction, "No se puede agregar o quitar ese rol.")
+        return
+    if actor.id != guild.owner_id and rol >= actor.top_role:
+        await send_moderation_message(interaction, "El rol elegido debe estar por debajo de tu rol más alto.")
+        return
+    if rol >= bot_member.top_role:
+        await send_moderation_message(interaction, "El rol elegido debe estar por debajo del rol más alto del bot.")
+        return
+    if add and rol in usuario.roles:
+        await send_moderation_message(interaction, f"**{usuario}** ya tiene el rol **{rol.name}**.")
+        return
+    if not add and rol not in usuario.roles:
+        await send_moderation_message(interaction, f"**{usuario}** no tiene el rol **{rol.name}**.")
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    try:
+        action = "add_roles" if add else "remove_roles"
+        await getattr(usuario, action)(
+            rol,
+            reason=razon or f"Rol {'agregado' if add else 'quitado'} por {interaction.user}",
+        )
+        result = "agregado a" if add else "quitado de"
+        await interaction.followup.send(f"✅ El rol **{rol.name}** fue {result} **{usuario}**.", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send("No tengo permisos para cambiar ese rol.", ephemeral=True)
+    except discord.HTTPException:
+        await interaction.followup.send("Discord no pudo cambiar el rol. Inténtalo de nuevo.", ephemeral=True)
+
+
+@tree.command(name="addrole", description="Agrega un rol a un miembro")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(usuario="Miembro objetivo", rol="Rol que se agregará", razon="Motivo")
+async def addrole_command(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    rol: discord.Role,
+    razon: str | None = None,
+):
+    await change_member_role(interaction, usuario, rol, razon, True)
+
+
+@tree.command(name="removerole", description="Quita un rol de un miembro")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+@app_commands.describe(usuario="Miembro objetivo", rol="Rol que se quitará", razon="Motivo")
+async def removerole_command(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    rol: discord.Role,
+    razon: str | None = None,
+):
+    await change_member_role(interaction, usuario, rol, razon, False)
+
+
 def build_shop_embed(panel: bool = False) -> discord.Embed:
     embed = discord.Embed(
         title="🛍️ Tienda del Casino" if panel else "🏪 Tienda del Casino",
@@ -3046,6 +3446,19 @@ async def help_cmd(interaction: discord.Interaction):
             "`/addmoney @usuario cantidad` — Añadir monedas\n"
             "`/removemoney @usuario cantidad` — Quitar monedas\n"
             "`/collect` — Recoger ganancias de roles"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🛡️ Moderación (solo slash)",
+        value=(
+            "`/ban usuario [razón]` y `/unban user_id` — requieren **Banear miembros**\n"
+            "`/kick usuario [razón]` — requiere **Expulsar miembros**\n"
+            "`/mute` y `/unmute` — requieren **Administrador**\n"
+            "`/clear cantidad [canal]` — requiere **Administrador**\n"
+            "`/lock [canal]` y `/unlock [canal]` — requieren **Administrador**\n"
+            "`/addrole usuario rol` y `/removerole usuario rol` — requieren **Administrador**"
         ),
         inline=False
     )
