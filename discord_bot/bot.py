@@ -3556,8 +3556,260 @@ async def help_cmd(interaction: discord.Interaction):
         inline=False
     )
 
-    embed.set_footer(text="🏦 El banco es seguro contra robos  •  Casino Bot")
+    embed.set_footer(text="Para ver la guía completa con ejemplos, usa `/guía`.")
     await interaction.response.send_message(embed=embed)
+
+
+GUIDE_SECTIONS = (
+    {
+        "id": "economy",
+        "title": "💰 Economía y monedas",
+        "description": (
+            "Las monedas del casino se muestran como 🪙. Gana con `/daily`, misiones, "
+            "premios de juegos y `/collect`. Usa `/balance` para revisar cartera y banco; "
+            "el dinero depositado está protegido contra robos."
+        ),
+        "commands": (
+            "balance", "daily", "collect", "pay", "dep", "withdraw", "missions",
+            "leaderboard", "ranking", "historial",
+        ),
+    },
+    {
+        "id": "games",
+        "title": "🎰 Juegos y apuestas",
+        "description": (
+            "Las apuestas pueden darte ganancias o hacerte perder monedas. En `/roulette` "
+            "puedes apostar a color, par/impar, docena o número; también admite hasta tres apuestas."
+        ),
+        "commands": (
+            "roulette", "slots", "blackjack", "coinflip", "rob", "duel", "crash",
+            "bet", "tournament", "ruleta-en-vivo",
+        ),
+    },
+    {
+        "id": "shop",
+        "title": "🛍️ Tienda, objetos y roles",
+        "description": (
+            "Abre `/shop` y compra con `/buy <item>`. Por ejemplo, compra `bronce` y luego "
+            "usa `/use bronce` para crear y reclamar el rol en el servidor. El objeto queda "
+            "en tu inventario para que `/collect` siga pagando sus ganancias."
+        ),
+        "commands": (
+            "shop", "store", "buy", "inventory", "iteminfo", "use", "gift", "sell",
+        ),
+    },
+    {
+        "id": "fighters",
+        "title": "🥊 Luchadores y puntos de mejora",
+        "description": (
+            "Consulta y compra luchadores con `/fighters` y `/buyfighter`, y pelea con `/fight`. "
+            "En un combate el ganador gana 15 XP y el otro luchador 5 XP; cada nivel otorga "
+            "5 puntos de mejora. `/addpuntos ataque 2` gasta puntos: cada punto suma +2 ataque, "
+            "+2 defensa o +5 salud. Elige `ataque`, `defensa` o `salud`."
+        ),
+        "commands": (
+            "fighters", "buyfighter", "myfighter", "fight", "addpuntos", "ftorneo",
+        ),
+    },
+    {
+        "id": "football",
+        "title": "⚽ Cartas de fútbol",
+        "description": (
+            "Revisa `/infocartas`, compra sobres con `/comprarsobre`, consulta tu colección "
+            "y publica cartas en el mercado. Los comandos muestran el ID o número de publicación "
+            "que necesitas para vender, comprar o retirar una oferta."
+        ),
+        "commands": (
+            "abrirpaquete", "comprarsobre", "coleccion", "inventariocartas",
+            "infocartas", "vender", "mercado", "comprar", "cancelarventa",
+            "misventas", "intercambiar",
+        ),
+    },
+    {
+        "id": "admin",
+        "title": "🛡️ Administración y moderación",
+        "description": (
+            "Permisos: `/ban` y `/unban` requieren **Banear miembros**; `/kick` requiere "
+            "**Expulsar miembros**. Los demás comandos de moderación requieren **Administrador**. "
+            "`/addmoney`, `/removemoney` y `/addlevel` también son para administradores. "
+            "`/resetmoney` reinicia tu cartera; solo un administrador puede elegir a otra persona. "
+            "El bot también necesita sus permisos de Discord y una jerarquía de roles correcta."
+        ),
+        "commands": (
+            "ban", "unban", "kick", "mute", "unmute", "clear", "lock", "unlock",
+            "addrole", "removerole", "addmoney", "removemoney", "resetmoney", "addlevel",
+        ),
+    },
+    {
+        "id": "general",
+        "title": "📚 Ayuda general",
+        "description": (
+            "Los campos muestran cada comando slash registrado, su uso y sus opciones. "
+            "Los valores entre `< >` son obligatorios; los que están entre `[ ]` son opcionales. "
+            "Discord te permite seleccionar usuarios, canales y roles desde el menú del comando."
+        ),
+        "commands": ("help", "guía"),
+    },
+)
+
+
+def build_guide_command_value(command: app_commands.Command) -> str:
+    arguments = []
+    details = []
+    parameters = getattr(command, "parameters", [])
+    for parameter in parameters:
+        token = f"<{parameter.name}>" if parameter.required else f"[{parameter.name}]"
+        arguments.append(token)
+
+        requirement = "obligatorio" if parameter.required else "opcional"
+        hint = parameter.description or parameter.name.replace("_", " ")
+        if parameter.choices and len(parameters) <= 2:
+            choices = ", ".join(choice.name for choice in parameter.choices[:6])
+            hint = f"{hint}. Opciones: {choices}"
+        details.append(f"• `{parameter.name}` ({requirement}): {hint}")
+
+    usage = f"/{command.name}"
+    if arguments:
+        usage += " " + " ".join(arguments)
+    value = f"Uso: `{usage}`\n{command.description or 'Comando del bot.'}"
+    if details:
+        value += "\n" + "\n".join(details)
+    if len(value) > 1000:
+        value = value[:997] + "…"
+    return value
+
+
+def build_guide_pages() -> list[dict]:
+    registered = {command.name: command for command in tree.get_commands()}
+    pages = []
+    covered: set[str] = set()
+
+    for section in GUIDE_SECTIONS:
+        commands = [
+            registered[name]
+            for name in section["commands"]
+            if name in registered
+        ]
+        covered.update(command.name for command in commands)
+        page = {
+            "title": section["title"],
+            "description": section["description"],
+            "commands": commands,
+            "extra_fields": [],
+        }
+
+        if section["id"] == "economy":
+            page["extra_fields"].append(
+                (
+                    "Comandos de texto para ganar monedas",
+                    (
+                        "`,work` — gana entre 1.000 y 100.000 🪙.\n"
+                        "`,slut` y `,crime` — 60% de éxito y 40% de riesgo de perder monedas.\n"
+                        "`,lottery [cantidad]` — compra boletos; `,lottery info` muestra el bote. "
+                        "Estos comandos se escriben con coma en el chat, no como slash."
+                    ),
+                )
+            )
+
+        if section["id"] == "shop":
+            role_lines = [
+                (
+                    f"**{item['name'].split('Rol:', 1)[-1].strip()}** — "
+                    f"+{item['collect_bonus']:,} 🪙 cada {item['collect_hours']} h"
+                )
+                for item in SHOP_ITEMS.values()
+                if item.get("category") == "rol"
+            ]
+            if role_lines:
+                page["extra_fields"].append(("Ganancias de roles", "\n".join(role_lines)))
+
+        if commands or page["extra_fields"]:
+            pages.append(page)
+
+    uncategorized = [
+        command for name, command in registered.items() if name not in covered
+    ]
+    if uncategorized:
+        pages.append(
+            {
+                "title": "📎 Otros comandos",
+                "description": "Otros comandos slash registrados en el bot.",
+                "commands": uncategorized,
+                "extra_fields": [],
+            }
+        )
+    return pages
+
+
+class GuideView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.pages = build_guide_pages()
+        self.page_index = 0
+        self.update_navigation()
+
+    def update_navigation(self):
+        self.previous_button.disabled = self.page_index == 0
+        self.next_button.disabled = self.page_index >= len(self.pages) - 1
+
+    def make_embed(self) -> discord.Embed:
+        page = self.pages[self.page_index]
+        embed = discord.Embed(
+            title=f"Guía del bot · {page['title']}",
+            description=page["description"],
+            color=0xE91E63,
+        )
+        for command in page["commands"]:
+            embed.add_field(
+                name=f"/{command.name}",
+                value=build_guide_command_value(command),
+                inline=False,
+            )
+        for name, value in page["extra_fields"]:
+            embed.add_field(name=name, value=value, inline=False)
+        embed.set_footer(
+            text=(
+                f"Página {self.page_index + 1}/{len(self.pages)} · "
+                "Los botones solo funcionan para quien abrió la guía."
+            )
+        )
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Solo la persona que abrió esta guía puede cambiar de página.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Anterior", emoji="◀", style=discord.ButtonStyle.secondary)
+    async def previous_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        self.page_index = max(0, self.page_index - 1)
+        self.update_navigation()
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    @discord.ui.button(label="Siguiente", emoji="▶", style=discord.ButtonStyle.secondary)
+    async def next_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        self.page_index = min(len(self.pages) - 1, self.page_index + 1)
+        self.update_navigation()
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+
+@tree.command(name="guía", description="Guía completa de comandos, monedas, juegos y roles")
+async def guia(interaction: discord.Interaction):
+    view = GuideView(interaction.user.id)
+    await interaction.response.send_message(
+        embed=view.make_embed(),
+        view=view,
+        ephemeral=True,
+    )
 
 
 async def get_fighter_stats(user_id: str, fighter_id: str) -> dict:
