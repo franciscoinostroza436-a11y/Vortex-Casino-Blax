@@ -514,6 +514,7 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 PREFIX = ","
+SHOP_ROLE_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
 
 
 async def init_db():
@@ -591,6 +592,14 @@ async def init_db():
                 item_id TEXT NOT NULL,
                 last_collect TEXT NOT NULL,
                 PRIMARY KEY (user_id, item_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS shop_guild_roles (
+                guild_id TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                role_id TEXT NOT NULL,
+                PRIMARY KEY (guild_id, item_id)
             )
         """)
         for legacy_id, current_id in LEGACY_ROLE_ITEM_IDS.items():
@@ -2015,7 +2024,7 @@ def build_shop_embed(panel: bool = False) -> discord.Embed:
     )
     categories = {
         "proteccion": "🛡️ Protección",
-        "rol": "👑 Roles con /collect",
+        "rol": "👑 Roles del servidor · /use y /collect",
         "decorativo": "🎭 Decorativos",
     }
     for category, title in categories.items():
@@ -2044,6 +2053,67 @@ def build_shop_embed(panel: bool = False) -> discord.Embed:
     return embed
 
 
+async def get_or_create_shop_guild_role(
+    guild: discord.Guild, item_id: str
+) -> discord.Role:
+    lock_key = (guild.id, item_id)
+    lock = SHOP_ROLE_LOCKS.setdefault(lock_key, asyncio.Lock())
+    async with lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT role_id FROM shop_guild_roles WHERE guild_id = ? AND item_id = ?",
+                (str(guild.id), item_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+
+        role = guild.get_role(int(row[0])) if row else None
+        if role is not None:
+            return role
+
+        item_name = SHOP_ITEMS[item_id]["name"]
+        role_name = item_name.split("Rol:", 1)[-1].strip()
+        role = await guild.create_role(
+            name=role_name,
+            reason=f"Rol de tienda Vortex Casino ({item_id})",
+        )
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO shop_guild_roles (guild_id, item_id, role_id)
+                VALUES (?, ?, ?)
+                ON CONFLICT(guild_id, item_id)
+                DO UPDATE SET role_id = excluded.role_id
+                """,
+                (str(guild.id), item_id, str(role.id)),
+            )
+            await db.commit()
+        return role
+
+
+async def grant_shop_role(
+    guild: discord.Guild, member: discord.Member, item_id: str
+) -> tuple[discord.Role | None, bool, str | None]:
+    bot_member = guild.me
+    if bot_member is None or not bot_member.guild_permissions.manage_roles:
+        return None, False, "Necesito el permiso **Gestionar roles** para reclamar roles."
+
+    role = await get_or_create_shop_guild_role(guild, item_id)
+    if role >= bot_member.top_role:
+        return None, False, (
+            f"El rol **{role.name}** debe estar por debajo del rol más alto del bot. "
+            "Pídele a un administrador que ajuste la posición de los roles."
+        )
+    if role in member.roles:
+        return role, True, None
+
+    await member.add_roles(
+        role,
+        reason=f"Rol de tienda Vortex Casino reclamado por {member}",
+    )
+    return role, False, None
+
+
 async def complete_shop_purchase(user: discord.User | discord.Member, item_id: str) -> discord.Embed:
     item_data = SHOP_ITEMS[item_id]
     user_id = str(user.id)
@@ -2069,7 +2139,10 @@ async def complete_shop_purchase(user: discord.User | discord.Member, item_id: s
         f"Saldo restante: **{new_balance:,}** 🪙"
     )
     if item_data["category"] == "rol":
-        description += "\n\n💡 Usa `/collect` para reclamar las ganancias disponibles."
+        description += (
+            f"\n\n💡 Usa `/use {item_id}` para reclamar el rol en este servidor. "
+            "Luego usa `/collect` para cobrar sus ganancias; el objeto permanece en tu inventario."
+        )
     if item_data["category"] == "proteccion":
         description += "\n\n💡 Se activa automáticamente si alguien intenta robarte."
     embed.description = description
@@ -2084,7 +2157,10 @@ class ShopBuySelect(discord.ui.Select):
             category = "Rol" if item["category"] == "rol" else item["category"].title()
             detail = f"{item['price']:,} monedas · {category}"
             if item["category"] == "rol":
-                detail += f" · +{item['collect_bonus']:,} cada {item['collect_hours']}h"
+                detail += (
+                    f" · /use · +{item['collect_bonus']:,} cada "
+                    f"{item['collect_hours']}h"
+                )
             options.append(
                 discord.SelectOption(
                     label=item["name"],
@@ -2868,9 +2944,10 @@ async def iteminfo(interaction: discord.Interaction, item: str):
             name="📋 Cómo funciona",
             value=(
                 "• Compra el rol con `/buy`\n"
+                f"• Usa `/use {item}` para reclamarlo en este servidor\n"
                 "• Usa `/collect` para reclamar tus ganancias\n"
                 "• Cada rol tiene su propio cooldown\n"
-                "• `/collect` paga solo los roles que ya están listos"
+                "• El objeto permanece en tu inventario para mantener el bonus"
             ),
             inline=False
         )
@@ -2916,8 +2993,8 @@ async def missions(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="use", description="Usa un objeto de tu inventario")
-@app_commands.describe(item="ID del objeto a usar")
+@tree.command(name="use", description="Usa un objeto o reclama un rol de tu inventario")
+@app_commands.describe(item="ID del objeto a usar o rol a reclamar")
 async def use(interaction: discord.Interaction, item: str):
     item = normalize_shop_item_id(item)
     if item not in SHOP_ITEMS:
@@ -2938,6 +3015,47 @@ async def use(interaction: discord.Interaction, item: str):
         return
 
     item_data = SHOP_ITEMS[item]
+
+    if item_data["category"] == "rol":
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "Debes usar este comando dentro del servidor donde quieres reclamar el rol.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            role, already_has_role, error = await grant_shop_role(
+                interaction.guild, interaction.user, item
+            )
+        except discord.Forbidden:
+            error = "No tengo permiso para crear o asignar roles. Necesito **Gestionar roles**."
+            role = None
+            already_has_role = False
+        except discord.HTTPException:
+            error = "Discord no pudo crear o asignar el rol. Inténtalo de nuevo."
+            role = None
+            already_has_role = False
+        except aiosqlite.Error:
+            error = "No pude guardar el rol del servidor. El objeto sigue en tu inventario; inténtalo de nuevo."
+            role = None
+            already_has_role = False
+
+        if error:
+            await interaction.followup.send(error, ephemeral=True)
+            return
+
+        claim_message = (
+            f"Ya tienes el rol {role.mention}."
+            if already_has_role
+            else f"Reclamaste {role.mention}; ya está asignado a tu cuenta."
+        )
+        await interaction.followup.send(
+            f"{claim_message}\nEl objeto permanece en tu inventario para `/collect`.",
+            ephemeral=True,
+        )
+        return
 
     if item_data["category"] == "decorativo":
         flavor = USE_FLAVOR.get(item, f"Usas **{item_data['name']}**.")
@@ -2960,31 +3078,6 @@ async def use(interaction: discord.Interaction, item: str):
             f"📦 Escudos restantes: **{qty - 1}**"
         )
         await interaction.response.send_message(embed=embed)
-
-    elif item_data["category"] == "rol":
-        last_collect = await get_role_last_collect(user_id, item)
-        now = datetime.utcnow()
-        cooldown_hours = item_data["collect_hours"]
-        if last_collect:
-            last_dt = datetime.fromisoformat(last_collect)
-            next_collect_at = last_dt + timedelta(hours=cooldown_hours)
-            if now < next_collect_at:
-                next_collect = f"en **{format_collect_wait(next_collect_at, now)}**"
-            else:
-                next_collect = "**¡Ahora mismo!** Usa `/collect`"
-        else:
-            next_collect = "**¡Ahora mismo!** Usa `/collect`"
-
-        embed = discord.Embed(title=f"👑 {item_data['name']}", color=0xFFD700)
-        embed.description = (
-            f"**Estado:** Activo ✅\n"
-            f"**Bonus de /collect:** +**{item_data['collect_bonus']:,}** 🪙 cada **{cooldown_hours}h**\n"
-            f"**Próximo collect:** {next_collect}\n\n"
-            f"Tienes **{qty}** unidades en inventario.\n"
-            f"💡 Usa `/collect` para reclamar tus ganancias."
-        )
-        await interaction.response.send_message(embed=embed)
-
 
 class BetView(discord.ui.View):
     def __init__(self, challenger_id: str, challenged_id: str, amount: int, challenger_name: str):
@@ -3416,7 +3509,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`/buy [item]` — Abrir panel de compra o comprar por ID\n"
             "`/inventory` — Ver tu inventario\n"
             "`/iteminfo item` — Info de un objeto\n"
-            "`/use item` — Usar un objeto\n"
+            "`/use item` — Usar un objeto o reclamar un rol\n"
             "`/gift @usuario item` — Regalar un objeto\n"
             "`/sell item` — Vender objeto al 50%"
         ),
@@ -4796,7 +4889,7 @@ async def on_message(message: discord.Message):
         )
         categorias = {
             "proteccion": "🛡️ Protección",
-            "rol": "👑 Roles con /collect",
+            "rol": "👑 Roles del servidor · /use y /collect",
             "decorativo": "🎭 Decorativos",
         }
         for cat_key, cat_name in categorias.items():
@@ -6224,7 +6317,10 @@ async def on_message(message: discord.Message):
             f"Gastaste: **{item_data['price']:,}** 🪙\nSaldo restante: **{new_balance:,}** 🪙"
         )
         if item_data["category"] == "rol":
-            desc += "\n\n💡 Usa `,collect` para reclamar tus ganancias de rol."
+            desc += (
+                f"\n\n💡 Usa `,use {item}` para reclamar el rol en este servidor. "
+                "Después usa `,collect` para cobrar sus ganancias."
+            )
         embed.description = desc
         await message.channel.send(embed=embed)
 
@@ -6260,7 +6356,42 @@ async def on_message(message: discord.Message):
             await message.channel.send(embed=embed)
             return
         item_data = SHOP_ITEMS[item]
-        if item_data["category"] == "decorativo":
+        if item_data["category"] == "rol":
+            if message.guild is None or not isinstance(message.author, discord.Member):
+                await message.channel.send(
+                    "Debes usar este comando dentro del servidor donde quieres reclamar el rol."
+                )
+                return
+            try:
+                role, already_has_role, error = await grant_shop_role(
+                    message.guild, message.author, item
+                )
+            except discord.Forbidden:
+                error = "No tengo permiso para crear o asignar roles. Necesito **Gestionar roles**."
+                role = None
+                already_has_role = False
+            except discord.HTTPException:
+                error = "Discord no pudo crear o asignar el rol. Inténtalo de nuevo."
+                role = None
+                already_has_role = False
+            except aiosqlite.Error:
+                error = "No pude guardar el rol del servidor. El objeto sigue en tu inventario; inténtalo de nuevo."
+                role = None
+                already_has_role = False
+
+            if error:
+                await message.channel.send(error)
+                return
+
+            claim_message = (
+                f"Ya tienes el rol **{role.name}**."
+                if already_has_role
+                else f"Reclamaste el rol **{role.name}**; ya está asignado a tu cuenta."
+            )
+            await message.channel.send(
+                f"{claim_message}\nEl objeto permanece en tu inventario para `,collect`."
+            )
+        elif item_data["category"] == "decorativo":
             flavor = USE_FLAVOR.get(item, f"Usas **{item_data['name']}**.")
             embed = discord.Embed(title=f"✨ Usando {item_data['name']}", color=0x9B59B6)
             embed.description = flavor
@@ -6281,8 +6412,8 @@ async def on_message(message: discord.Message):
             )
             await message.channel.send(embed=embed)
         else:
-            embed = discord.Embed(title="❌ No usable", color=0xFF4444)
-            embed.description = f"**{item_data['name']}** no se puede usar manualmente.\nUsa `,collect` si es un rol."
+            embed = discord.Embed(title="❌ No se puede usar", color=0xFF4444)
+            embed.description = f"**{item_data['name']}** no tiene una acción de uso manual."
             await message.channel.send(embed=embed)
 
     # ,bet @usuario <cantidad>
