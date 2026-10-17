@@ -2202,7 +2202,12 @@ class ShopBuyView(discord.ui.View):
 
 @tree.command(name="shop", description="Muestra los objetos disponibles en la tienda")
 async def shop(interaction: discord.Interaction):
-    await interaction.response.send_message(embed=build_shop_embed())
+    await get_or_create_user(str(interaction.user.id), interaction.user.name)
+    await interaction.response.send_message(
+        embed=build_shop_embed(panel=True),
+        view=ShopBuyView(str(interaction.user.id)),
+        ephemeral=True,
+    )
 
 
 @tree.command(name="buy", description="Abre el panel de compra o compra un objeto por ID")
@@ -3885,47 +3890,256 @@ def simulate_fight(f1_id: str, f2_id: str) -> tuple[str, str]:
     return (f1_id if idx == 0 else f2_id), log
 
 
-@tree.command(name="fighters", description="Muestra todos los luchadores disponibles para comprar")
-async def fighters_slash(interaction: discord.Interaction):
+async def get_current_fighter_id(user_id: str) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT fighter_id FROM fighters WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+    return row[0] if row else None
+
+
+FIGHTER_PURCHASE_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+async def complete_fighter_purchase(
+    user: discord.User | discord.Member,
+    fighter_id: str,
+    *,
+    expected_current_id: str | None = None,
+) -> tuple[discord.Embed | None, str | None]:
+    user_id = str(user.id)
+    lock = FIGHTER_PURCHASE_LOCKS.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        await get_or_create_user(user_id, user.name)
+        current_id = await get_current_fighter_id(user_id)
+        if current_id == fighter_id:
+            return None, "Ya tienes activo ese luchador. No se descontaron monedas."
+        if current_id and current_id != expected_current_id:
+            current_name = FIGHTERS.get(current_id, {}).get("name", current_id)
+            return None, (
+                f"Ya tienes activo a **{current_name}**. Debes confirmar antes de reemplazarlo."
+            )
+        if expected_current_id is not None and current_id != expected_current_id:
+            return None, (
+                "Tu luchador activo cambió desde que abriste la confirmación. "
+                "Vuelve a abrir la tienda."
+            )
+
+        fighter = FIGHTERS[fighter_id]
+        balance = await get_balance(user_id)
+        if balance < fighter["price"]:
+            return None, (
+                f"Te faltan **{fighter['price'] - balance:,}** 🪙 para comprar "
+                f"**{fighter['name']}**."
+            )
+
+        await update_balance(user_id, -fighter["price"])
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO fighters (user_id, fighter_id) VALUES (?, ?)",
+                (user_id, fighter_id),
+            )
+            await db.commit()
+
+    embed = discord.Embed(title="🥊 ¡Luchador comprado!", color=0x00FF88)
+    embed.description = (
+        f"Ahora tienes a **{fighter['name']}** en tu equipo.\n\n"
+        f"❤️ HP: {fighter['hp']} | ⚔️ ATK: {fighter['attack']} | "
+        f"🛡️ DEF: {fighter['defense']}\n\n"
+        "Usa `/fight @usuario` para retar a alguien."
+    )
+    return embed, None
+
+
+def build_fighter_shop_embed() -> discord.Embed:
     embed = discord.Embed(title="🥊 Luchadores del Casino", color=0xFF6B00)
-    embed.description = "Compra un luchador con `/buyfighter <id>` y reta a otros con `/fight @usuario`.\n\u200b"
+    embed.description = (
+        "Elige un luchador en el menú para comprarlo.\n"
+        "Si ya tienes uno, el bot te pedirá confirmar antes de reemplazarlo.\n\u200b"
+    )
     for fid, f in FIGHTERS.items():
         embed.add_field(
             name=f"{f['name']} — `{fid}`",
             value=f"💰 {f['price']:,} 🪙\n❤️ HP: {f['hp']} | ⚔️ ATK: {f['attack']} | 🛡️ DEF: {f['defense']}\n_{f['description']}_",
             inline=False
         )
-    await interaction.response.send_message(embed=embed)
+    return embed
 
 
-@tree.command(name="buyfighter", description="Compra un luchador para pelear")
-@app_commands.describe(luchador="ID del luchador (usa /fighters para ver la lista)")
-async def buyfighter_slash(interaction: discord.Interaction, luchador: str):
-    user_id = str(interaction.user.id)
-    fid = luchador.lower().strip()
-    if fid not in FIGHTERS:
-        ids = ", ".join(f"`{k}`" for k in FIGHTERS)
-        await interaction.response.send_message(f"❌ Luchador no encontrado. IDs válidos: {ids}", ephemeral=True)
+class FighterReplaceConfirmView(discord.ui.View):
+    def __init__(self, owner_id: int, fighter_id: str, expected_current_id: str):
+        super().__init__(timeout=120)
+        self.owner_id = owner_id
+        self.fighter_id = fighter_id
+        self.expected_current_id = expected_current_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Esta confirmación pertenece a otra persona.", ephemeral=True
+            )
+            return False
+        return True
+
+    @discord.ui.button(label="Confirmar compra", style=discord.ButtonStyle.danger)
+    async def confirm_purchase(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.edit_message(
+            content="Procesando la compra…", embed=None, view=None
+        )
+        embed, error = await complete_fighter_purchase(
+            interaction.user,
+            self.fighter_id,
+            expected_current_id=self.expected_current_id,
+        )
+        if error:
+            await interaction.followup.send(error, ephemeral=True)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
+    async def cancel_purchase(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        await interaction.response.edit_message(
+            content="Compra cancelada. No se descontaron monedas.",
+            embed=None,
+            view=None,
+        )
+        self.stop()
+
+
+async def offer_fighter_purchase(
+    interaction: discord.Interaction, fighter_id: str, *, edit_message: bool = False
+):
+    current_id = await get_current_fighter_id(str(interaction.user.id))
+    if current_id == fighter_id:
+        message = "Ya tienes activo ese luchador. No se descontaron monedas."
+        if edit_message:
+            await interaction.response.edit_message(
+                content=message, embed=None, view=None
+            )
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
         return
-    await interaction.response.defer()
-    await get_or_create_user(user_id, interaction.user.name)
-    f = FIGHTERS[fid]
-    bal = await get_balance(user_id)
-    if bal < f["price"]:
-        await interaction.followup.send(
-            f"❌ Te faltan **{f['price'] - bal:,}** 🪙 para comprar **{f['name']}**.", ephemeral=True)
+
+    if current_id:
+        current_name = FIGHTERS.get(current_id, {}).get("name", current_id)
+        new_fighter = FIGHTERS[fighter_id]
+        confirm_embed = discord.Embed(
+            title="⚠️ Reemplazar luchador activo",
+            description=(
+                f"Comprar **{new_fighter['name']}** cuesta **{new_fighter['price']:,}** 🪙 "
+                f"y reemplazará a **{current_name}** como tu luchador activo. "
+                "¿Quieres continuar?"
+            ),
+            color=0xE67E22,
+        )
+        confirm_view = FighterReplaceConfirmView(
+            interaction.user.id, fighter_id, current_id
+        )
+        if edit_message:
+            await interaction.response.edit_message(
+                content=None, embed=confirm_embed, view=confirm_view
+            )
+        else:
+            await interaction.response.send_message(
+                embed=confirm_embed, view=confirm_view, ephemeral=True
+            )
         return
-    await update_balance(user_id, -f["price"])
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR REPLACE INTO fighters (user_id, fighter_id) VALUES (?, ?)", (user_id, fid))
-        await db.commit()
-    embed = discord.Embed(title=f"🥊 ¡Luchador Comprado!", color=0x00FF88)
-    embed.description = (
-        f"Ahora tienes a **{f['name']}** en tu equipo.\n\n"
-        f"❤️ HP: {f['hp']} | ⚔️ ATK: {f['attack']} | 🛡️ DEF: {f['defense']}\n\n"
-        f"_Reta a alguien con `/fight @usuario`_"
+
+    if edit_message:
+        await interaction.response.edit_message(
+            content="Procesando compra…", embed=None, view=None
+        )
+    else:
+        await interaction.response.defer(ephemeral=True)
+    embed, error = await complete_fighter_purchase(interaction.user, fighter_id)
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+    else:
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class FighterBuySelect(discord.ui.Select):
+    def __init__(self, owner_id: int):
+        self.owner_id = owner_id
+        options = [
+            discord.SelectOption(
+                label=f"{fighter['name']} · {fighter_id}"[:100],
+                value=fighter_id,
+                description=(
+                    f"{fighter['price']:,} monedas · HP {fighter['hp']} · "
+                    f"ATK {fighter['attack']} · DEF {fighter['defense']}"
+                )[:100],
+            )
+            for fighter_id, fighter in FIGHTERS.items()
+        ]
+        super().__init__(
+            placeholder="Elige un luchador para comprar",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message(
+                "Este panel pertenece a otra persona.", ephemeral=True
+            )
+            return
+        view = self.view
+        if view is None or view.purchase_completed:
+            await interaction.response.send_message(
+                "Este panel ya fue utilizado. Ejecuta `/fighters` para abrir otro.",
+                ephemeral=True,
+            )
+            return
+        view.purchase_completed = True
+        await offer_fighter_purchase(
+            interaction, self.values[0], edit_message=True
+        )
+
+
+class FighterShopView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=180)
+        self.purchase_completed = False
+        self.add_item(FighterBuySelect(owner_id))
+
+
+@tree.command(name="fighters", description="Abre la tienda interactiva de luchadores")
+async def fighters_slash(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=build_fighter_shop_embed(),
+        view=FighterShopView(interaction.user.id),
+        ephemeral=True,
     )
-    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="buyfighter", description="Abre la tienda o compra un luchador por ID")
+@app_commands.describe(luchador="ID del luchador; déjalo vacío para abrir el panel")
+async def buyfighter_slash(
+    interaction: discord.Interaction, luchador: str | None = None
+):
+    if luchador is None:
+        await interaction.response.send_message(
+            embed=build_fighter_shop_embed(),
+            view=FighterShopView(interaction.user.id),
+            ephemeral=True,
+        )
+        return
+    fighter_id = luchador.lower().strip()
+    if fighter_id not in FIGHTERS:
+        ids = ", ".join(f"`{fighter_id}`" for fighter_id in FIGHTERS)
+        await interaction.response.send_message(
+            f"❌ Luchador no encontrado. IDs válidos: {ids}", ephemeral=True
+        )
+        return
+    await offer_fighter_purchase(interaction, fighter_id)
 
 
 @tree.command(name="myfighter", description="Muestra tu luchador actual")
@@ -4526,7 +4740,9 @@ class LiveRouletteView(discord.ui.View):
                 pass
 
 
-async def _open_card_pack(interaction: discord.Interaction, tipo: str):
+async def _open_card_pack(
+    interaction: discord.Interaction, tipo: str, *, ephemeral: bool = False
+):
     pack_key = _PACK_ALIASES.get(tipo.lower().strip())
     if not pack_key:
         lines = "\n".join(
@@ -4546,7 +4762,7 @@ async def _open_card_pack(interaction: discord.Interaction, tipo: str):
         embed.description = f"{pt['emoji']} **{pt['label']}** cuesta **{pt['price']:,}** 🪙. Tienes **{bal:,}** 🪙."
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
-    await interaction.response.defer()
+    await interaction.response.defer(ephemeral=ephemeral)
     await update_balance(user_id, -pt["price"])
     drawn = _draw_pack_cards(pack_key)
     for cid in drawn:
@@ -4561,7 +4777,55 @@ async def _open_card_pack(interaction: discord.Interaction, tipo: str):
     embed.description += "\n".join(f"➤ {_card_line(cid)}" for cid in drawn)
     new_bal = await get_balance(user_id)
     embed.set_footer(text=f"💰 Saldo restante: {new_bal:,} 🪙")
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=embed, ephemeral=ephemeral)
+
+
+class FootballPackSelect(discord.ui.Select):
+    def __init__(self, owner_id: str):
+        self.owner_id = owner_id
+        options = [
+            discord.SelectOption(
+                label=f"{pack['label']} · {pack['price']:,} monedas",
+                value=pack_id,
+                description=f"{CARDS_PER_PACK} cartas · {len(FOOTBALL_CARDS)} en la colección",
+                emoji=pack["emoji"],
+            )
+            for pack_id, pack in PACK_TYPES.items()
+        ]
+        super().__init__(
+            placeholder="Elige un sobre para comprar y abrir",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.owner_id:
+            await interaction.response.send_message(
+                "Este panel pertenece a otra persona.", ephemeral=True
+            )
+            return
+        view = self.view
+        if view is None or view.purchase_completed:
+            await interaction.response.send_message(
+                "Este panel ya fue utilizado. Ejecuta `/infocartas` para abrir otro.",
+                ephemeral=True,
+            )
+            return
+        view.purchase_completed = True
+        await _open_card_pack(interaction, self.values[0], ephemeral=True)
+        try:
+            if interaction.message:
+                await interaction.message.edit(view=None)
+        except discord.HTTPException:
+            pass
+
+
+class FootballPackStoreView(discord.ui.View):
+    def __init__(self, owner_id: str):
+        super().__init__(timeout=180)
+        self.purchase_completed = False
+        self.add_item(FootballPackSelect(owner_id))
 
 
 @tree.command(name="abrirpaquete", description="Compra y abre un sobre de tarjetas de fútbol")
@@ -4669,8 +4933,12 @@ async def infocartas_slash(interaction: discord.Interaction):
             value=_format_pack_probabilities(pt),
             inline=False,
         )
-    embed.set_footer(text="Usa /comprarsobre <tipo>  •  Ej: /comprarsobre raro")
-    await interaction.response.send_message(embed=embed)
+    embed.set_footer(text="Elige un sobre en el menú o usa /comprarsobre.")
+    await interaction.response.send_message(
+        embed=embed,
+        view=FootballPackStoreView(str(interaction.user.id)),
+        ephemeral=True,
+    )
 
 
 # ─────────────────────────── MERCADO DE CARTAS ───────────────────────────
@@ -4742,6 +5010,154 @@ def _market_embed(listings: list[tuple], title: str, footer: str = "") -> discor
     return embed
 
 
+MARKET_PURCHASE_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+async def complete_market_purchase(
+    user: discord.User | discord.Member, listing_id: int
+) -> tuple[discord.Embed | None, str | None]:
+    lock = MARKET_PURCHASE_LOCKS.setdefault(listing_id, asyncio.Lock())
+    async with lock:
+        user_id = str(user.id)
+        await get_or_create_user(user_id, user.name)
+        listing = await _market_get_listing(listing_id)
+        if not listing:
+            return None, f"La publicación **#{listing_id}** no existe o ya fue vendida."
+
+        lid, seller_id, card_id, price, _ = listing
+        if seller_id == user_id:
+            return None, "No puedes comprar tu propia carta."
+
+        balance = await get_balance(user_id)
+        if balance < price:
+            return None, f"Necesitas **{price:,}** 🪙 pero tienes **{balance:,}** 🪙."
+
+        await _market_delete_listing(lid)
+        await update_balance(user_id, -price)
+        await update_balance(seller_id, price)
+        await _add_card(user_id, card_id)
+        new_balance = await get_balance(user_id)
+
+    card = FOOTBALL_CARDS[card_id]
+    rarity = RARITY_CONFIG[card["rarity"]]
+    embed = discord.Embed(title="🎉 ¡Compra exitosa!", color=rarity["color"])
+    embed.description = (
+        f"➤ {_card_line(card_id)}\n\n"
+        f"💸 Pagaste: **{price:,}** 🪙\n"
+        "La carta fue añadida a tu colección."
+    )
+    embed.set_footer(text=f"Saldo restante: {new_balance:,} 🪙")
+
+    try:
+        seller = await client.fetch_user(int(seller_id))
+        dm_embed = discord.Embed(title="💰 ¡Vendiste una carta!", color=0x2ECC71)
+        dm_embed.description = (
+            f"**{user.display_name}** compró tu:\n"
+            f"➤ {_card_line(card_id)}\n\n"
+            f"Recibiste **{price:,}** 🪙 en tu balance."
+        )
+        await seller.send(embed=dm_embed)
+    except Exception:
+        pass
+    return embed, None
+
+
+async def cancel_market_listing(
+    seller_id: str, listing_id: int
+) -> tuple[str | None, str | None]:
+    lock = MARKET_PURCHASE_LOCKS.setdefault(listing_id, asyncio.Lock())
+    async with lock:
+        listing = await _market_get_listing(listing_id)
+        if not listing:
+            return None, f"La publicación **#{listing_id}** no existe."
+        lid, owner_id, card_id, _price, _timestamp = listing
+        if owner_id != seller_id:
+            return None, "Esa publicación no es tuya."
+        await _market_delete_listing(lid)
+        await _add_card(seller_id, card_id)
+        return card_id, None
+
+
+class MarketBuySelect(discord.ui.Select):
+    def __init__(self, listings: list[tuple], rarity_filter: str = ""):
+        self.rarity_filter = rarity_filter
+        options = []
+        for listing_id, _seller_id, card_id, price, _ts in listings[:25]:
+            card = FOOTBALL_CARDS.get(card_id, {})
+            rarity = RARITY_CONFIG.get(
+                card.get("rarity", "comun"), RARITY_CONFIG["comun"]
+            )
+            options.append(
+                discord.SelectOption(
+                    label=f"#{listing_id} {card.get('name', card_id)} · {price:,} 🪙"[:100],
+                    value=str(listing_id),
+                    description=f"{rarity['label']} · comprar esta publicación"[:100],
+                    emoji=rarity["emoji"],
+                )
+            )
+        super().__init__(
+            placeholder="Elige una carta para comprar",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        embed, error = await complete_market_purchase(
+            interaction.user, int(self.values[0])
+        )
+        view = self.view
+        if isinstance(view, MarketBuyView) and interaction.message:
+            refreshed_listings = await _market_listings(view.rarity_filter)
+            view.clear_items()
+            if refreshed_listings:
+                view.add_item(
+                    MarketBuySelect(refreshed_listings, view.rarity_filter)
+                )
+                updated_view = view
+            else:
+                view.stop()
+                updated_view = None
+            try:
+                await interaction.message.edit(
+                    embed=build_market_store_embed(
+                        refreshed_listings, view.rarity_filter
+                    ),
+                    view=updated_view,
+                )
+            except discord.HTTPException:
+                pass
+        if error:
+            await interaction.followup.send(error, ephemeral=True)
+        else:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class MarketBuyView(discord.ui.View):
+    def __init__(self, listings: list[tuple], rarity_filter: str = ""):
+        super().__init__(timeout=180)
+        self.rarity_filter = rarity_filter
+        self.add_item(MarketBuySelect(listings, rarity_filter))
+
+
+def build_market_store_embed(
+    listings: list[tuple], rarity_filter: str = ""
+) -> discord.Embed:
+    title = "🏪 Mercado de Cartas"
+    if rarity_filter:
+        rarity = RARITY_CONFIG[rarity_filter]
+        title += f" — {rarity['emoji']} {rarity['label']}"
+    embed = _market_embed(listings, title)
+    footer = (
+        "Elige una carta del menú para comprar · /vender <carta> <precio>"
+        if listings
+        else "No hay publicaciones disponibles ahora mismo."
+    )
+    embed.set_footer(text=footer)
+    return embed
+
+
 @tree.command(name="vender", description="Publica una carta en el mercado para que otros la compren")
 @app_commands.describe(
     carta="ID de la carta a vender (ej: messi, pele, cr7)",
@@ -4794,81 +5210,30 @@ async def vender_slash(interaction: discord.Interaction, carta: str, precio: int
 async def mercado_slash(interaction: discord.Interaction, rareza: str = ""):
     rarity_key = _PACK_ALIASES.get(rareza.lower().strip(), "") if rareza else ""
     listings = await _market_listings(rarity_key)
-    title = "🏪 Mercado de Cartas"
-    if rarity_key:
-        rc = RARITY_CONFIG[rarity_key]
-        title += f" — {rc['emoji']} {rc['label']}"
-    embed = _market_embed(listings, title,
-                          footer="Comprar: /comprar <#id>  •  Vender: /vender <carta> <precio>")
-    embed.set_footer(text=f"{'Mostrando hasta 20 resultados' if listings else ''} · "
-                         f"/comprar <id> para comprar · /vender <carta> <precio> para vender")
-    await interaction.response.send_message(embed=embed)
+    embed = build_market_store_embed(listings, rarity_key)
+    view = MarketBuyView(listings, rarity_key) if listings else None
+    await interaction.response.send_message(embed=embed, view=view)
 
 
 @tree.command(name="comprar", description="Compra una carta del mercado")
 @app_commands.describe(id="Número de la publicación (el #id que aparece en /mercado)")
 async def comprar_slash(interaction: discord.Interaction, id: int):
-    user_id = str(interaction.user.id)
-    await get_or_create_user(user_id, interaction.user.name)
-    listing = await _market_get_listing(id)
-    if not listing:
-        await interaction.response.send_message(f"❌ La publicación **#{id}** no existe o ya fue vendida.",
-                                                  ephemeral=True)
-        return
-    lid, seller_id, card_id, price, ts = listing
-    if seller_id == user_id:
-        await interaction.response.send_message("❌ No puedes comprar tu propia carta.", ephemeral=True)
-        return
-    bal = await get_balance(user_id)
-    if bal < price:
-        await interaction.response.send_message(
-            f"❌ Necesitas **{price:,}** 🪙 pero tienes **{bal:,}** 🪙.", ephemeral=True)
-        return
-    # Execute purchase
-    await _market_delete_listing(lid)
-    await update_balance(user_id, -price)
-    await update_balance(seller_id, price)
-    await _add_card(user_id, card_id)
-    c = FOOTBALL_CARDS[card_id]
-    rc = RARITY_CONFIG[c["rarity"]]
-    embed = discord.Embed(title="🎉 ¡Compra exitosa!", color=rc["color"])
-    embed.description = (
-        f"➤ {_card_line(card_id)}\n\n"
-        f"💸 Pagaste: **{price:,}** 🪙\n"
-        f"La carta fue añadida a tu colección."
-    )
-    new_bal = await get_balance(user_id)
-    embed.set_footer(text=f"Saldo restante: {new_bal:,} 🪙")
-    await interaction.response.send_message(embed=embed)
-    # Notify seller in DMs if possible
-    try:
-        seller = await client.fetch_user(int(seller_id))
-        dm_embed = discord.Embed(title="💰 ¡Vendiste una carta!", color=0x2ECC71)
-        dm_embed.description = (
-            f"**{interaction.user.display_name}** compró tu:\n"
-            f"➤ {_card_line(card_id)}\n\n"
-            f"Recibiste **{price:,}** 🪙 en tu balance."
-        )
-        await seller.send(embed=dm_embed)
-    except Exception:
-        pass
+    await interaction.response.defer(ephemeral=True)
+    embed, error = await complete_market_purchase(interaction.user, id)
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+    else:
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @tree.command(name="cancelarventa", description="Retira tu carta del mercado y devuélvela a tu colección")
 @app_commands.describe(id="Número de la publicación a cancelar")
 async def cancelarventa_slash(interaction: discord.Interaction, id: int):
     user_id = str(interaction.user.id)
-    listing = await _market_get_listing(id)
-    if not listing:
-        await interaction.response.send_message(f"❌ La publicación **#{id}** no existe.", ephemeral=True)
+    card_id, error = await cancel_market_listing(user_id, id)
+    if error:
+        await interaction.response.send_message(f"❌ {error}", ephemeral=True)
         return
-    lid, seller_id, card_id, price, ts = listing
-    if seller_id != user_id:
-        await interaction.response.send_message("❌ Esa publicación no es tuya.", ephemeral=True)
-        return
-    await _market_delete_listing(lid)
-    await _add_card(user_id, card_id)
-    c = FOOTBALL_CARDS[card_id]
     embed = discord.Embed(title="↩️ Venta cancelada", color=0x95A5A6)
     embed.description = f"➤ {_card_line(card_id)}\n\nLa carta fue devuelta a tu colección."
     await interaction.response.send_message(embed=embed)
@@ -7003,16 +7368,10 @@ async def on_message(message: discord.Message):
         except ValueError:
             await message.channel.send("❌ El ID debe ser un número.")
             return
-        listing = await _market_get_listing(lid)
-        if not listing:
-            await message.channel.send(f"❌ La publicación **#{lid}** no existe.")
+        card_id, error = await cancel_market_listing(user_id, lid)
+        if error:
+            await message.channel.send(f"❌ {error}")
             return
-        _lid, seller_id, card_id, price, ts = listing
-        if seller_id != user_id:
-            await message.channel.send("❌ Esa publicación no es tuya.")
-            return
-        await _market_delete_listing(_lid)
-        await _add_card(user_id, card_id)
         c = FOOTBALL_CARDS[card_id]
         embed = discord.Embed(title="↩️ Venta cancelada", color=0x95A5A6)
         embed.description = f"➤ {_card_line(card_id)}\n\nLa carta fue devuelta a tu colección."
