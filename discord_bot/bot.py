@@ -139,15 +139,6 @@ SHOP_ITEMS = {
 }
 
 ROLE_ITEMS = [k for k, v in SHOP_ITEMS.items() if v["category"] == "rol"]
-ROLE_LOAN_LENDER_PERCENT = 50     # % de cada collect de un rol prestado que va para su dueño
-
-
-def role_collect_payout(role_id: str, borrowed: dict) -> int:
-    """Lo que recibe quien hace /collect (si el rol es prestado, descuenta el % del dueño)."""
-    bonus = SHOP_ITEMS[role_id]["collect_bonus"]
-    if role_id in borrowed:
-        return bonus - bonus * ROLE_LOAN_LENDER_PERCENT // 100
-    return bonus
 LEGACY_ROLE_ITEM_IDS = {
     "role_vip": "vip",
     "role_viciado": "viciado",
@@ -809,13 +800,8 @@ async def remove_from_inventory(user_id: str, item_id: str):
 async def collect_available_role_earnings(
     user_id: str,
     now: datetime | None = None,
-) -> tuple[list[str], list[str], list[tuple[str, datetime]], dict[str, str]]:
-    """Collect only roles whose individual cooldown has expired.
-
-    Incluye los roles que le prestaron (el dueño recibe un %) y excluye los que
-    el usuario prestó a otros. Devuelve (owned, ready, waiting, borrowed) con
-    borrowed = {role_id: lender_id}.
-    """
+) -> tuple[list[str], list[str], list[tuple[str, datetime]]]:
+    """Collect only roles whose individual cooldown has expired."""
     role_placeholders = ",".join("?" for _ in ROLE_ITEMS)
     now = now or datetime.utcnow()
     owned_roles: list[str] = []
@@ -829,29 +815,11 @@ async def collect_available_role_earnings(
             f"AND item_id IN ({role_placeholders})",
             (user_id, *ROLE_ITEMS),
         ) as cursor:
-            inventory_roles = [row[0] for row in await cursor.fetchall()]
-
-        async with db.execute(
-            "SELECT item_id FROM role_loans WHERE lender_id=? AND expires_at > ?",
-            (user_id, now.isoformat()),
-        ) as cursor:
-            lent_out = {row[0] for row in await cursor.fetchall()}
-        async with db.execute(
-            "SELECT item_id, lender_id FROM role_loans WHERE borrower_id=? AND expires_at > ?",
-            (user_id, now.isoformat()),
-        ) as cursor:
-            borrowed = dict(await cursor.fetchall())
-
-        owned_roles = [r for r in inventory_roles if r not in lent_out]
-        for role_id in list(borrowed):
-            if role_id in owned_roles:
-                del borrowed[role_id]  # ya lo compró: cobra completo
-            else:
-                owned_roles.append(role_id)
+            owned_roles = [row[0] for row in await cursor.fetchall()]
 
         if not owned_roles:
             await db.commit()
-            return [], [], [], {}
+            return [], [], []
 
         async with db.execute(
             "SELECT item_id, last_collect FROM role_collects WHERE user_id=?",
@@ -869,16 +837,8 @@ async def collect_available_role_earnings(
                 waiting_roles.append((role_id, next_collect))
 
         if ready_roles:
-            total_bonus = 0
+            total_bonus = sum(SHOP_ITEMS[role_id]["collect_bonus"] for role_id in ready_roles)
             for role_id in ready_roles:
-                total_bonus += role_collect_payout(role_id, borrowed)
-                lender_id = borrowed.get(role_id)
-                if lender_id:
-                    lender_share = SHOP_ITEMS[role_id]["collect_bonus"] * ROLE_LOAN_LENDER_PERCENT // 100
-                    await db.execute(
-                        "UPDATE users SET balance=MIN(balance + ?, ?) WHERE user_id=?",
-                        (lender_share, MAX_BALANCE, lender_id),
-                    )
                 await db.execute(
                     "INSERT INTO role_collects (user_id, item_id, last_collect) VALUES (?, ?, ?) "
                     "ON CONFLICT(user_id, item_id) DO UPDATE SET last_collect=excluded.last_collect",
@@ -891,7 +851,7 @@ async def collect_available_role_earnings(
 
         await db.commit()
 
-    return owned_roles, ready_roles, waiting_roles, borrowed
+    return owned_roles, ready_roles, waiting_roles
 
 
 async def get_role_last_collect(user_id: str, role_id: str) -> str | None:
@@ -1066,14 +1026,12 @@ async def on_ready():
     await init_db()
     await init_shield_table()
     await loan_init_table()
-    await init_role_loans_table()
     await tree.sync()
     if not _background_started:
         _background_started = True
         asyncio.create_task(lottery_loop())
         asyncio.create_task(shield_role_loop())
         asyncio.create_task(_loan_loop())
-        asyncio.create_task(role_loan_loop())
     print(f"Bot conectado como {client.user} (ID público: {client.user.id})")
 
 
@@ -1150,7 +1108,7 @@ async def daily(interaction: discord.Interaction):
 async def collect(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     await get_or_create_user(user_id, interaction.user.name)
-    owned_roles, ready_roles, waiting_roles, borrowed = await collect_available_role_earnings(user_id)
+    owned_roles, ready_roles, waiting_roles = await collect_available_role_earnings(user_id)
 
     if not owned_roles:
         embed = discord.Embed(title="❌ Sin Roles", color=0xFF4444)
@@ -1178,12 +1136,11 @@ async def collect(interaction: discord.Interaction):
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
-    total_bonus = sum(role_collect_payout(r, borrowed) for r in ready_roles)
+    total_bonus = sum(SHOP_ITEMS[r]["collect_bonus"] for r in ready_roles)
     new_balance = await get_balance(user_id)
     embed = discord.Embed(title="💰 ¡Ganancias Recogidas!", color=0x00FF88)
     lines = "\n".join(
-        f"{SHOP_ITEMS[r]['name']}{f' (prestado · {ROLE_LOAN_LENDER_PERCENT}% para su dueño)' if r in borrowed else ''} "
-        f"→ +**{role_collect_payout(r, borrowed):,}** 🪙"
+        f"{SHOP_ITEMS[r]['name']} → +**{SHOP_ITEMS[r]['collect_bonus']:,}** 🪙"
         for r in ready_roles
     )
     embed.description = (
@@ -6156,8 +6113,6 @@ async def on_message(message: discord.Message):
 
     if await loan_handle_prefix(message, cmd, args):
         return
-    if await role_loan_handle_prefix(message, cmd, args):
-        return
 
     # ,bal
     if cmd == "bal":
@@ -6198,7 +6153,7 @@ async def on_message(message: discord.Message):
     # ,collect
     elif cmd == "collect":
         await get_or_create_user(user_id, message.author.name)
-        owned_roles, ready_roles, waiting_roles, borrowed = await collect_available_role_earnings(user_id)
+        owned_roles, ready_roles, waiting_roles = await collect_available_role_earnings(user_id)
 
         if not owned_roles:
             embed = discord.Embed(title="❌ Sin Roles", color=0xFF4444)
@@ -6226,12 +6181,11 @@ async def on_message(message: discord.Message):
             await message.channel.send(embed=embed)
             return
 
-        total_bonus = sum(role_collect_payout(r, borrowed) for r in ready_roles)
+        total_bonus = sum(SHOP_ITEMS[r]["collect_bonus"] for r in ready_roles)
         new_balance = await get_balance(user_id)
         embed = discord.Embed(title="💰 ¡Ganancias Recogidas!", color=0x00FF88)
         lines = "\n".join(
-            f"{SHOP_ITEMS[r]['name']}{f' (prestado · {ROLE_LOAN_LENDER_PERCENT}% para su dueño)' if r in borrowed else ''} "
-            f"→ +**{role_collect_payout(r, borrowed):,}** 🪙"
+            f"{SHOP_ITEMS[r]['name']} → +**{SHOP_ITEMS[r]['collect_bonus']:,}** 🪙"
             for r in ready_roles
         )
         embed.description = (
@@ -8205,11 +8159,10 @@ import math as _loan_math
 from typing import Optional as _LoanOptional
 
 # ===================== CONFIGURACION (cambia estos numeros) =====================
-LOAN_INTEREST_PERCENT = 25        # interes base (por cada tramo)
-LOAN_TIER_SIZE = 5_000_000        # cada tramo de este monto suma otro LOAN_INTEREST_PERCENT
+LOAN_INTEREST_PERCENT = 25        # interes total del prestamo
 LOAN_WEEKLY_PERCENT = 5           # % de la deuda total que se paga en cada cuota
 LOAN_MIN = 1_000             # prestamo minimo
-LOAN_MAX = 150_000_000       # prestamo maximo
+LOAN_MAX = 5_000_000         # prestamo maximo
 LOAN_LATE_FEE_PERCENT = 10        # recargo sobre la parte de la cuota que no se pudo cobrar
 LOAN_PERIOD = timedelta(days=7)   # cada cuanto se cobra (para probar: timedelta(minutes=2))
 LOAN_CHECK_SECONDS = 60           # cada cuanto revisa el bot si hay cuotas vencidas
@@ -8220,14 +8173,8 @@ def _loan_db():
 
 
 # ------------------------------------------------------------------ utilidades
-def loan_interest_percent(amount: int) -> int:
-    # hasta 5M = 25%, hasta 10M = 50%, hasta 15M = 75%, etc.
-    tiers = max(1, _loan_math.ceil(amount / LOAN_TIER_SIZE))
-    return tiers * LOAN_INTEREST_PERCENT
-
-
 def loan_calc_terms(amount: int):
-    interest = _loan_math.ceil(amount * loan_interest_percent(amount) / 100)
+    interest = _loan_math.ceil(amount * LOAN_INTEREST_PERCENT / 100)
     total = amount + interest
     installment = max(1, _loan_math.ceil(total * LOAN_WEEKLY_PERCENT / 100))
     payments = _loan_math.ceil(total / installment)
@@ -8265,9 +8212,7 @@ def loan_info_embed() -> discord.Embed:
     embed = discord.Embed(title="🏦 Préstamos del Casino", color=0x3498DB)
     embed.description = (
         f"Pide entre **{LOAN_MIN:,}** y **{LOAN_MAX:,}** 🪙 con `/loan <cantidad>`.\n\n"
-        f"• Interés: **{LOAN_INTEREST_PERCENT}%** por cada **{LOAN_TIER_SIZE:,}** 🪙 prestados "
-        f"(hasta {LOAN_TIER_SIZE:,} = {LOAN_INTEREST_PERCENT}%, hasta {LOAN_TIER_SIZE*2:,} = {LOAN_INTEREST_PERCENT*2}%, "
-        f"hasta {LOAN_TIER_SIZE*3:,} = {LOAN_INTEREST_PERCENT*3}%...)\n"
+        f"• Interés: **{LOAN_INTEREST_PERCENT}%** sobre lo prestado\n"
         f"• Cada **{_loan_period_text()}** se cobra una cuota de **{LOAN_WEEKLY_PERCENT}%** de la deuda total\n"
         f"• Si no hay fondos, se cobra lo que haya y se suma un recargo de **{LOAN_LATE_FEE_PERCENT}%** "
         f"sobre lo no pagado\n"
@@ -8284,7 +8229,7 @@ def loan_terms_embed(amount: int) -> discord.Embed:
     embed = discord.Embed(title="🏦 Confirma tu préstamo", color=0x3498DB)
     embed.description = (
         f"💵 Recibes: **{amount:,}** 🪙\n"
-        f"📈 Interés ({loan_interest_percent(amount)}%): **{interest:,}** 🪙\n"
+        f"📈 Interés ({LOAN_INTEREST_PERCENT}%): **{interest:,}** 🪙\n"
         f"🧾 Total a devolver: **{total:,}** 🪙\n\n"
         f"📅 Cuota cada **{_loan_period_text()}**: **{installment:,}** 🪙 ({LOAN_WEEKLY_PERCENT}%)\n"
         f"🔢 Número de pagos: **{payments}**\n\n"
@@ -8386,18 +8331,6 @@ async def loan_create(user_id: str, username: str, amount: int) -> discord.Embed
             if await _loan_get_row(db, user_id):
                 await db.rollback()
                 return _loan_err("Ya tienes una deuda", "Termina de pagar tu préstamo actual antes de pedir otro. Mira `/debt`.")
-            async with db.execute(
-                "SELECT COALESCE(balance, 0) FROM users WHERE user_id = ?",
-                (user_id,),
-            ) as cur:
-                wallet_row = await cur.fetchone()
-            wallet = wallet_row[0] if wallet_row else 0
-            if wallet + amount > MAX_BALANCE:
-                await db.rollback()
-                return _loan_err(
-                    "Cartera llena",
-                    "No cabe el préstamo completo en tu cartera. Deposita monedas en el banco y vuelve a intentarlo.",
-                )
             await db.execute(
                 "INSERT INTO loans (user_id, principal, total_due, remaining, installment, "
                 "next_due, missed, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
@@ -8687,304 +8620,6 @@ async def debt_command(interaction: discord.Interaction):
 async def payloan_command(interaction: discord.Interaction, cantidad: _LoanOptional[str] = None):
     embed = await loan_pay(str(interaction.user.id), interaction.user.name, cantidad)
     await interaction.response.send_message(embed=embed)
-
-
-# =====================================================================
-#  PRESTAR ROLES: presta un rol de tu inventario por X dias.
-#  El prestatario cobra el rol con /collect y el 50% va para el dueño.
-#  Al vencer, el bot le quita el rol automaticamente.
-#  Comando: /prestar  (prefijo: ,prestar @usuario <rol> <dias>)
-# =====================================================================
-ROLE_LOAN_MAX_DAYS = 30           # maximo de dias que se puede prestar un rol
-ROLE_LOAN_CHECK_SECONDS = 30      # cada cuanto revisa el bot si hay prestamos vencidos
-
-
-async def init_role_loans_table():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS role_loans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id TEXT NOT NULL,
-                lender_id TEXT NOT NULL,
-                borrower_id TEXT NOT NULL,
-                item_id TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE (lender_id, item_id),
-                UNIQUE (borrower_id, item_id)
-            )
-            """
-        )
-        await db.commit()
-
-
-def _role_loan_err(message: str) -> discord.Embed:
-    return discord.Embed(title="❌ No se pudo prestar el rol", description=message, color=0xFF4444)
-
-
-async def role_loan_create(
-    guild: discord.Guild,
-    lender: discord.Member,
-    borrower: discord.Member,
-    item_id: str,
-    days: int,
-) -> tuple[bool, discord.Embed]:
-    lender_id, borrower_id = str(lender.id), str(borrower.id)
-    if borrower.bot:
-        return False, _role_loan_err("No puedes prestarle un rol a un bot.")
-    if borrower.id == lender.id:
-        return False, _role_loan_err("No puedes prestarte un rol a ti mismo.")
-    if item_id not in ROLE_ITEMS:
-        return False, _role_loan_err("Ese objeto no es un rol de la tienda.")
-    if not 1 <= days <= ROLE_LOAN_MAX_DAYS:
-        return False, _role_loan_err(f"Los días deben estar entre **1** y **{ROLE_LOAN_MAX_DAYS}**.")
-
-    await get_or_create_user(lender_id, lender.name)
-    await get_or_create_user(borrower_id, borrower.name)
-    item = SHOP_ITEMS[item_id]
-    now = datetime.utcnow()
-    expires = now + timedelta(days=days)
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("BEGIN IMMEDIATE")
-        try:
-            async with db.execute(
-                "SELECT quantity FROM inventory WHERE user_id=? AND item_id=?", (lender_id, item_id)
-            ) as cur:
-                row = await cur.fetchone()
-            if not row or row[0] <= 0:
-                await db.rollback()
-                return False, _role_loan_err(f"No tienes **{item['name']}** en tu inventario.")
-
-            async with db.execute(
-                "SELECT quantity FROM inventory WHERE user_id=? AND item_id=?", (borrower_id, item_id)
-            ) as cur:
-                row = await cur.fetchone()
-            if row and row[0] > 0:
-                await db.rollback()
-                return False, _role_loan_err(f"{borrower.mention} ya tiene **{item['name']}**.")
-
-            async with db.execute(
-                "SELECT lender_id, expires_at FROM role_loans WHERE item_id=? AND (lender_id=? OR borrower_id=?)",
-                (item_id, lender_id, borrower_id),
-            ) as cur:
-                existing = await cur.fetchone()
-            if existing:
-                await db.rollback()
-                if existing[0] == lender_id:
-                    msg = f"Ya tienes prestado **{item['name']}**. Espera a que termine el préstamo."
-                else:
-                    msg = f"{borrower.mention} ya está usando **{item['name']}** prestado."
-                return False, _role_loan_err(msg)
-
-            await db.execute(
-                "INSERT INTO role_loans (guild_id, lender_id, borrower_id, item_id, expires_at, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (str(guild.id), lender_id, borrower_id, item_id, expires.isoformat(), now.isoformat()),
-            )
-            await db.commit()
-        except aiosqlite.IntegrityError:
-            await db.rollback()
-            return False, _role_loan_err(
-                "Ese rol ya tiene un préstamo activo. Espera a que termine antes de prestarlo otra vez."
-            )
-        except Exception:
-            await db.rollback()
-            raise
-
-    # Asigna el rol de Discord; si falla, se cancela el préstamo
-    error = None
-    already_has_role = False
-    try:
-        _, already_has_role, error = await grant_shop_role(guild, borrower, item_id)
-    except discord.Forbidden:
-        error = "No tengo permiso para crear o asignar roles. Necesito **Gestionar roles**."
-    except (discord.HTTPException, aiosqlite.Error):
-        error = "Discord no pudo asignar el rol. Inténtalo de nuevo."
-    if already_has_role and not error:
-        error = (
-            f"{borrower.mention} ya tiene ese rol de Discord; no puedo prestarlo porque "
-            "el bot podría quitárselo al vencer el préstamo."
-        )
-    if error:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("DELETE FROM role_loans WHERE lender_id=? AND item_id=?", (lender_id, item_id))
-            await db.commit()
-        return False, _role_loan_err(error)
-
-    bonus = item["collect_bonus"]
-    lender_share = bonus * ROLE_LOAN_LENDER_PERCENT // 100
-    ts = _loan_ts(expires.isoformat())
-    embed = discord.Embed(title="🤝 Rol prestado", color=0x00FF88)
-    embed.description = (
-        f"{lender.mention} le prestó **{item['name']}** a {borrower.mention} "
-        f"por **{days}** día{'s' if days != 1 else ''}.\n\n"
-        f"💰 {borrower.mention} cobra **{bonus - lender_share:,}** 🪙 cada **{item['collect_hours']}h** con `/collect`.\n"
-        f"🏦 {lender.mention} recibe **{lender_share:,}** 🪙 ({ROLE_LOAN_LENDER_PERCENT}%) de cada collect.\n"
-        f"⏳ Termina <t:{ts}:R> (<t:{ts}:f>); el bot quitará el rol automáticamente.\n\n"
-        f"⚠️ Mientras dure el préstamo, {lender.mention} no puede cobrar ese rol con `/collect`."
-    )
-    return True, embed
-
-
-# ------------------------------------------------------------------ vencimiento automatico
-async def _role_loan_dm(user_id: str, text: str):
-    try:
-        user = client.get_user(int(user_id)) or await client.fetch_user(int(user_id))
-        await user.send(text)
-    except (discord.HTTPException, ValueError):
-        pass  # DMs cerrados o usuario inexistente
-
-
-async def expire_role_loans():
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT id, guild_id, lender_id, borrower_id, item_id, expires_at FROM role_loans"
-        ) as cur:
-            rows = await cur.fetchall()
-
-    now = datetime.utcnow()
-    for loan_id, guild_id, lender_id, borrower_id, item_id, expires_at in rows:
-        try:
-            if datetime.fromisoformat(expires_at) > now:
-                continue
-        except ValueError:
-            pass  # fecha corrupta: se limpia igual
-
-        item_name = SHOP_ITEMS.get(item_id, {}).get("name", item_id)
-        removed_ok = True
-        guild = client.get_guild(int(guild_id))
-        if guild is None:
-            # Reintenta cuando el bot vuelva a poder acceder al servidor.
-            continue
-
-        # Si el prestatario compró el rol mientras tanto, se queda con el rol de Discord.
-        borrower_owns_role = await get_item_quantity(borrower_id, item_id) > 0
-        if not borrower_owns_role:
-            async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute(
-                    "SELECT role_id FROM shop_guild_roles WHERE guild_id=? AND item_id=?",
-                    (guild_id, item_id),
-                ) as cur:
-                    role_row = await cur.fetchone()
-            role = guild.get_role(int(role_row[0])) if role_row else None
-            if role is not None:
-                try:
-                    member = guild.get_member(int(borrower_id)) or await guild.fetch_member(int(borrower_id))
-                    if role in member.roles:
-                        await member.remove_roles(role, reason="Préstamo de rol terminado")
-                except discord.NotFound:
-                    pass  # el usuario ya no está en el servidor
-                except (discord.Forbidden, discord.HTTPException) as exc:
-                    removed_ok = False  # se reintenta en la próxima vuelta
-                    print(f"No pude quitar el rol prestado a {borrower_id} en {guild_id}: {exc}")
-
-        if not removed_ok:
-            continue
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("DELETE FROM role_loans WHERE id=?", (loan_id,))
-            await db.commit()
-
-        if borrower_owns_role:
-            borrower_message = (
-                f"⏰ Terminó tu préstamo de **{item_name}**. "
-                "Conservas el rol porque también lo tienes comprado."
-            )
-        else:
-            borrower_message = (
-                f"⏰ Terminó tu préstamo de **{item_name}**. "
-                "El rol prestado ya no está activo."
-            )
-        await _role_loan_dm(borrower_id, borrower_message)
-        await _role_loan_dm(lender_id, f"✅ Tu **{item_name}** prestado terminó y ya puedes volver a cobrarlo con `/collect`.")
-
-
-async def role_loan_loop():
-    await client.wait_until_ready()
-    while not client.is_closed():
-        try:
-            await expire_role_loans()
-        except Exception as exc:  # el bucle nunca debe morir
-            print(f"Error en role_loan_loop: {exc}")
-        await asyncio.sleep(ROLE_LOAN_CHECK_SECONDS)
-
-
-# ------------------------------------------------------------------ comandos
-async def prestar_role_autocomplete(interaction: discord.Interaction, current: str):
-    t = _plain(current)
-    uid = str(interaction.user.id)
-    rows = await get_inventory(uid)
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT item_id FROM role_loans WHERE lender_id=?", (uid,)) as cur:
-            lent = {r[0] for r in await cur.fetchall()}
-    choices = []
-    for item_id, qty in rows:
-        item = SHOP_ITEMS.get(item_id)
-        if item is None or item["category"] != "rol" or qty <= 0 or item_id in lent:
-            continue
-        if t and t not in f"{_plain(item['name'])} {_plain(item_id)}":
-            continue
-        label = f"{item['name']} — +{item['collect_bonus']:,} cada {item['collect_hours']}h"
-        choices.append(app_commands.Choice(name=label[:100], value=item_id))
-    return choices[:25]
-
-
-@tree.command(
-    name="prestar",
-    description=f"Presta un rol de tu inventario por unos días y recibe {ROLE_LOAN_LENDER_PERCENT}% de sus collects",
-)
-@app_commands.guild_only()
-@app_commands.describe(
-    usuario="A quién le prestas el rol",
-    rol="Elige el rol de tu inventario que vas a prestar",
-    dias=f"Días de préstamo (1-{ROLE_LOAN_MAX_DAYS})",
-)
-async def prestar_command(
-    interaction: discord.Interaction,
-    usuario: discord.Member,
-    rol: str,
-    dias: app_commands.Range[int, 1, ROLE_LOAN_MAX_DAYS],
-):
-    item_id = resolve_shop_item(rol)
-    if item_id is None or item_id not in ROLE_ITEMS:
-        await interaction.response.send_message(
-            embed=_role_loan_err("No encontré ese rol. Elígelo de la lista que aparece al escribir."),
-            ephemeral=True,
-        )
-        return
-    await interaction.response.defer()
-    ok, embed = await role_loan_create(interaction.guild, interaction.user, usuario, item_id, dias)
-    if ok:
-        await interaction.followup.send(content=usuario.mention, embed=embed)
-    else:
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-prestar_command.autocomplete("rol")(prestar_role_autocomplete)
-
-
-async def role_loan_handle_prefix(message: discord.Message, cmd: str, args: list) -> bool:
-    """Devuelve True si el comando era ,prestar (así el bot no sigue buscando)."""
-    if cmd != "prestar":
-        return False
-    usage = "❌ Uso: `,prestar @usuario <rol> <días>` — ej: `,prestar @Juan oro 3`"
-    if message.guild is None or not message.mentions or len(args) < 3 or not args[-1].isdigit():
-        await message.channel.send(usage)
-        return True
-    borrower = message.mentions[0]
-    if not isinstance(borrower, discord.Member) or not isinstance(message.author, discord.Member):
-        await message.channel.send(usage)
-        return True
-    name = " ".join(a for a in args[:-1] if not re.fullmatch(r"<@!?\d+>", a))
-    item_id = resolve_shop_item(name)
-    if item_id is None or item_id not in ROLE_ITEMS:
-        await message.channel.send(f"❌ No encontré el rol **{name}**.\n{usage}")
-        return True
-    ok, embed = await role_loan_create(message.guild, message.author, borrower, item_id, int(args[-1]))
-    await message.channel.send(content=borrower.mention if ok else None, embed=embed)
-    return True
 
 
 if __name__ == "__main__":
