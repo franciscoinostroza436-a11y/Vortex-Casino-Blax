@@ -204,9 +204,9 @@ FIGHTERS = {
 
 def calc_daily_reward(streak: int) -> int:
     if streak <= 1:
-        return 5_000
+        return DAILY_FIRST_REWARD
     day = min(streak, 30)
-    return 50_000 + (day - 2) * 10_000
+    return DAILY_BASE_REWARD + (day - 2) * DAILY_STREAK_STEP
 
 RED_NUMBERS = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
 BLACK_NUMBERS = {2,4,6,8,10,11,13,15,17,20,22,24,26,28,29,31,33,35}
@@ -809,18 +809,22 @@ async def remove_from_inventory(user_id: str, item_id: str):
 async def collect_available_role_earnings(
     user_id: str,
     now: datetime | None = None,
-) -> tuple[list[str], list[str], list[tuple[str, datetime]], dict[str, str]]:
+) -> tuple[list[str], list[str], list[tuple[str, datetime]], dict[str, str], dict[str, int], int]:
     """Collect only roles whose individual cooldown has expired.
 
-    Incluye los roles que le prestaron (el dueño recibe un %) y excluye los que
-    el usuario prestó a otros. Devuelve (owned, ready, waiting, borrowed) con
-    borrowed = {role_id: lender_id}.
+    Incluye los roles que le prestaron (el dueño recibe su %), excluye los que el
+    usuario prestó y aplica el evento de collect doble.
+    Devuelve (owned, ready, waiting, borrowed, payouts, multiplier) con
+    borrowed = {role_id: lender_id} y payouts = {role_id: monedas que recibe}.
     """
     role_placeholders = ",".join("?" for _ in ROLE_ITEMS)
     now = now or datetime.utcnow()
     owned_roles: list[str] = []
     ready_roles: list[str] = []
     waiting_roles: list[tuple[str, datetime]] = []
+    payouts: dict[str, int] = {}
+    multiplier = 1
+    borrowed: dict[str, str] = {}
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
@@ -837,21 +841,24 @@ async def collect_available_role_earnings(
         ) as cursor:
             lent_out = {row[0] for row in await cursor.fetchall()}
         async with db.execute(
-            "SELECT item_id, lender_id FROM role_loans WHERE borrower_id=? AND expires_at > ?",
+            "SELECT item_id, lender_id, lender_percent FROM role_loans WHERE borrower_id=? AND expires_at > ?",
             (user_id, now.isoformat()),
         ) as cursor:
-            borrowed = dict(await cursor.fetchall())
+            borrowed_info = {row[0]: (row[1], row[2]) for row in await cursor.fetchall()}
 
         owned_roles = [r for r in inventory_roles if r not in lent_out]
-        for role_id in list(borrowed):
+        for role_id in list(borrowed_info):
             if role_id in owned_roles:
-                del borrowed[role_id]  # ya lo compró: cobra completo
+                del borrowed_info[role_id]  # ya lo compró: cobra completo
             else:
                 owned_roles.append(role_id)
+        borrowed = {r: info[0] for r, info in borrowed_info.items()}
 
         if not owned_roles:
             await db.commit()
-            return [], [], [], {}
+            return [], [], [], {}, {}, 1
+
+        multiplier = await _collect_multiplier(db, now)
 
         async with db.execute(
             "SELECT item_id, last_collect FROM role_collects WHERE user_id=?",
@@ -871,14 +878,23 @@ async def collect_available_role_earnings(
         if ready_roles:
             total_bonus = 0
             for role_id in ready_roles:
-                total_bonus += role_collect_payout(role_id, borrowed)
-                lender_id = borrowed.get(role_id)
-                if lender_id:
-                    lender_share = SHOP_ITEMS[role_id]["collect_bonus"] * ROLE_LOAN_LENDER_PERCENT // 100
-                    await db.execute(
-                        "UPDATE users SET balance=MIN(balance + ?, ?) WHERE user_id=?",
-                        (lender_share, MAX_BALANCE, lender_id),
-                    )
+                base = SHOP_ITEMS[role_id]["collect_bonus"] * multiplier
+                if role_id in borrowed_info:
+                    lender_id, pct = borrowed_info[role_id]
+                    lender_share = base * pct // 100
+                    payouts[role_id] = base - lender_share
+                    if lender_share:
+                        await db.execute(
+                            "UPDATE users SET balance=MIN(balance + ?, ?) WHERE user_id=?",
+                            (lender_share, MAX_BALANCE, lender_id),
+                        )
+                        await db.execute(
+                            "UPDATE role_loans SET earned = earned + ? WHERE lender_id=? AND item_id=?",
+                            (lender_share, lender_id, role_id),
+                        )
+                else:
+                    payouts[role_id] = base
+                total_bonus += payouts[role_id]
                 await db.execute(
                     "INSERT INTO role_collects (user_id, item_id, last_collect) VALUES (?, ?, ?) "
                     "ON CONFLICT(user_id, item_id) DO UPDATE SET last_collect=excluded.last_collect",
@@ -891,7 +907,9 @@ async def collect_available_role_earnings(
 
         await db.commit()
 
-    return owned_roles, ready_roles, waiting_roles, borrowed
+    if ready_roles:
+        await feature_hook(user_id, "collect", len(ready_roles))
+    return owned_roles, ready_roles, waiting_roles, borrowed, payouts, multiplier
 
 
 async def get_role_last_collect(user_id: str, role_id: str) -> str | None:
@@ -916,6 +934,7 @@ async def get_today() -> str:
 
 
 async def track_mission(user_id: str, action: str):
+    await feature_hook(user_id, action)
     today = await get_today()
     async with aiosqlite.connect(DB_PATH) as db:
         for mission_id, mission in MISSIONS.items():
@@ -1067,6 +1086,9 @@ async def on_ready():
     await init_shield_table()
     await loan_init_table()
     await init_role_loans_table()
+    await init_extras_tables()
+    await init_dashboard_tables()
+    await config_load()
     await tree.sync()
     if not _background_started:
         _background_started = True
@@ -1074,6 +1096,8 @@ async def on_ready():
         asyncio.create_task(shield_role_loop())
         asyncio.create_task(_loan_loop())
         asyncio.create_task(role_loan_loop())
+        asyncio.create_task(weekly_loop())
+        asyncio.create_task(dashboard_start())
     print(f"Bot conectado como {client.user} (ID público: {client.user.id})")
 
 
@@ -1150,7 +1174,7 @@ async def daily(interaction: discord.Interaction):
 async def collect(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
     await get_or_create_user(user_id, interaction.user.name)
-    owned_roles, ready_roles, waiting_roles, borrowed = await collect_available_role_earnings(user_id)
+    owned_roles, ready_roles, waiting_roles, borrowed, payouts, multiplier = await collect_available_role_earnings(user_id)
 
     if not owned_roles:
         embed = discord.Embed(title="❌ Sin Roles", color=0xFF4444)
@@ -1178,17 +1202,19 @@ async def collect(interaction: discord.Interaction):
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
-    total_bonus = sum(role_collect_payout(r, borrowed) for r in ready_roles)
+    total_bonus = sum(payouts[r] for r in ready_roles)
+
+    event_note = f" · 🎉 evento x{multiplier}" if multiplier > 1 else ""
     new_balance = await get_balance(user_id)
     embed = discord.Embed(title="💰 ¡Ganancias Recogidas!", color=0x00FF88)
     lines = "\n".join(
         f"{SHOP_ITEMS[r]['name']}{f' (prestado · {ROLE_LOAN_LENDER_PERCENT}% para su dueño)' if r in borrowed else ''} "
-        f"→ +**{role_collect_payout(r, borrowed):,}** 🪙"
+        f"→ +**{payouts[r]:,}** 🪙"
         for r in ready_roles
     )
     embed.description = (
         f"{lines}\n\n"
-        f"**Total:** +**{total_bonus:,}** 🪙\n"
+        f"**Total:** +**{total_bonus:,}** 🪙{event_note}\n"
         f"Saldo actual: **{new_balance:,}** 🪙"
     )
     if waiting_roles:
@@ -1510,7 +1536,7 @@ async def slots(interaction: discord.Interaction, cantidad: int):
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="rob", description="Intenta robarle monedas a otro usuario (40% de éxito)")
+@tree.command(name="rob", description="Intenta robarle monedas a otro usuario")
 @app_commands.describe(usuario="El usuario al que quieres robar")
 async def rob(interaction: discord.Interaction, usuario: discord.Member):
     robber_id = str(interaction.user.id)
@@ -1536,8 +1562,8 @@ async def rob(interaction: discord.Interaction, usuario: discord.Member):
     if last_rob:
         last_dt = datetime.fromisoformat(last_rob)
         diff = now - last_dt
-        if diff < timedelta(hours=1):
-            remaining = timedelta(hours=1) - diff
+        if diff < timedelta(minutes=ROB_COOLDOWN_MINUTES):
+            remaining = timedelta(minutes=ROB_COOLDOWN_MINUTES) - diff
             minutes = int(remaining.total_seconds() // 60)
             seconds = int(remaining.total_seconds() % 60)
             embed = discord.Embed(title="⏰ Cooldown Activo", color=0xFF4444)
@@ -1575,10 +1601,10 @@ async def rob(interaction: discord.Interaction, usuario: discord.Member):
             await interaction.followup.send(embed=embed)
             return
 
-    success = random.random() < 0.40
+    success = random.random() < ROB_SUCCESS_CHANCE / 100
 
     if success:
-        pct = random.uniform(0.10, 0.40)
+        pct = random.uniform(ROB_STEAL_MIN_PCT / 100, ROB_STEAL_MAX_PCT / 100)
         stolen = max(1, int(victim_balance * pct))
         stolen = min(stolen, victim_balance)
         await update_balance(victim_id, -stolen)
@@ -1591,16 +1617,18 @@ async def rob(interaction: discord.Interaction, usuario: discord.Member):
             f"Tu saldo: **{robber_balance:,}** 🪙"
         )
     else:
-        fine = max(1, int(victim_balance * 0.10))
+        fine = max(1, int(victim_balance * ROB_FINE_PCT / 100))
         robber_balance = await get_balance(robber_id)
         fine = min(fine, robber_balance)
         await update_balance(robber_id, -fine)
         new_robber_balance = robber_balance - fine
+        jail_minutes = await jail_send(robber_id)
         embed = discord.Embed(title="🚔 ¡Te Atraparon!", color=0xFF4444)
         embed.description = (
             f"Intentaste robar a **{usuario.mention}** pero te atraparon.\n"
             f"Multa: **{fine:,}** 🪙\n\n"
-            f"Tu saldo: **{new_robber_balance:,}** 🪙"
+            f"Tu saldo: **{new_robber_balance:,}** 🪙\n\n"
+            f"🔒 **Vas a la cárcel {jail_minutes} min.** No podrás robar ni apostar. Sal antes con `/fianza`."
         )
 
     await interaction.followup.send(embed=embed)
@@ -1622,22 +1650,22 @@ async def addmoney(interaction: discord.Interaction, usuario: discord.Member, ca
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(name="removemoney", description="[ADMIN] Quita monedas a un usuario")
-@app_commands.describe(usuario="Usuario objetivo", cantidad="Cantidad a quitar")
+@tree.command(name="removemoney", description="[ADMIN] Quita monedas a un usuario (pon all para quitarle todo)")
+@app_commands.describe(
+    usuario="Usuario objetivo",
+    cantidad="Cantidad a quitar, o all para quitar todo el dinero de la cartera",
+    banco="Quitar también todo lo que tiene en el banco",
+)
 @app_commands.default_permissions(administrator=True)
-async def removemoney(interaction: discord.Interaction, usuario: discord.Member, cantidad: int):
-    if cantidad <= 0:
-        await interaction.response.send_message("❌ La cantidad debe ser mayor a 0.", ephemeral=True)
+async def removemoney(interaction: discord.Interaction, usuario: discord.Member, cantidad: str, banco: bool = False):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Solo los administradores pueden usar este comando.", ephemeral=True)
         return
-    target_id = str(usuario.id)
-    await get_or_create_user(target_id, usuario.name)
-    current = await get_balance(target_id)
-    deduct = min(cantidad, current)
-    await update_balance(target_id, -deduct)
-    new_balance = await get_balance(target_id)
-    embed = discord.Embed(title="✅ Dinero Eliminado", color=0xFFAA00)
-    embed.description = f"Se quitaron **{deduct:,}** 🪙 a {usuario.mention}.\nNuevo saldo: **{new_balance:,}** 🪙"
-    await interaction.response.send_message(embed=embed)
+    result = await perform_removemoney(usuario, cantidad, banco)
+    if isinstance(result, str):
+        await interaction.response.send_message(result, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=result)
 
 
 @tree.command(name="resetmoney", description="Reinicia el saldo de cartera a 0 (admins pueden resetear a otros)")
@@ -3600,6 +3628,11 @@ async def gift(interaction: discord.Interaction, usuario: discord.Member, item: 
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
 
+    if item in ROLE_ITEMS and await role_is_committed(sender_id, item):
+        await interaction.response.send_message(
+            "❌ Ese rol está prestado o publicado en el mercado de roles. Espera a que termine o retíralo.", ephemeral=True)
+        return
+
     await remove_from_inventory(sender_id, item)
     await add_to_inventory(receiver_id, item)
 
@@ -3630,6 +3663,11 @@ async def sell(interaction: discord.Interaction, item: str):
         embed = discord.Embed(title="❌ Sin Objeto", color=0xFF4444)
         embed.description = f"No tienes **{SHOP_ITEMS[item]['name']}** en tu inventario."
         await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    if item in ROLE_ITEMS and await role_is_committed(user_id, item):
+        await interaction.response.send_message(
+            "❌ Ese rol está prestado o publicado en el mercado de roles. Espera a que termine o retíralo.", ephemeral=True)
         return
 
     item_data = SHOP_ITEMS[item]
@@ -3837,6 +3875,23 @@ async def help_cmd(interaction: discord.Interaction):
             "`/withdraw <cantidad|all>` — Retirar del banco\n"
             "`/pay @usuario cantidad` — Transferir monedas\n"
             "`/leaderboard` — Top 10 jugadores"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="🆕 Novedades",
+        value=(
+            "`/work` `/slut` `/crime` — Gana monedas (configurables en el panel web)\n"
+            "`/top` — Ranking semanal con premios automáticos\n"
+            "`/logros` — Insignias y progreso\n"
+            "`/mines cantidad minas` — Buscaminas con retiro a tiempo\n"
+            "`/clan crear|unirse|info|depositar|misiones...` — Clanes con banco y misiones\n"
+            "`/prestar` `/devolver` `/misprestamos` — Presta roles y mira tus cobros\n"
+            "`/rolmercado publicar|ver|comprar|retirar` — Vende o alquila roles\n"
+            "`/ftorneo apuesta` — Torneo de luchadores con entrada y premio\n"
+            "`/carcel` `/fianza` — Cárcel por robos fallidos\n"
+            "`/evento` — Fines de semana con collect doble"
         ),
         inline=False
     )
@@ -4627,17 +4682,31 @@ async def fight_slash(interaction: discord.Interaction, usuario: discord.Member)
 
 
 FIGHTER_TOURNAMENT_PRIZE = 60_000_000
+FIGHTER_TOURNAMENT_RAKE_PERCENT = 5   # comisión del casino cuando el torneo tiene apuesta de entrada
 
 class FighterTournamentView(discord.ui.View):
     MAX_PLAYERS = 8
 
-    def __init__(self, host_id: str, host_name: str):
+    def __init__(self, host_id: str, host_name: str, entry_fee: int = 0):
         super().__init__(timeout=90)
         self.host_id = host_id
         self.host_name = host_name
+        self.entry_fee = entry_fee
         self.players: list[tuple[str, str, str]] = []  # (user_id, display_name, fighter_id)
         self.message: discord.Message | None = None
         self.started = False
+
+    def prize_for(self, player_count: int) -> int:
+        """Sin apuesta: premio fijo. Con apuesta: el pozo de entradas menos la comisión."""
+        if self.entry_fee <= 0:
+            return FIGHTER_TOURNAMENT_PRIZE
+        return self.entry_fee * player_count * (100 - FIGHTER_TOURNAMENT_RAKE_PERCENT) // 100
+
+    def prize_text(self) -> str:
+        if self.entry_fee <= 0:
+            return f"El campeón gana **{FIGHTER_TOURNAMENT_PRIZE:,}** 🪙"
+        return (f"Entrada: **{self.entry_fee:,}** 🪙 por jugador · el campeón se lleva el pozo "
+                f"(**{self.prize_for(len(self.players)):,}** 🪙 ahora, comisión {FIGHTER_TOURNAMENT_RAKE_PERCENT}%)")
 
     def roster_text(self):
         if not self.players:
@@ -4651,7 +4720,7 @@ class FighterTournamentView(discord.ui.View):
     def make_embed(self):
         embed = discord.Embed(title="🥊 Torneo de Luchadores — Inscripción Abierta", color=0xFF6B00)
         embed.description = (
-            f"🏆 El campeón gana **{FIGHTER_TOURNAMENT_PRIZE:,}** 🪙\n"
+            f"🏆 {self.prize_text()}\n"
             f"👥 Jugadores: {len(self.players)}/{self.MAX_PLAYERS}\n\n"
             f"**Participantes:**\n{self.roster_text()}\n\n"
             f"⏳ El torneo inicia en **90 segundos** o cuando haya {self.MAX_PLAYERS} jugadores.\n"
@@ -4675,6 +4744,13 @@ class FighterTournamentView(discord.ui.View):
         if not row:
             await interaction.response.send_message("❌ No tienes luchador. Compra uno con `,buyfighter`.", ephemeral=True)
             return
+        if self.entry_fee > 0:
+            balance = await get_balance(uid)
+            if balance < self.entry_fee:
+                await interaction.response.send_message(
+                    f"❌ La entrada cuesta **{self.entry_fee:,}** 🪙 y tienes **{balance:,}** 🪙.", ephemeral=True)
+                return
+            await update_balance(uid, -self.entry_fee)
         self.players.append((uid, interaction.user.display_name, row[0]))
         await interaction.response.edit_message(embed=self.make_embed(), view=self)
         if len(self.players) >= self.MAX_PLAYERS:
@@ -4696,8 +4772,13 @@ class FighterTournamentView(discord.ui.View):
         if len(players) < 2:
             embed = discord.Embed(title="❌ Torneo Cancelado", color=0xFF4444)
             embed.description = "No hubo suficientes participantes (mínimo 2)."
+            if self.entry_fee > 0 and players:
+                for p in players:
+                    await update_balance(p[0], self.entry_fee)
+                embed.description += "\n💸 Se devolvieron las entradas."
             await channel.send(embed=embed)
             return
+        prize = self.prize_for(len(players))
 
         embed = discord.Embed(title="🥊 ¡TORNEO DE LUCHADORES INICIADO!", color=0xFF6B00)
         names = "\n".join(f"• **{n}** ({FIGHTERS[fid]['name']})" for _, n, fid in players)
@@ -4744,14 +4825,14 @@ class FighterTournamentView(discord.ui.View):
             round_num += 1
 
         champion = players[0]
-        await update_balance(champion[0], FIGHTER_TOURNAMENT_PRIZE)
+        await update_balance(champion[0], prize)
         champ_bal = await get_balance(champion[0])
 
         embed = discord.Embed(title="🏆 ¡CAMPEÓN DEL TORNEO!", color=0xFFD700)
         embed.description = (
             f"👑 **<@{champion[0]}> es el campeón!**\n"
             f"Luchador: **{FIGHTERS[champion[2]]['name']}**\n\n"
-            f"💰 Premio: **{FIGHTER_TOURNAMENT_PRIZE:,}** 🪙\n"
+            f"💰 Premio: **{prize:,}** 🪙\n"
             f"💼 Saldo nuevo: **{champ_bal:,}** 🪙"
         )
         await channel.send(embed=embed)
@@ -5032,9 +5113,14 @@ async def addpuntos_slash(
 addpuntos_slash.autocomplete("stat")(stat_autocomplete)
 
 
-@tree.command(name="ftorneo", description="Crea un torneo de luchadores. El campeón gana 60 millones.")
-async def ftorneo_slash(interaction: discord.Interaction):
+@tree.command(name="ftorneo", description="Crea un torneo de luchadores (con apuesta de entrada opcional)")
+@app_commands.describe(apuesta="Entrada por jugador (acepta 5m, 500k). Sin apuesta, el campeón gana 60 millones")
+async def ftorneo_slash(interaction: discord.Interaction, apuesta: str = "0"):
     uid = str(interaction.user.id)
+    entry_fee = loan_parse_amount(apuesta)
+    if entry_fee is None or entry_fee < 0:
+        await interaction.response.send_message("❌ La apuesta debe ser un número válido (`5m`, `500k`...).", ephemeral=True)
+        return
     await interaction.response.defer()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT fighter_id FROM fighters WHERE user_id = ?", (uid,)) as cur:
@@ -5042,7 +5128,11 @@ async def ftorneo_slash(interaction: discord.Interaction):
     if not row:
         await interaction.followup.send("❌ Necesitas un luchador para organizar un torneo. Compra uno con `/buyfighter`.", ephemeral=True)
         return
-    view = FighterTournamentView(host_id=uid, host_name=interaction.user.display_name)
+    charge_error = await ftorneo_charge_host(uid, entry_fee)
+    if charge_error:
+        await interaction.followup.send(charge_error, ephemeral=True)
+        return
+    view = FighterTournamentView(host_id=uid, host_name=interaction.user.display_name, entry_fee=entry_fee)
     view.players.append((uid, interaction.user.display_name, row[0]))
     msg = await interaction.followup.send(embed=view.make_embed(), view=view)
     view.message = msg
@@ -6158,6 +6248,8 @@ async def on_message(message: discord.Message):
         return
     if await role_loan_handle_prefix(message, cmd, args):
         return
+    if await features_handle_prefix(message, cmd, args):
+        return
 
     # ,bal
     if cmd == "bal":
@@ -6198,7 +6290,7 @@ async def on_message(message: discord.Message):
     # ,collect
     elif cmd == "collect":
         await get_or_create_user(user_id, message.author.name)
-        owned_roles, ready_roles, waiting_roles, borrowed = await collect_available_role_earnings(user_id)
+        owned_roles, ready_roles, waiting_roles, borrowed, payouts, multiplier = await collect_available_role_earnings(user_id)
 
         if not owned_roles:
             embed = discord.Embed(title="❌ Sin Roles", color=0xFF4444)
@@ -6226,17 +6318,19 @@ async def on_message(message: discord.Message):
             await message.channel.send(embed=embed)
             return
 
-        total_bonus = sum(role_collect_payout(r, borrowed) for r in ready_roles)
+        total_bonus = sum(payouts[r] for r in ready_roles)
+
+        event_note = f" · 🎉 evento x{multiplier}" if multiplier > 1 else ""
         new_balance = await get_balance(user_id)
         embed = discord.Embed(title="💰 ¡Ganancias Recogidas!", color=0x00FF88)
         lines = "\n".join(
             f"{SHOP_ITEMS[r]['name']}{f' (prestado · {ROLE_LOAN_LENDER_PERCENT}% para su dueño)' if r in borrowed else ''} "
-            f"→ +**{role_collect_payout(r, borrowed):,}** 🪙"
+            f"→ +**{payouts[r]:,}** 🪙"
             for r in ready_roles
         )
         embed.description = (
             f"{lines}\n\n"
-            f"**Total:** +**{total_bonus:,}** 🪙\n"
+            f"**Total:** +**{total_bonus:,}** 🪙{event_note}\n"
             f"Saldo actual: **{new_balance:,}** 🪙"
         )
         if waiting_roles:
@@ -6512,145 +6606,9 @@ async def on_message(message: discord.Message):
         )
         await message.channel.send(embed=embed)
 
-    # ,work — gana monedas trabajando (cooldown 1h)
-    elif cmd == "work":
-        await get_or_create_user(user_id, message.author.name)
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT last_work FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-                last_work = row[0] if row else None
-
-        now = datetime.utcnow()
-        if last_work:
-            diff = now - datetime.fromisoformat(last_work)
-            if diff < timedelta(seconds=30):
-                remaining = timedelta(seconds=30) - diff
-                secs = int(remaining.total_seconds())
-                embed = discord.Embed(title="⏰ Aún estás trabajando", color=0xFF4444)
-                embed.description = f"Descansa **{secs}s** antes de volver a trabajar."
-                await message.channel.send(embed=embed)
-                return
-
-        earned = random.randint(1000, 100000)
-        trabajos = [
-            ("👨‍🍳 Cocinero", f"Preparaste platos toda la noche y ganaste **{earned:,}** 🪙."),
-            ("🚗 Taxista", f"Llevaste pasajeros por toda la ciudad y ganaste **{earned:,}** 🪙."),
-            ("💻 Programador", f"Terminaste un proyecto freelance y ganaste **{earned:,}** 🪙."),
-            ("🎸 Músico", f"Tocaste en una plaza y la gente aplaudió. Ganaste **{earned:,}** 🪙."),
-            ("📦 Repartidor", f"Repartiste 30 pedidos y ganaste **{earned:,}** 🪙."),
-            ("🧹 Limpiador", f"Limpiaste el casino de arriba a abajo. Ganaste **{earned:,}** 🪙."),
-        ]
-        titulo, desc = random.choice(trabajos)
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET balance = balance + ?, last_work = ? WHERE user_id = ?",
-                             (earned, now.isoformat(), user_id))
-            await db.commit()
-
-        new_bal = await get_balance(user_id)
-        embed = discord.Embed(title=f"💼 {titulo}", color=0x00FF88)
-        embed.description = f"{desc}\n\n👛 Saldo actual: **{new_bal:,}** 🪙"
-        await message.channel.send(embed=embed)
-
-    # ,slut — 60% ganar / 40% perder (cooldown 30min)
-    elif cmd == "slut":
-        await get_or_create_user(user_id, message.author.name)
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT last_slut FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-                last_slut = row[0] if row else None
-
-        now = datetime.utcnow()
-        if last_slut:
-            diff = now - datetime.fromisoformat(last_slut)
-            if diff < timedelta(seconds=30):
-                remaining = timedelta(seconds=30) - diff
-                secs = int(remaining.total_seconds())
-                embed = discord.Embed(title="⏰ Cooldown Activo", color=0xFF4444)
-                embed.description = f"Espera **{secs}s** para volver a intentarlo."
-                await message.channel.send(embed=embed)
-                return
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET last_slut = ? WHERE user_id = ?", (now.isoformat(), user_id))
-            await db.commit()
-
-        success = random.random() < 0.60
-        if success:
-            earned = random.randint(1000, 100000)
-            escenas = [
-                f"💋 Una noche rentable. Ganaste **{earned:,}** 🪙.",
-                f"💄 El cliente quedó satisfecho. Ganaste **{earned:,}** 🪙.",
-                f"🌹 Noche de buenas propinas. Ganaste **{earned:,}** 🪙.",
-            ]
-            await update_balance(user_id, earned)
-            new_bal = await get_balance(user_id)
-            embed = discord.Embed(title="💋 ¡Éxito!", color=0xFF69B4)
-            embed.description = f"{random.choice(escenas)}\n\n👛 Saldo: **{new_bal:,}** 🪙"
-        else:
-            lost = random.randint(1000, 100000)
-            bal = await get_balance(user_id)
-            lost = min(lost, bal)
-            await update_balance(user_id, -lost)
-            new_bal = await get_balance(user_id)
-            embed = discord.Embed(title="🚔 ¡Te Pillaron!", color=0xFF4444)
-            embed.description = (
-                f"La policía te arrestó. Multa: **{lost:,}** 🪙.\n\n"
-                f"👛 Saldo: **{new_bal:,}** 🪙"
-            )
-        await message.channel.send(embed=embed)
-
-    # ,crime — 60% ganar / 40% perder (cooldown 1h)
-    elif cmd == "crime":
-        await get_or_create_user(user_id, message.author.name)
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT last_crime FROM users WHERE user_id = ?", (user_id,)) as cursor:
-                row = await cursor.fetchone()
-                last_crime = row[0] if row else None
-
-        now = datetime.utcnow()
-        if last_crime:
-            diff = now - datetime.fromisoformat(last_crime)
-            if diff < timedelta(seconds=30):
-                remaining = timedelta(seconds=30) - diff
-                secs = int(remaining.total_seconds())
-                embed = discord.Embed(title="⏰ Cooldown Activo", color=0xFF4444)
-                embed.description = f"Espera **{secs}s** antes de cometer otro crimen."
-                await message.channel.send(embed=embed)
-                return
-
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET last_crime = ? WHERE user_id = ?", (now.isoformat(), user_id))
-            await db.commit()
-
-        success = random.random() < 0.60
-        if success:
-            earned = random.randint(1000, 100000)
-            crimenes = [
-                f"🏦 Asaltaste un banco pequeño y escapaste con **{earned:,}** 🪙.",
-                f"💎 Vendiste joyas robadas en el mercado negro. Ganaste **{earned:,}** 🪙.",
-                f"🎰 Hackeaste una slot machine. Ganaste **{earned:,}** 🪙.",
-                f"🚗 Robaste un auto de lujo y lo vendiste. Ganaste **{earned:,}** 🪙.",
-                f"📱 Estafaste a un coleccionista con NFTs falsos. Ganaste **{earned:,}** 🪙.",
-            ]
-            await update_balance(user_id, earned)
-            new_bal = await get_balance(user_id)
-            embed = discord.Embed(title="🦹 ¡Crimen Exitoso!", color=0x9B59B6)
-            embed.description = f"{random.choice(crimenes)}\n\n👛 Saldo: **{new_bal:,}** 🪙"
-        else:
-            lost = random.randint(1000, 100000)
-            bal = await get_balance(user_id)
-            lost = min(lost, bal)
-            await update_balance(user_id, -lost)
-            new_bal = await get_balance(user_id)
-            fracasos = [
-                f"🚔 La policía te atrapó en pleno acto. Multa: **{lost:,}** 🪙.",
-                f"😬 Tu cómplice te traicionó. Perdiste **{lost:,}** 🪙 en sobornos.",
-                f"🔒 Las cámaras te grabaron. Multa judicial: **{lost:,}** 🪙.",
-            ]
-            embed = discord.Embed(title="🚔 ¡Operación Fallida!", color=0xFF4444)
-            embed.description = f"{random.choice(fracasos)}\n\n👛 Saldo: **{new_bal:,}** 🪙"
-        await message.channel.send(embed=embed)
+    # ,work / ,slut / ,crime — los valores se configuran desde el panel web
+    elif cmd in ("work", "slut", "crime"):
+        await message.channel.send(embed=await run_income_command(cmd, user_id, message.author.name))
 
     # ,rob @usuario
     elif cmd == "rob":
@@ -6679,8 +6637,8 @@ async def on_message(message: discord.Message):
         now = datetime.utcnow()
         if last_rob:
             diff = now - datetime.fromisoformat(last_rob)
-            if diff < timedelta(hours=1):
-                remaining = timedelta(hours=1) - diff
+            if diff < timedelta(minutes=ROB_COOLDOWN_MINUTES):
+                remaining = timedelta(minutes=ROB_COOLDOWN_MINUTES) - diff
                 mins = int(remaining.total_seconds() // 60)
                 secs = int(remaining.total_seconds() % 60)
                 embed = discord.Embed(title="⏰ Cooldown Activo", color=0xFF4444)
@@ -6716,13 +6674,14 @@ async def on_message(message: discord.Message):
                 await message.channel.send(embed=embed)
                 return
 
-        success = random.random() < 0.40
+        success = random.random() < ROB_SUCCESS_CHANCE / 100
         if success:
-            pct = random.uniform(0.10, 0.40)
+            pct = random.uniform(ROB_STEAL_MIN_PCT / 100, ROB_STEAL_MAX_PCT / 100)
             stolen = max(1, int(victim_balance * pct))
             stolen = min(stolen, victim_balance)
             await update_balance(victim_id, -stolen)
             await update_balance(user_id, stolen)
+            await track_mission(user_id, "rob_success")
             robber_balance = await get_balance(user_id)
             embed = discord.Embed(title="🦹 ¡Robo Exitoso!", color=0x00FF88)
             embed.description = (
@@ -6730,15 +6689,17 @@ async def on_message(message: discord.Message):
                 f"Tu saldo: **{robber_balance:,}** 🪙"
             )
         else:
-            fine = max(1, int(victim_balance * 0.10))
+            fine = max(1, int(victim_balance * ROB_FINE_PCT / 100))
             robber_balance = await get_balance(user_id)
             fine = min(fine, robber_balance)
             await update_balance(user_id, -fine)
+            jail_minutes = await jail_send(user_id)
             embed = discord.Embed(title="🚔 ¡Te Atraparon!", color=0xFF4444)
             embed.description = (
                 f"Intentaste robar a **{target.mention}** pero te atraparon.\n"
                 f"Multa: **{fine:,}** 🪙\n\n"
-                f"Tu saldo: **{robber_balance - fine:,}** 🪙"
+                f"Tu saldo: **{robber_balance - fine:,}** 🪙\n\n"
+                f"🔒 **Vas a la cárcel {jail_minutes} min.** No podrás robar ni apostar. Sal antes con `,fianza`."
             )
         await message.channel.send(embed=embed)
 
@@ -6913,33 +6874,18 @@ async def on_message(message: discord.Message):
         if not message.author.guild_permissions.administrator:
             await message.channel.send("❌ Solo los administradores pueden usar este comando.")
             return
-        if len(args) < 2:
-            await message.channel.send("❌ Uso: `,removemoney <@usuario> <cantidad>`")
-            return
         target = message.mentions[0] if message.mentions else None
-        if not target:
-            await message.channel.send("❌ Debes mencionar a un usuario. Ej: `,removemoney @usuario 50000`")
+        amount_args = [a for a in args if not re.fullmatch(r"<@!?\d+>", a)]
+        if not target or not amount_args:
+            await message.channel.send("❌ Uso: `,removemoney @usuario <cantidad|all> [banco]` — ej: `,removemoney @Juan all`")
             return
-        try:
-            amount = int(args[1].replace(",", "").replace(".", ""))
-        except ValueError:
-            await message.channel.send("❌ La cantidad debe ser un número entero.")
-            return
-        if amount <= 0:
-            await message.channel.send("❌ La cantidad debe ser mayor a 0.")
-            return
-        await get_or_create_user(str(target.id), target.name)
-        cur_bal = await get_balance(str(target.id))
-        deduct = min(amount, cur_bal)
-        await update_balance(str(target.id), -deduct)
-        new_bal = await get_balance(str(target.id))
-        embed = discord.Embed(title="💸 Dinero Eliminado", color=0xFF4444)
-        embed.description = (
-            f"✅ Se eliminaron **{deduct:,}** 🪙 de {target.mention}\n"
-            f"📊 Nuevo saldo: **{new_bal:,}** 🪙\n\n"
-            f"_Por: {message.author.display_name}_"
-        )
-        await message.channel.send(embed=embed)
+        include_bank = any(a.lower() in ("banco", "bank") for a in amount_args[1:])
+        result = await perform_removemoney(target, amount_args[0], include_bank)
+        if isinstance(result, str):
+            await message.channel.send(result)
+        else:
+            result.set_footer(text=f"Por: {message.author.display_name}")
+            await message.channel.send(embed=result)
 
     # ,fighters — lista luchadores disponibles
     elif cmd == "fighters":
@@ -7178,7 +7124,15 @@ async def on_message(message: discord.Message):
         if not row:
             await message.channel.send("❌ Necesitas un luchador para organizar un torneo. Compra uno con `,buyfighter`.")
             return
-        view = FighterTournamentView(host_id=user_id, host_name=message.author.display_name)
+        entry_fee = loan_parse_amount(args[0]) if args else 0
+        if entry_fee is None or entry_fee < 0:
+            await message.channel.send("❌ Uso: `,ftorneo [apuesta de entrada]` — ej: `,ftorneo 5m`")
+            return
+        charge_error = await ftorneo_charge_host(user_id, entry_fee)
+        if charge_error:
+            await message.channel.send(charge_error)
+            return
+        view = FighterTournamentView(host_id=user_id, host_name=message.author.display_name, entry_fee=entry_fee)
         view.players.append((user_id, message.author.display_name, row[0]))
         sent = await message.channel.send(embed=view.make_embed(), view=view)
         view.message = sent
@@ -8387,8 +8341,7 @@ async def loan_create(user_id: str, username: str, amount: int) -> discord.Embed
                 await db.rollback()
                 return _loan_err("Ya tienes una deuda", "Termina de pagar tu préstamo actual antes de pedir otro. Mira `/debt`.")
             async with db.execute(
-                "SELECT COALESCE(balance, 0) FROM users WHERE user_id = ?",
-                (user_id,),
+                "SELECT COALESCE(balance, 0) FROM users WHERE user_id = ?", (user_id,)
             ) as cur:
                 wallet_row = await cur.fetchone()
             wallet = wallet_row[0] if wallet_row else 0
@@ -8690,15 +8643,563 @@ async def payloan_command(interaction: discord.Interaction, cantidad: _LoanOptio
 
 
 # =====================================================================
-#  PRESTAR ROLES: presta un rol de tu inventario por X dias.
-#  El prestatario cobra el rol con /collect y el 50% va para el dueño.
-#  Al vencer, el bot le quita el rol automaticamente.
-#  Comando: /prestar  (prefijo: ,prestar @usuario <rol> <dias>)
+#  EXTRAS V2: prestamos/mercado de roles, carcel, logros, /top semanal,
+#  clanes, evento de doble collect y mines.
+#  Todos los numeros que puedes querer cambiar estan aqui arriba.
 # =====================================================================
-ROLE_LOAN_MAX_DAYS = 30           # maximo de dias que se puede prestar un rol
+# ----- roles prestados / mercado de roles
+ROLE_LOAN_MAX_DAYS = 30           # maximo de dias que se puede prestar o alquilar un rol
 ROLE_LOAN_CHECK_SECONDS = 30      # cada cuanto revisa el bot si hay prestamos vencidos
+ROLE_MARKET_FEE_PERCENT = 5       # comision del bot en ventas/alquileres del mercado de roles
+
+# ----- carcel (cuando te atrapan robando)
+JAIL_BASE_MINUTES = 10            # minutos de carcel la primera vez
+JAIL_EXTRA_MINUTES_PER_STRIKE = 5 # minutos extra por cada captura seguida
+JAIL_MAX_MINUTES = 60
+JAIL_STRIKE_RESET_HOURS = 24      # sin caer en este tiempo, el contador de reincidencia se reinicia
+JAIL_BAIL_PER_MINUTE = 5_000_000  # fianza = minutos que faltan x esto
+JAIL_BLOCKED_COMMANDS = {         # comandos slash bloqueados mientras estas preso
+    "rob", "slots", "roulette", "ruleta-en-vivo", "blackjack", "crash", "mines",
+    "coinflip", "duel", "bet", "fight", "ftorneo",
+}
+JAIL_BLOCKED_PREFIX = {           # lo mismo para los comandos con coma
+    "rob", "slots", "slot", "tragamonedas", "roulette", "blackjack", "bj", "crash", "mines",
+    "coinflip", "cf", "duel", "bet", "fight", "ftorneo", "lroulette", "liveroulette", "ruleta",
+}
+
+# ----- ranking semanal (se reinicia cada lunes 00:00 UTC)
+WEEKLY_PRIZES = (300_000_000, 150_000_000, 75_000_000)   # premios 1º, 2º y 3º
+WEEKLY_CHECK_SECONDS = 60
+
+# ----- clanes
+CLAN_CREATE_COST = 50_000_000
+CLAN_MAX_MEMBERS = 10
+CLAN_NAME_RE = re.compile(r"[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ _\-]{3,20}")
+CLAN_MISSIONS = {                 # misiones semanales del clan; el premio va al banco del clan
+    "jugadas":  {"name": "🎲 Apostadores",        "key": "plays",       "goal": 150, "reward": 300_000_000,
+                 "desc": "Jueguen 150 partidas entre todos (slots, ruleta, crash, mines)"},
+    "robos":    {"name": "🦹 Banda de ladrones",  "key": "rob_success", "goal": 10,  "reward": 200_000_000,
+                 "desc": "Consigan 10 robos exitosos entre todos"},
+    "collects": {"name": "💰 Cobradores",         "key": "collect",     "goal": 30,  "reward": 500_000_000,
+                 "desc": "Cobren 30 roles con /collect entre todos"},
+    "diarias":  {"name": "🎁 Constantes",         "key": "daily_used",  "goal": 20,  "reward": 150_000_000,
+                 "desc": "Reclamen 20 recompensas diarias entre todos"},
+}
+
+# ----- evento de doble collect
+WEEKEND_DOUBLE_COLLECT = True     # sabados y domingos (UTC) los roles pagan doble
+COLLECT_EVENT_MULTIPLIER = 2
+
+# ----- mines
+MINES_TILES = 20                  # 4 filas x 5 columnas
+MINES_MAX = 10
+MINES_PAYOUT_FACTOR = 0.96        # 4% de ventaja de la casa
+
+ALL_WORDS = ("all", "todo", "todos", "max")
 
 
+# ------------------------------------------------------------------ utilidades
+def _fmt_dur(seconds) -> str:
+    seconds = max(0, int(seconds))
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    parts = []
+    if d:
+        parts.append(f"{d}d")
+    if h or d:
+        parts.append(f"{h}h")
+    parts.append(f"{m}m")
+    return " ".join(parts)
+
+
+def _bar(current: int, goal: int, width: int = 10) -> str:
+    filled = int(width * min(current, goal) / goal) if goal else width
+    return "█" * filled + "░" * (width - filled)
+
+
+def week_key(dt: datetime | None = None) -> str:
+    """Lunes (UTC) de la semana de dt, como texto YYYY-MM-DD."""
+    dt = dt or datetime.utcnow()
+    return (dt - timedelta(days=dt.weekday())).date().isoformat()
+
+
+def next_week_start(dt: datetime | None = None) -> datetime:
+    dt = dt or datetime.utcnow()
+    monday = datetime.fromisoformat(week_key(dt))
+    return monday + timedelta(days=7)
+
+
+def parse_amount_or_all(text, available: int) -> int | None:
+    t = str(text).strip().lower()
+    if t in ALL_WORDS:
+        return available
+    return loan_parse_amount(t)
+
+
+def _err_embed(title: str, message: str) -> discord.Embed:
+    return discord.Embed(title=f"❌ {title}", description=message, color=0xFF4444)
+
+
+async def setting_get(key: str, default: str | None = None) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT value FROM bot_settings WHERE key=?", (key,)) as cur:
+            row = await cur.fetchone()
+    return row[0] if row else default
+
+
+async def setting_set(key: str, value: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+        await db.commit()
+
+
+async def setting_del(key: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM bot_settings WHERE key=?", (key,))
+        await db.commit()
+
+
+async def init_extras_tables():
+    async with aiosqlite.connect(DB_PATH) as db:
+        statements = (
+            "CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT)",
+            """CREATE TABLE IF NOT EXISTS jail (
+                user_id TEXT PRIMARY KEY, until TEXT NOT NULL,
+                strikes INTEGER NOT NULL DEFAULT 1, last_strike TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS user_stats (
+                user_id TEXT NOT NULL, stat TEXT NOT NULL, value INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, stat))""",
+            """CREATE TABLE IF NOT EXISTS achievements (
+                user_id TEXT NOT NULL, key TEXT NOT NULL, unlocked_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, key))""",
+            """CREATE TABLE IF NOT EXISTS weekly_snapshot (
+                week_key TEXT NOT NULL, user_id TEXT NOT NULL, networth INTEGER NOT NULL,
+                PRIMARY KEY (week_key, user_id))""",
+            """CREATE TABLE IF NOT EXISTS clans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                owner_id TEXT NOT NULL, bank INTEGER NOT NULL DEFAULT 0,
+                open INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS clan_members (
+                user_id TEXT PRIMARY KEY, clan_id INTEGER NOT NULL, joined_at TEXT NOT NULL)""",
+            """CREATE TABLE IF NOT EXISTS clan_invites (
+                clan_id INTEGER NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (clan_id, user_id))""",
+            """CREATE TABLE IF NOT EXISTS clan_missions (
+                clan_id INTEGER NOT NULL, week_key TEXT NOT NULL, mission_key TEXT NOT NULL,
+                progress INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (clan_id, week_key, mission_key))""",
+            """CREATE TABLE IF NOT EXISTS role_listings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id TEXT NOT NULL, item_id TEXT NOT NULL,
+                mode TEXT NOT NULL, price INTEGER NOT NULL, days INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL, UNIQUE (seller_id, item_id))""",
+        )
+        for sql in statements:
+            await db.execute(sql)
+        await db.commit()
+
+
+# ------------------------------------------------------------------ avisos al usuario
+_last_channel: dict = {}   # user_id -> ultimo canal donde uso el bot (para avisar logros)
+
+
+async def _dm_user(user_id: str, text: str, embed: discord.Embed | None = None):
+    try:
+        user = client.get_user(int(user_id)) or await client.fetch_user(int(user_id))
+        await user.send(text, embed=embed)
+    except (discord.HTTPException, ValueError):
+        pass  # DMs cerrados o usuario inexistente
+
+
+async def _notify_user(user_id: str, text: str, embed: discord.Embed | None = None):
+    channel = _last_channel.get(user_id)
+    if channel is not None:
+        try:
+            await channel.send(text, embed=embed)
+            return
+        except (discord.HTTPException, AttributeError):
+            pass
+    await _dm_user(user_id, text, embed)
+
+
+# ------------------------------------------------------------------ estadisticas y logros
+ACHIEVEMENTS = {
+    "primer_millon":  {"name": "💵 Primer millón",        "desc": "Junta 1,000,000 🪙 entre cartera y banco",   "kind": "wealth", "goal": 1_000_000,         "reward": 500_000},
+    "mil_millones":   {"name": "💰 Mil millones",         "desc": "Junta 1,000,000,000 🪙",                     "kind": "wealth", "goal": 1_000_000_000,     "reward": 50_000_000},
+    "billonario":     {"name": "🏦 Billonario",           "desc": "Junta 1,000,000,000,000 🪙",                 "kind": "wealth", "goal": 1_000_000_000_000, "reward": 500_000_000},
+    "primer_robo":    {"name": "🦹 Primer golpe",         "desc": "Consigue tu primer robo exitoso",            "kind": "stat", "stat": "rob_success", "goal": 1,   "reward": 100_000},
+    "ladron_10":      {"name": "🥷 Ladrón de guante blanco", "desc": "10 robos exitosos",                       "kind": "stat", "stat": "rob_success", "goal": 10,  "reward": 5_000_000},
+    "ladron_50":      {"name": "😈 Maestro del hurto",    "desc": "50 robos exitosos",                          "kind": "stat", "stat": "rob_success", "goal": 50,  "reward": 50_000_000},
+    "primera_carcel": {"name": "🔒 Primera celda",        "desc": "Que te atrapen robando por primera vez",     "kind": "stat", "stat": "jailed", "goal": 1,        "reward": 0},
+    "reincidente":    {"name": "⛓️ Reincidente",          "desc": "Ve a la cárcel 10 veces",                    "kind": "stat", "stat": "jailed", "goal": 10,       "reward": 1_000_000},
+    "cobrador_1":     {"name": "🪙 Primer cobro",         "desc": "Cobra un rol con /collect",                  "kind": "stat", "stat": "collect", "goal": 1,       "reward": 1_000_000},
+    "cobrador_25":    {"name": "📈 Cobrador constante",   "desc": "25 cobros de roles",                         "kind": "stat", "stat": "collect", "goal": 25,      "reward": 25_000_000},
+    "cobrador_100":   {"name": "🏭 Máquina de dinero",    "desc": "100 cobros de roles",                        "kind": "stat", "stat": "collect", "goal": 100,     "reward": 100_000_000},
+    "diario_7":       {"name": "📅 Una semana seguida",   "desc": "Reclama 7 recompensas diarias",              "kind": "stat", "stat": "daily_used", "goal": 7,    "reward": 5_000_000},
+    "apostador_100":  {"name": "🎲 Apostador",            "desc": "Juega 100 partidas (slots, ruleta, crash, mines)", "kind": "stat", "stat": "plays", "goal": 100,  "reward": 10_000_000},
+    "apostador_1000": {"name": "🎰 Leyenda del casino",   "desc": "Juega 1,000 partidas",                       "kind": "stat", "stat": "plays", "goal": 1000, "reward": 100_000_000},
+    "buscaminas_10":  {"name": "💎 Buscador de diamantes","desc": "Retírate con ganancias en mines 10 veces",   "kind": "stat", "stat": "mines_cashout", "goal": 10, "reward": 10_000_000},
+    "blackjack_10":   {"name": "🃏 Rey del blackjack",    "desc": "Gana 10 manos de blackjack",                 "kind": "stat", "stat": "blackjack_won", "goal": 10, "reward": 10_000_000},
+    "con_rango":      {"name": "👑 Con rango",            "desc": "Ten algún rol de la tienda",                 "kind": "role_any", "goal": 1,                    "reward": 5_000_000},
+    "rey_obsidiana":  {"name": "⚫ Rey Obsidiana",        "desc": "Ten el rol Obsidiana",                       "kind": "role", "item": "obsidiana", "goal": 1,   "reward": 250_000_000},
+    "generoso":       {"name": "🤝 Generoso",             "desc": "Presta un rol a otro jugador",               "kind": "stat", "stat": "roles_lent", "goal": 1,    "reward": 1_000_000},
+    "empresario":     {"name": "🏪 Empresario",           "desc": "Vende o alquila un rol en el mercado",       "kind": "stat", "stat": "roles_market", "goal": 1,  "reward": 5_000_000},
+    "clanero":        {"name": "🛡️ Clanero",              "desc": "Únete o crea un clan",                       "kind": "clan", "goal": 1,                        "reward": 1_000_000},
+    "luchador":       {"name": "🥊 Luchador",             "desc": "Consigue un luchador",                       "kind": "fighter", "goal": 1,                     "reward": 500_000},
+}
+
+
+async def stat_inc(user_id: str, stat: str, n: int = 1):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO user_stats (user_id, stat, value) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id, stat) DO UPDATE SET value = value + excluded.value",
+            (user_id, stat, n),
+        )
+        await db.commit()
+
+
+async def _achievement_context(user_id: str) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT balance + COALESCE(bank, 0) FROM users WHERE user_id=?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        wealth = row[0] if row else 0
+        async with db.execute("SELECT stat, value FROM user_stats WHERE user_id=?", (user_id,)) as cur:
+            stats = dict(await cur.fetchall())
+        async with db.execute(
+            "SELECT item_id FROM inventory WHERE user_id=? AND quantity > 0", (user_id,)
+        ) as cur:
+            roles = {r[0] for r in await cur.fetchall() if r[0] in ROLE_ITEMS}
+        async with db.execute("SELECT 1 FROM clan_members WHERE user_id=?", (user_id,)) as cur:
+            in_clan = await cur.fetchone() is not None
+        async with db.execute("SELECT 1 FROM fighters WHERE user_id=?", (user_id,)) as cur:
+            has_fighter = await cur.fetchone() is not None
+    return {"wealth": wealth, "stats": stats, "roles": roles, "clan": in_clan, "fighter": has_fighter}
+
+
+def _achievement_progress(a: dict, ctx: dict) -> tuple[int, int]:
+    kind, goal = a["kind"], a["goal"]
+    if kind == "wealth":
+        return ctx["wealth"], goal
+    if kind == "stat":
+        return ctx["stats"].get(a["stat"], 0), goal
+    if kind == "role_any":
+        return (1 if ctx["roles"] else 0), goal
+    if kind == "role":
+        return (1 if a["item"] in ctx["roles"] else 0), goal
+    if kind == "clan":
+        return (1 if ctx["clan"] else 0), goal
+    if kind == "fighter":
+        return (1 if ctx["fighter"] else 0), goal
+    return 0, goal
+
+
+async def achievements_check(user_id: str) -> list[str]:
+    """Desbloquea (y paga) los logros que ya cumple. Devuelve los nuevos."""
+    ctx = await _achievement_context(user_id)
+    new_keys: list[str] = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT key FROM achievements WHERE user_id=?", (user_id,)) as cur:
+            unlocked = {r[0] for r in await cur.fetchall()}
+        for key, a in ACHIEVEMENTS.items():
+            if key in unlocked:
+                continue
+            current, goal = _achievement_progress(a, ctx)
+            if current < goal:
+                continue
+            cur = await db.execute(
+                "INSERT OR IGNORE INTO achievements (user_id, key, unlocked_at) VALUES (?, ?, ?)",
+                (user_id, key, datetime.utcnow().isoformat()),
+            )
+            if cur.rowcount == 1:
+                new_keys.append(key)
+                if a["reward"]:
+                    await db.execute(
+                        "UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?",
+                        (a["reward"], MAX_BALANCE, user_id),
+                    )
+        await db.commit()
+    if new_keys:
+        asyncio.create_task(_announce_achievements(user_id, new_keys))
+    return new_keys
+
+
+async def _announce_achievements(user_id: str, keys: list[str]):
+    await asyncio.sleep(2)  # que salga despues de la respuesta del comando
+    lines = []
+    for key in keys:
+        a = ACHIEVEMENTS[key]
+        reward = f" · **+{a['reward']:,}** 🪙" if a["reward"] else ""
+        lines.append(f"{a['name']} — {a['desc']}{reward}")
+    await _notify_user(user_id, f"<@{user_id}> 🏅 **¡Logro desbloqueado!**\n" + "\n".join(lines))
+
+
+_PLAY_ACTIONS = {"slots_played", "roulette_played", "crash_played", "mines_played"}
+
+
+async def feature_hook(user_id: str, action: str, n: int = 1):
+    """Alimenta logros y misiones de clan. Nunca debe romper un comando."""
+    try:
+        await stat_inc(user_id, action, n)
+        clan_key = action
+        if action in _PLAY_ACTIONS:
+            await stat_inc(user_id, "plays", n)
+            clan_key = "plays"
+        await clan_progress(user_id, clan_key, n)
+        await achievements_check(user_id)
+    except Exception as exc:
+        print(f"Error en feature_hook({action}): {exc}")
+
+
+def build_achievements_embed(name: str, ctx: dict, unlocked: set[str]) -> discord.Embed:
+    embed = discord.Embed(title=f"🏅 Logros de {name}", color=0xF1C40F)
+    done = [k for k in ACHIEVEMENTS if k in unlocked]
+    todo = [k for k in ACHIEVEMENTS if k not in unlocked]
+    embed.description = f"Desbloqueados: **{len(done)}/{len(ACHIEVEMENTS)}**"
+    if done:
+        embed.add_field(
+            name="✅ Insignias",
+            value="\n".join(f"{ACHIEVEMENTS[k]['name']} — {ACHIEVEMENTS[k]['desc']}" for k in done)[:1024],
+            inline=False,
+        )
+    if todo:
+        lines = []
+        for k in todo:
+            cur, goal = _achievement_progress(ACHIEVEMENTS[k], ctx)
+            lines.append(
+                f"{ACHIEVEMENTS[k]['name']} — {ACHIEVEMENTS[k]['desc']}\n"
+                f"`[{_bar(cur, goal)}]` {min(cur, goal):,}/{goal:,}"
+            )
+        chunk, size, part = [], 0, 1
+        for line in lines:
+            if size + len(line) + 2 > 1000:
+                embed.add_field(name="🔒 Pendientes" if part == 1 else "🔒 Pendientes (cont.)",
+                                value="\n\n".join(chunk), inline=False)
+                chunk, size, part = [], 0, part + 1
+            chunk.append(line)
+            size += len(line) + 2
+        if chunk:
+            embed.add_field(name="🔒 Pendientes" if part == 1 else "🔒 Pendientes (cont.)",
+                            value="\n\n".join(chunk), inline=False)
+    return embed
+
+
+async def logros_embed_for(user_id: str, username: str) -> discord.Embed:
+    await get_or_create_user(user_id, username)
+    await achievements_check(user_id)
+    ctx = await _achievement_context(user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT key FROM achievements WHERE user_id=?", (user_id,)) as cur:
+            unlocked = {r[0] for r in await cur.fetchall()}
+    return build_achievements_embed(username, ctx, unlocked)
+
+
+@tree.command(name="logros", description="Mira tus insignias y tu progreso (o el de otro jugador)")
+@app_commands.describe(usuario="Jugador a consultar (opcional)")
+async def logros_command(interaction: discord.Interaction, usuario: _LoanOptional[discord.Member] = None):
+    target = usuario or interaction.user
+    await interaction.response.defer()
+    embed = await logros_embed_for(str(target.id), target.display_name)
+    await interaction.followup.send(embed=embed)
+
+
+# ------------------------------------------------------------------ carcel
+async def jail_remaining(user_id: str) -> timedelta | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT until FROM jail WHERE user_id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    try:
+        remaining = datetime.fromisoformat(row[0]) - datetime.utcnow()
+    except ValueError:
+        return None
+    return remaining if remaining.total_seconds() > 0 else None
+
+
+async def jail_send(user_id: str) -> int:
+    """Manda al usuario a la carcel. Devuelve los minutos que le tocan."""
+    now = datetime.utcnow()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT strikes, last_strike FROM jail WHERE user_id=?", (user_id,)) as cur:
+            row = await cur.fetchone()
+        strikes = 1
+        if row:
+            try:
+                if now - datetime.fromisoformat(row[1]) < timedelta(hours=JAIL_STRIKE_RESET_HOURS):
+                    strikes = row[0] + 1
+            except ValueError:
+                pass
+        minutes = min(JAIL_BASE_MINUTES + JAIL_EXTRA_MINUTES_PER_STRIKE * (strikes - 1), JAIL_MAX_MINUTES)
+        until = now + timedelta(minutes=minutes)
+        await db.execute(
+            "INSERT INTO jail (user_id, until, strikes, last_strike) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET until=excluded.until, strikes=excluded.strikes, "
+            "last_strike=excluded.last_strike",
+            (user_id, until.isoformat(), strikes, now.isoformat()),
+        )
+        await db.commit()
+    await feature_hook(user_id, "jailed")
+    return minutes
+
+
+def jail_embed(remaining: timedelta) -> discord.Embed:
+    minutes = max(1, _loan_math.ceil(remaining.total_seconds() / 60))
+    embed = discord.Embed(title="🔒 Estás en la cárcel", color=0xFF4444)
+    embed.description = (
+        f"No puedes robar ni jugar apuestas durante **{_fmt_dur(remaining.total_seconds())}**.\n"
+        f"💸 Fianza para salir ya: **{minutes * JAIL_BAIL_PER_MINUTE:,}** 🪙 → `/fianza`"
+    )
+    return embed
+
+
+async def jail_pay_bail(user_id: str, username: str) -> discord.Embed:
+    await get_or_create_user(user_id, username)
+    remaining = await jail_remaining(user_id)
+    if remaining is None:
+        return discord.Embed(title="✅ Estás libre", description="No estás en la cárcel.", color=0x00FF88)
+    minutes = max(1, _loan_math.ceil(remaining.total_seconds() / 60))
+    cost = minutes * JAIL_BAIL_PER_MINUTE
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (cost, user_id, cost)
+        )
+        if cur.rowcount == 0:
+            await db.rollback()
+            balance = await get_balance(user_id)
+            return _err_embed("Fianza insuficiente",
+                              f"La fianza cuesta **{cost:,}** 🪙 y tienes **{balance:,}** 🪙.")
+        await db.execute("UPDATE jail SET until=? WHERE user_id=?", (datetime.utcnow().isoformat(), user_id))
+        await db.commit()
+    return discord.Embed(title="🔓 Fianza pagada",
+                         description=f"Pagaste **{cost:,}** 🪙 y quedaste libre. ¡Pórtate bien!", color=0x00FF88)
+
+
+async def _jail_interaction_check(interaction: discord.Interaction) -> bool:
+    try:
+        _last_channel[str(interaction.user.id)] = interaction.channel
+        if interaction.type is discord.InteractionType.application_command:
+            name = (interaction.data or {}).get("name")
+            if name in JAIL_BLOCKED_COMMANDS:
+                remaining = await jail_remaining(str(interaction.user.id))
+                if remaining is not None:
+                    await interaction.response.send_message(embed=jail_embed(remaining), ephemeral=True)
+                    return False
+    except Exception as exc:
+        print(f"Error en el chequeo de carcel: {exc}")
+    return True
+
+
+tree.interaction_check = _jail_interaction_check
+
+
+async def jail_block_prefix(message: discord.Message, cmd: str) -> bool:
+    if cmd not in JAIL_BLOCKED_PREFIX:
+        return False
+    remaining = await jail_remaining(str(message.author.id))
+    if remaining is None:
+        return False
+    await message.channel.send(embed=jail_embed(remaining))
+    return True
+
+
+@tree.command(name="fianza", description="Paga la fianza para salir de la cárcel antes de tiempo")
+async def fianza_command(interaction: discord.Interaction):
+    embed = await jail_pay_bail(str(interaction.user.id), interaction.user.name)
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="carcel", description="Mira cuánto te falta en la cárcel (o a otro jugador)")
+@app_commands.describe(usuario="Jugador a consultar (opcional)")
+async def carcel_command(interaction: discord.Interaction, usuario: _LoanOptional[discord.Member] = None):
+    target = usuario or interaction.user
+    remaining = await jail_remaining(str(target.id))
+    if remaining is None:
+        await interaction.response.send_message(f"✅ **{target.display_name}** no está en la cárcel.", ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=jail_embed(remaining), ephemeral=True)
+
+
+# ------------------------------------------------------------------ evento: doble collect
+async def _collect_multiplier(db, now: datetime) -> int:
+    async with db.execute("SELECT value FROM bot_settings WHERE key='double_collect_until'") as cur:
+        row = await cur.fetchone()
+    if row:
+        try:
+            if now < datetime.fromisoformat(row[0]):
+                return COLLECT_EVENT_MULTIPLIER
+        except ValueError:
+            pass
+    if WEEKEND_DOUBLE_COLLECT and now.weekday() >= 5:
+        return COLLECT_EVENT_MULTIPLIER
+    return 1
+
+
+async def collect_event_info(now: datetime | None = None) -> tuple[int, str]:
+    """(multiplicador actual, texto de estado)."""
+    now = now or datetime.utcnow()
+    async with aiosqlite.connect(DB_PATH) as db:
+        mult = await _collect_multiplier(db, now)
+        async with db.execute("SELECT value FROM bot_settings WHERE key='double_collect_until'") as cur:
+            row = await cur.fetchone()
+    lines = []
+    if mult > 1:
+        lines.append(f"🎉 **¡Evento activo!** Los roles pagan **x{mult}** en `/collect`.")
+    else:
+        lines.append("😴 No hay ningún evento activo ahora mismo.")
+    if row:
+        try:
+            until = datetime.fromisoformat(row[0])
+            if until > now:
+                lines.append(f"⏳ Evento manual termina <t:{_loan_ts(until.isoformat())}:R>.")
+        except ValueError:
+            pass
+    if WEEKEND_DOUBLE_COLLECT:
+        if now.weekday() >= 5:
+            end = datetime.fromisoformat(week_key(now)) + timedelta(days=7)
+            lines.append(f"📅 Fin de semana de collect x{COLLECT_EVENT_MULTIPLIER}: termina <t:{_loan_ts(end.isoformat())}:R>.")
+        else:
+            start = datetime.fromisoformat(week_key(now)) + timedelta(days=5)
+            lines.append(f"📅 Próximo fin de semana x{COLLECT_EVENT_MULTIPLIER}: empieza <t:{_loan_ts(start.isoformat())}:R> (sábado 00:00 UTC).")
+    return mult, "\n".join(lines)
+
+
+@tree.command(name="evento", description="Mira si hay un evento de collect doble activo")
+async def evento_command(interaction: discord.Interaction):
+    mult, text = await collect_event_info()
+    embed = discord.Embed(title="🎉 Eventos del casino", description=text,
+                          color=0x00FF88 if mult > 1 else 0x95A5A6)
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="doblecollect", description="[ADMIN] Activa collect doble por unas horas (0 = terminar el evento)")
+@app_commands.describe(horas="Horas que dura el evento (0 para terminarlo)")
+@app_commands.default_permissions(administrator=True)
+async def doblecollect_command(interaction: discord.Interaction, horas: app_commands.Range[int, 0, 168]):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Solo los administradores pueden usar este comando.", ephemeral=True)
+        return
+    if horas == 0:
+        await setting_del("double_collect_until")
+        await interaction.response.send_message("✅ Evento manual de collect doble terminado.")
+        return
+    until = datetime.utcnow() + timedelta(hours=horas)
+    await setting_set("double_collect_until", until.isoformat())
+    await interaction.response.send_message(
+        f"🎉 **¡Collect x{COLLECT_EVENT_MULTIPLIER} activado!** Los roles pagan el doble hasta "
+        f"<t:{_loan_ts(until.isoformat())}:f> (<t:{_loan_ts(until.isoformat())}:R>)."
+    )
+
+
+# =====================================================================
+#  ROLES: prestar, devolver, mis prestamos y mercado de roles
+#  Comandos: /prestar  /devolver  /misprestamos  /rolmercado ...
+# =====================================================================
 async def init_role_loans_table():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -8716,11 +9217,44 @@ async def init_role_loans_table():
             )
             """
         )
+        for col, ddl in (
+            ("lender_percent", "INTEGER NOT NULL DEFAULT 50"),  # % de cada collect para el dueño
+            ("price", "INTEGER NOT NULL DEFAULT 0"),             # >0 = alquiler pagado
+            ("earned", "INTEGER NOT NULL DEFAULT 0"),            # lo que el dueño ya cobró
+        ):
+            try:
+                await db.execute(f"ALTER TABLE role_loans ADD COLUMN {col} {ddl}")
+            except Exception:
+                pass  # la columna ya existe
         await db.commit()
 
 
 def _role_loan_err(message: str) -> discord.Embed:
     return discord.Embed(title="❌ No se pudo prestar el rol", description=message, color=0xFF4444)
+
+
+async def _fetch_member(guild: discord.Guild, user_id: str) -> discord.Member | None:
+    member = guild.get_member(int(user_id))
+    if member is not None:
+        return member
+    try:
+        return await guild.fetch_member(int(user_id))
+    except (discord.NotFound, discord.HTTPException):
+        return None
+
+
+async def role_is_committed(user_id: str, item_id: str) -> bool:
+    """True si el rol esta prestado a otro o publicado en el mercado de roles."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM role_loans WHERE lender_id=? AND item_id=?", (user_id, item_id)
+        ) as cur:
+            if await cur.fetchone():
+                return True
+        async with db.execute(
+            "SELECT 1 FROM role_listings WHERE seller_id=? AND item_id=?", (user_id, item_id)
+        ) as cur:
+            return await cur.fetchone() is not None
 
 
 async def role_loan_create(
@@ -8729,7 +9263,11 @@ async def role_loan_create(
     borrower: discord.Member,
     item_id: str,
     days: int,
+    *,
+    price: int = 0,
+    lender_percent: int = ROLE_LOAN_LENDER_PERCENT,
 ) -> tuple[bool, discord.Embed]:
+    """Presta (price=0) o alquila (price>0) un rol. Devuelve (ok, embed)."""
     lender_id, borrower_id = str(lender.id), str(borrower.id)
     if borrower.bot:
         return False, _role_loan_err("No puedes prestarle un rol a un bot.")
@@ -8745,6 +9283,7 @@ async def role_loan_create(
     item = SHOP_ITEMS[item_id]
     now = datetime.utcnow()
     expires = now + timedelta(days=days)
+    fee = price * ROLE_MARKET_FEE_PERCENT // 100 if price > 0 else 0
 
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
@@ -8755,7 +9294,7 @@ async def role_loan_create(
                 row = await cur.fetchone()
             if not row or row[0] <= 0:
                 await db.rollback()
-                return False, _role_loan_err(f"No tienes **{item['name']}** en tu inventario.")
+                return False, _role_loan_err(f"{lender.mention} no tiene **{item['name']}** en su inventario.")
 
             async with db.execute(
                 "SELECT quantity FROM inventory WHERE user_id=? AND item_id=?", (borrower_id, item_id)
@@ -8773,68 +9312,117 @@ async def role_loan_create(
             if existing:
                 await db.rollback()
                 if existing[0] == lender_id:
-                    msg = f"Ya tienes prestado **{item['name']}**. Espera a que termine el préstamo."
+                    msg = f"**{item['name']}** ya está prestado. Espera a que termine el préstamo."
                 else:
                     msg = f"{borrower.mention} ya está usando **{item['name']}** prestado."
                 return False, _role_loan_err(msg)
 
+            if price > 0:
+                cur = await db.execute(
+                    "UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?",
+                    (price, borrower_id, price),
+                )
+                if cur.rowcount == 0:
+                    await db.rollback()
+                    return False, _role_loan_err(f"No tienes suficientes monedas: el alquiler cuesta **{price:,}** 🪙.")
+                await db.execute(
+                    "UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?",
+                    (price - fee, MAX_BALANCE, lender_id),
+                )
+
             await db.execute(
-                "INSERT INTO role_loans (guild_id, lender_id, borrower_id, item_id, expires_at, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (str(guild.id), lender_id, borrower_id, item_id, expires.isoformat(), now.isoformat()),
+                "INSERT INTO role_loans (guild_id, lender_id, borrower_id, item_id, expires_at, created_at, "
+                "lender_percent, price) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(guild.id), lender_id, borrower_id, item_id, expires.isoformat(), now.isoformat(),
+                 lender_percent, price),
             )
             await db.commit()
-        except aiosqlite.IntegrityError:
-            await db.rollback()
-            return False, _role_loan_err(
-                "Ese rol ya tiene un préstamo activo. Espera a que termine antes de prestarlo otra vez."
-            )
         except Exception:
             await db.rollback()
             raise
 
-    # Asigna el rol de Discord; si falla, se cancela el préstamo
+    # Asigna el rol de Discord; si falla, se cancela todo (y se devuelve el dinero)
     error = None
-    already_has_role = False
     try:
         _, already_has_role, error = await grant_shop_role(guild, borrower, item_id)
+        if already_has_role and not error:
+            error = (
+                f"{borrower.mention} ya tiene ese rol de Discord; no puedo prestarlo porque "
+                "el bot podría quitárselo cuando termine el préstamo o alquiler."
+            )
     except discord.Forbidden:
         error = "No tengo permiso para crear o asignar roles. Necesito **Gestionar roles**."
     except (discord.HTTPException, aiosqlite.Error):
         error = "Discord no pudo asignar el rol. Inténtalo de nuevo."
-    if already_has_role and not error:
-        error = (
-            f"{borrower.mention} ya tiene ese rol de Discord; no puedo prestarlo porque "
-            "el bot podría quitárselo al vencer el préstamo."
-        )
     if error:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("DELETE FROM role_loans WHERE lender_id=? AND item_id=?", (lender_id, item_id))
+            if price > 0:
+                await db.execute("UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?",
+                                 (price, MAX_BALANCE, borrower_id))
+                await db.execute("UPDATE users SET balance = MAX(balance - ?, 0) WHERE user_id=?",
+                                 (price - fee, lender_id))
             await db.commit()
         return False, _role_loan_err(error)
 
     bonus = item["collect_bonus"]
-    lender_share = bonus * ROLE_LOAN_LENDER_PERCENT // 100
+    lender_share = bonus * lender_percent // 100
     ts = _loan_ts(expires.isoformat())
-    embed = discord.Embed(title="🤝 Rol prestado", color=0x00FF88)
-    embed.description = (
-        f"{lender.mention} le prestó **{item['name']}** a {borrower.mention} "
-        f"por **{days}** día{'s' if days != 1 else ''}.\n\n"
-        f"💰 {borrower.mention} cobra **{bonus - lender_share:,}** 🪙 cada **{item['collect_hours']}h** con `/collect`.\n"
-        f"🏦 {lender.mention} recibe **{lender_share:,}** 🪙 ({ROLE_LOAN_LENDER_PERCENT}%) de cada collect.\n"
-        f"⏳ Termina <t:{ts}:R> (<t:{ts}:f>); el bot quitará el rol automáticamente.\n\n"
-        f"⚠️ Mientras dure el préstamo, {lender.mention} no puede cobrar ese rol con `/collect`."
-    )
+    day_word = f"día{'s' if days != 1 else ''}"
+    if price > 0:
+        embed = discord.Embed(title="🔑 Rol alquilado", color=0x00FF88)
+        embed.description = (
+            f"{borrower.mention} alquiló **{item['name']}** de {lender.mention} por **{days}** {day_word}.\n\n"
+            f"💸 Pagó **{price:,}** 🪙 (comisión del casino: {fee:,}).\n"
+            f"💰 Cobra **{bonus:,}** 🪙 cada **{item['collect_hours']}h** con `/collect` y se queda con todo.\n"
+            f"⏳ Termina <t:{ts}:R> (<t:{ts}:f>); el bot quitará el rol automáticamente.\n\n"
+            f"⚠️ Mientras dure el alquiler, {lender.mention} no puede cobrar ese rol."
+        )
+        await feature_hook(lender_id, "roles_market")
+    else:
+        embed = discord.Embed(title="🤝 Rol prestado", color=0x00FF88)
+        embed.description = (
+            f"{lender.mention} le prestó **{item['name']}** a {borrower.mention} por **{days}** {day_word}.\n\n"
+            f"💰 {borrower.mention} cobra **{bonus - lender_share:,}** 🪙 cada **{item['collect_hours']}h** con `/collect`.\n"
+            f"🏦 {lender.mention} recibe **{lender_share:,}** 🪙 ({lender_percent}%) de cada collect.\n"
+            f"⏳ Termina <t:{ts}:R> (<t:{ts}:f>); el bot quitará el rol automáticamente.\n"
+            f"↩️ Cualquiera de los dos puede terminarlo antes con `/devolver`.\n\n"
+            f"⚠️ Mientras dure el préstamo, {lender.mention} no puede cobrar ese rol con `/collect`."
+        )
+        await feature_hook(lender_id, "roles_lent")
     return True, embed
 
 
-# ------------------------------------------------------------------ vencimiento automatico
+# ------------------------------------------------------------------ quitar el rol / vencimiento
 async def _role_loan_dm(user_id: str, text: str):
+    await _dm_user(user_id, text)
+
+
+async def _remove_shop_role(guild_id: str, user_id: str, item_id: str, reason: str) -> bool:
+    """Quita el rol de Discord si el usuario ya no tiene el objeto. True = ok o nada que hacer."""
+    guild = client.get_guild(int(guild_id))
+    if guild is None:
+        return True
+    if await get_item_quantity(user_id, item_id) > 0:
+        return True  # lo compró mientras tanto: se queda con el rol
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT role_id FROM shop_guild_roles WHERE guild_id=? AND item_id=?", (guild_id, item_id)
+        ) as cur:
+            row = await cur.fetchone()
+    role = guild.get_role(int(row[0])) if row else None
+    if role is None:
+        return True
     try:
-        user = client.get_user(int(user_id)) or await client.fetch_user(int(user_id))
-        await user.send(text)
-    except (discord.HTTPException, ValueError):
-        pass  # DMs cerrados o usuario inexistente
+        member = guild.get_member(int(user_id)) or await guild.fetch_member(int(user_id))
+        if role in member.roles:
+            await member.remove_roles(role, reason=reason)
+    except discord.NotFound:
+        pass  # el usuario ya no está en el servidor
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        print(f"No pude quitar el rol {item_id} a {user_id} en {guild_id}: {exc}")
+        return False
+    return True
 
 
 async def expire_role_loans():
@@ -8853,51 +9441,14 @@ async def expire_role_loans():
             pass  # fecha corrupta: se limpia igual
 
         item_name = SHOP_ITEMS.get(item_id, {}).get("name", item_id)
-        removed_ok = True
-        guild = client.get_guild(int(guild_id))
-        if guild is None:
-            # Reintenta cuando el bot vuelva a poder acceder al servidor.
-            continue
-
-        # Si el prestatario compró el rol mientras tanto, se queda con el rol de Discord.
-        borrower_owns_role = await get_item_quantity(borrower_id, item_id) > 0
-        if not borrower_owns_role:
-            async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute(
-                    "SELECT role_id FROM shop_guild_roles WHERE guild_id=? AND item_id=?",
-                    (guild_id, item_id),
-                ) as cur:
-                    role_row = await cur.fetchone()
-            role = guild.get_role(int(role_row[0])) if role_row else None
-            if role is not None:
-                try:
-                    member = guild.get_member(int(borrower_id)) or await guild.fetch_member(int(borrower_id))
-                    if role in member.roles:
-                        await member.remove_roles(role, reason="Préstamo de rol terminado")
-                except discord.NotFound:
-                    pass  # el usuario ya no está en el servidor
-                except (discord.Forbidden, discord.HTTPException) as exc:
-                    removed_ok = False  # se reintenta en la próxima vuelta
-                    print(f"No pude quitar el rol prestado a {borrower_id} en {guild_id}: {exc}")
-
-        if not removed_ok:
-            continue
+        if not await _remove_shop_role(guild_id, borrower_id, item_id, "Préstamo de rol terminado"):
+            continue  # se reintenta en la próxima vuelta
 
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("DELETE FROM role_loans WHERE id=?", (loan_id,))
             await db.commit()
 
-        if borrower_owns_role:
-            borrower_message = (
-                f"⏰ Terminó tu préstamo de **{item_name}**. "
-                "Conservas el rol porque también lo tienes comprado."
-            )
-        else:
-            borrower_message = (
-                f"⏰ Terminó tu préstamo de **{item_name}**. "
-                "El rol prestado ya no está activo."
-            )
-        await _role_loan_dm(borrower_id, borrower_message)
+        await _role_loan_dm(borrower_id, f"⏰ Terminó tu préstamo de **{item_name}**; el rol fue retirado.")
         await _role_loan_dm(lender_id, f"✅ Tu **{item_name}** prestado terminó y ya puedes volver a cobrarlo con `/collect`.")
 
 
@@ -8911,7 +9462,44 @@ async def role_loan_loop():
         await asyncio.sleep(ROLE_LOAN_CHECK_SECONDS)
 
 
-# ------------------------------------------------------------------ comandos
+async def role_loan_end_early(loan_id: int, actor_id: str) -> tuple[bool, discord.Embed]:
+    """Devolver (prestatario) o cancelar (dueño) un prestamo antes de tiempo."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT guild_id, lender_id, borrower_id, item_id, lender_percent, price FROM role_loans WHERE id=?",
+            (loan_id,),
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return False, _err_embed("Préstamo no encontrado", "Ese préstamo ya terminó o no existe.")
+    guild_id, lender_id, borrower_id, item_id, lender_percent, price = row
+    if actor_id not in (lender_id, borrower_id):
+        return False, _err_embed("No es tuyo", "Solo el dueño o quien tiene el rol prestado puede terminarlo.")
+    is_rental = price > 0 and lender_percent == 0
+    if is_rental and actor_id == lender_id:
+        return False, _err_embed("Rol alquilado", "Ese rol fue alquilado y ya está pagado; solo el inquilino puede devolverlo.")
+    if not await _remove_shop_role(guild_id, borrower_id, item_id, "Préstamo de rol terminado antes de tiempo"):
+        return False, _err_embed("Discord falló", "No pude quitar el rol en este momento. Inténtalo de nuevo.")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM role_loans WHERE id=?", (loan_id,))
+        await db.commit()
+
+    item_name = SHOP_ITEMS.get(item_id, {}).get("name", item_id)
+    other_id = borrower_id if actor_id == lender_id else lender_id
+    if actor_id == borrower_id:
+        text = f"↩️ <@{borrower_id}> devolvió **{item_name}**; ya puedes volver a cobrarlo."
+        embed = discord.Embed(title="↩️ Rol devuelto", color=0x3498DB,
+                              description=f"Devolviste **{item_name}** antes de tiempo." +
+                                          (" (El alquiler no se reembolsa.)" if is_rental else ""))
+    else:
+        text = f"🛑 <@{lender_id}> canceló el préstamo de **{item_name}**; el rol fue retirado."
+        embed = discord.Embed(title="🛑 Préstamo cancelado", color=0x3498DB,
+                              description=f"Cancelaste el préstamo de **{item_name}**. Ya puedes cobrarlo de nuevo.")
+    await _role_loan_dm(other_id, text)
+    return True, embed
+
+
+# ------------------------------------------------------------------ /prestar
 async def prestar_role_autocomplete(interaction: discord.Interaction, current: str):
     t = _plain(current)
     uid = str(interaction.user.id)
@@ -8954,6 +9542,11 @@ async def prestar_command(
             ephemeral=True,
         )
         return
+    if await role_is_committed(str(interaction.user.id), item_id):
+        await interaction.response.send_message(
+            embed=_role_loan_err("Ese rol ya está prestado o publicado en el mercado de roles."), ephemeral=True
+        )
+        return
     await interaction.response.defer()
     ok, embed = await role_loan_create(interaction.guild, interaction.user, usuario, item_id, dias)
     if ok:
@@ -8965,6 +9558,490 @@ async def prestar_command(
 prestar_command.autocomplete("rol")(prestar_role_autocomplete)
 
 
+# ------------------------------------------------------------------ /devolver y /misprestamos
+async def loan_choice_autocomplete(interaction: discord.Interaction, current: str):
+    uid = str(interaction.user.id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT rl.id, rl.item_id, rl.lender_id, rl.borrower_id, rl.expires_at,
+                   COALESCE(lu.username, rl.lender_id), COALESCE(bu.username, rl.borrower_id)
+            FROM role_loans rl
+            LEFT JOIN users lu ON lu.user_id = rl.lender_id
+            LEFT JOIN users bu ON bu.user_id = rl.borrower_id
+            WHERE rl.lender_id=? OR rl.borrower_id=?
+            ORDER BY rl.expires_at
+            """,
+            (uid, uid),
+        ) as cur:
+            rows = await cur.fetchall()
+    t = _plain(current)
+    now = datetime.utcnow()
+    choices = []
+    for loan_id, item_id, lender_id, borrower_id, expires_at, lender_name, borrower_name in rows:
+        name = SHOP_ITEMS.get(item_id, {}).get("name", item_id)
+        try:
+            left = _fmt_dur((datetime.fromisoformat(expires_at) - now).total_seconds())
+        except ValueError:
+            left = "?"
+        if lender_id == uid:
+            label = f"📤 {name} → prestado a {borrower_name} · {left}"
+        else:
+            label = f"📥 {name} ← de {lender_name} · {left}"
+        if t and t not in _plain(label):
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=str(loan_id)))
+    return choices[:25]
+
+
+@tree.command(name="devolver", description="Devuelve un rol que te prestaron o cancela uno que prestaste, antes de tiempo")
+@app_commands.describe(prestamo="Elige el préstamo que quieres terminar")
+async def devolver_command(interaction: discord.Interaction, prestamo: str):
+    if not prestamo.strip().isdigit():
+        await interaction.response.send_message(
+            embed=_err_embed("Elige un préstamo", "Escoge uno de la lista que aparece al escribir."), ephemeral=True
+        )
+        return
+    await interaction.response.defer()
+    ok, embed = await role_loan_end_early(int(prestamo), str(interaction.user.id))
+    if ok:
+        await interaction.followup.send(embed=embed)
+    else:
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+devolver_command.autocomplete("prestamo")(loan_choice_autocomplete)
+
+
+def _loan_projection(item_id: str, expires_iso: str, last_collect_iso: str | None,
+                     pct: int, now: datetime, mult: int) -> tuple[datetime, int, int]:
+    """(proximo collect posible, collects que aun caben, lo que gana el dueño por collect)."""
+    item = SHOP_ITEMS[item_id]
+    cooldown = timedelta(hours=item["collect_hours"])
+    expires = datetime.fromisoformat(expires_iso)
+    next_collect = datetime.fromisoformat(last_collect_iso) + cooldown if last_collect_iso else now
+    if next_collect < now:
+        next_collect = now
+    remaining = 0 if next_collect >= expires else 1 + int((expires - next_collect) / cooldown)
+    return next_collect, remaining, item["collect_bonus"] * mult * pct // 100
+
+
+async def build_misprestamos_embed(user_id: str) -> discord.Embed:
+    now = datetime.utcnow()
+    async with aiosqlite.connect(DB_PATH) as db:
+        mult = await _collect_multiplier(db, now)
+        async with db.execute(
+            """
+            SELECT rl.item_id, rl.expires_at, rl.lender_percent, rl.price, rl.earned,
+                   COALESCE(u.username, rl.borrower_id), rc.last_collect
+            FROM role_loans rl
+            LEFT JOIN users u ON u.user_id = rl.borrower_id
+            LEFT JOIN role_collects rc ON rc.user_id = rl.borrower_id AND rc.item_id = rl.item_id
+            WHERE rl.lender_id=? ORDER BY rl.expires_at
+            """,
+            (user_id,),
+        ) as cur:
+            lent = await cur.fetchall()
+        async with db.execute(
+            """
+            SELECT rl.item_id, rl.expires_at, rl.lender_percent, rl.price,
+                   COALESCE(u.username, rl.lender_id), rc.last_collect
+            FROM role_loans rl
+            LEFT JOIN users u ON u.user_id = rl.lender_id
+            LEFT JOIN role_collects rc ON rc.user_id = rl.borrower_id AND rc.item_id = rl.item_id
+            WHERE rl.borrower_id=? ORDER BY rl.expires_at
+            """,
+            (user_id,),
+        ) as cur:
+            borrowed = await cur.fetchall()
+        async with db.execute(
+            "SELECT id, item_id, mode, price, days FROM role_listings WHERE seller_id=?", (user_id,)
+        ) as cur:
+            listings = await cur.fetchall()
+
+    embed = discord.Embed(title="📒 Mis préstamos de roles", color=0x3498DB)
+    if not lent and not borrowed and not listings:
+        embed.description = "No tienes roles prestados, alquilados ni publicados. Usa `/prestar` o `/rolmercado publicar`."
+        return embed
+
+    if lent:
+        lines, total_pending, total_earned = [], 0, 0
+        for item_id, expires_at, pct, price, earned, borrower_name, last_collect in lent:
+            name = SHOP_ITEMS.get(item_id, {}).get("name", item_id)
+            ts = _loan_ts(expires_at)
+            if price > 0 and pct == 0:
+                lines.append(f"{name} → **{borrower_name}** · alquilado por **{price:,}** 🪙 (ya cobrado) · termina <t:{ts}:R>")
+                continue
+            next_collect, remaining, share = _loan_projection(item_id, expires_at, last_collect, pct, now, mult)
+            pending = remaining * share
+            total_pending += pending
+            total_earned += earned
+            lines.append(
+                f"{name} → **{borrower_name}** · termina <t:{ts}:R>\n"
+                f"   💰 Cobrado: **{earned:,}** 🪙 · Falta por cobrar: hasta **{pending:,}** 🪙 "
+                f"({remaining} collect{'s' if remaining != 1 else ''} × {share:,})"
+                + (f"\n   ⏱️ Próximo collect posible: <t:{_loan_ts(next_collect.isoformat())}:R>" if remaining else "")
+            )
+        embed.add_field(name="📤 Roles que prestaste", value="\n".join(lines)[:1024], inline=False)
+        embed.add_field(name="Totales de préstamos", inline=False,
+                        value=f"Ya cobrado: **{total_earned:,}** 🪙 · Pendiente máximo: **{total_pending:,}** 🪙")
+    if borrowed:
+        lines = []
+        for item_id, expires_at, pct, price, lender_name, last_collect in borrowed:
+            name = SHOP_ITEMS.get(item_id, {}).get("name", item_id)
+            ts = _loan_ts(expires_at)
+            item = SHOP_ITEMS.get(item_id)
+            mine = item["collect_bonus"] * mult * (100 - pct) // 100 if item else 0
+            kind = "alquilado" if price > 0 and pct == 0 else f"prestado ({pct}% para su dueño)"
+            lines.append(f"{name} ← **{lender_name}** · {kind}\n   💰 Ganas **{mine:,}** 🪙 por collect · termina <t:{ts}:R>")
+        embed.add_field(name="📥 Roles que tienes prestados", value="\n".join(lines)[:1024], inline=False)
+    if listings:
+        lines = []
+        for lid, item_id, mode, price, days in listings:
+            name = SHOP_ITEMS.get(item_id, {}).get("name", item_id)
+            extra = f" · {days} día(s)" if mode == "alquiler" else ""
+            lines.append(f"`#{lid}` {name} · {mode}{extra} · **{price:,}** 🪙")
+        embed.add_field(name="🏪 Tus anuncios en el mercado", value="\n".join(lines)[:1024], inline=False)
+    if mult > 1:
+        embed.set_footer(text=f"Cálculos con el evento collect x{mult} activo")
+    return embed
+
+
+@tree.command(name="misprestamos", description="Mira qué roles prestaste, cuánto has cobrado y cuánto te falta por cobrar")
+async def misprestamos_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    embed = await build_misprestamos_embed(str(interaction.user.id))
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ------------------------------------------------------------------ mercado de roles
+rolmercado_group = app_commands.Group(
+    name="rolmercado", description="Compra, vende o alquila roles de la tienda a otros jugadores", guild_only=True
+)
+tree.add_command(rolmercado_group)
+
+
+async def role_market_publish(seller: discord.Member, item_id: str, mode: str, price: int, days: int) -> tuple[bool, discord.Embed]:
+    seller_id = str(seller.id)
+    if item_id not in ROLE_ITEMS:
+        return False, _err_embed("Rol no válido", "Elige un rol de la lista.")
+    if mode not in ("venta", "alquiler"):
+        return False, _err_embed("Modo no válido", "Elige **venta** o **alquiler**.")
+    if price <= 0:
+        return False, _err_embed("Precio no válido", "El precio debe ser mayor a 0.")
+    if mode == "alquiler" and not 1 <= days <= ROLE_LOAN_MAX_DAYS:
+        return False, _err_embed("Días no válidos", f"El alquiler debe ser de **1** a **{ROLE_LOAN_MAX_DAYS}** días.")
+    await get_or_create_user(seller_id, seller.name)
+    item = SHOP_ITEMS[item_id]
+    if await get_item_quantity(seller_id, item_id) <= 0:
+        return False, _err_embed("Sin rol", f"No tienes **{item['name']}** en tu inventario.")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT 1 FROM role_loans WHERE lender_id=? AND item_id=?", (seller_id, item_id)) as cur:
+            lent = await cur.fetchone()
+        async with db.execute("SELECT id FROM role_listings WHERE seller_id=? AND item_id=?", (seller_id, item_id)) as cur:
+            listed = await cur.fetchone()
+        if lent or listed:
+            await db.rollback()
+            return False, _err_embed("No disponible", "Ese rol ya está prestado o publicado en el mercado.")
+        cur = await db.execute(
+            "INSERT INTO role_listings (seller_id, item_id, mode, price, days, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (seller_id, item_id, mode, price, days if mode == "alquiler" else 0, datetime.utcnow().isoformat()),
+        )
+        listing_id = cur.lastrowid
+        await db.commit()
+    fee_note = f"Comisión del casino: **{ROLE_MARKET_FEE_PERCENT}%** (recibirás {price - price * ROLE_MARKET_FEE_PERCENT // 100:,} 🪙)."
+    if mode == "venta":
+        what = f"🛒 **Venta** por **{price:,}** 🪙 — el rol pasa al comprador."
+    else:
+        what = f"🔑 **Alquiler** por **{price:,}** 🪙 durante **{days}** día(s) — el inquilino cobra el 100% de los collects."
+    embed = discord.Embed(title="🏪 Anuncio publicado", color=0x00FF88,
+                          description=f"`#{listing_id}` {item['name']}\n{what}\n{fee_note}\n\nRetíralo con `/rolmercado retirar`.")
+    return True, embed
+
+
+def _listing_line(lid, item_id, mode, price, days, seller_name) -> str:
+    item = SHOP_ITEMS.get(item_id, {"name": item_id, "collect_bonus": 0, "collect_hours": 0})
+    if mode == "venta":
+        what = f"🛒 Venta · **{price:,}** 🪙"
+    else:
+        what = f"🔑 Alquiler {days}d · **{price:,}** 🪙"
+    return (f"`#{lid}` {item['name']} — {what}\n"
+            f"   +{item['collect_bonus']:,} cada {item['collect_hours']}h · vendedor: **{seller_name}**")
+
+
+async def build_rolmercado_embed(mode: str | None = None) -> discord.Embed:
+    async with aiosqlite.connect(DB_PATH) as db:
+        sql = ("SELECT rl.id, rl.item_id, rl.mode, rl.price, rl.days, COALESCE(u.username, rl.seller_id) "
+               "FROM role_listings rl LEFT JOIN users u ON u.user_id = rl.seller_id ")
+        params: tuple = ()
+        if mode in ("venta", "alquiler"):
+            sql += "WHERE rl.mode=? "
+            params = (mode,)
+        sql += "ORDER BY rl.id DESC LIMIT 20"
+        async with db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+    embed = discord.Embed(title="🏪 Mercado de roles", color=0x9B59B6)
+    if not rows:
+        embed.description = "No hay anuncios todavía. Publica uno con `/rolmercado publicar`."
+        return embed
+    lines = [_listing_line(*r) for r in rows]
+    desc, size = [], 0
+    for line in lines:
+        if size + len(line) + 2 > 3800:
+            break
+        desc.append(line)
+        size += len(line) + 2
+    embed.description = "\n\n".join(desc)
+    embed.set_footer(text=f"Compra o alquila con /rolmercado comprar · comisión del {ROLE_MARKET_FEE_PERCENT}% al vendedor")
+    return embed
+
+
+async def role_market_buy(guild: discord.Guild, buyer: discord.Member, listing_id: int) -> tuple[bool, discord.Embed]:
+    buyer_id = str(buyer.id)
+    await get_or_create_user(buyer_id, buyer.name)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT seller_id, item_id, mode, price, days FROM role_listings WHERE id=?", (listing_id,)
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return False, _err_embed("Anuncio no encontrado", "Ese anuncio ya no existe.")
+    seller_id, item_id, mode, price, days = row
+    if seller_id == buyer_id:
+        return False, _err_embed("Es tu anuncio", "No puedes comprarte a ti mismo. Usa `/rolmercado retirar`.")
+    item = SHOP_ITEMS.get(item_id)
+    if item is None:
+        return False, _err_embed("Anuncio roto", "Ese rol ya no existe en la tienda.")
+
+    if mode == "alquiler":
+        seller = await _fetch_member(guild, seller_id)
+        if seller is None:
+            return False, _err_embed("Vendedor ausente", "El dueño del rol no está en este servidor.")
+        ok, embed = await role_loan_create(guild, seller, buyer, item_id, days, price=price, lender_percent=0)
+        if ok:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("DELETE FROM role_listings WHERE id=?", (listing_id,))
+                await db.commit()
+        return ok, embed
+
+    # ---- venta: el rol cambia de dueño
+    fee = price * ROLE_MARKET_FEE_PERCENT // 100
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute("SELECT 1 FROM role_listings WHERE id=?", (listing_id,)) as cur:
+                if not await cur.fetchone():
+                    await db.rollback()
+                    return False, _err_embed("Anuncio no encontrado", "Alguien se te adelantó: ese anuncio ya no existe.")
+            async with db.execute(
+                "SELECT quantity FROM inventory WHERE user_id=? AND item_id=?", (seller_id, item_id)
+            ) as cur:
+                srow = await cur.fetchone()
+            if not srow or srow[0] <= 0:
+                await db.execute("DELETE FROM role_listings WHERE id=?", (listing_id,))
+                await db.commit()
+                return False, _err_embed("Ya no disponible", "El vendedor ya no tiene ese rol; el anuncio fue eliminado.")
+            async with db.execute(
+                "SELECT 1 FROM role_loans WHERE lender_id=? AND item_id=?", (seller_id, item_id)
+            ) as cur:
+                if await cur.fetchone():
+                    await db.rollback()
+                    return False, _err_embed("Rol prestado", "Ese rol está prestado ahora mismo; inténtalo más tarde.")
+            async with db.execute(
+                "SELECT quantity FROM inventory WHERE user_id=? AND item_id=?", (buyer_id, item_id)
+            ) as cur:
+                brow = await cur.fetchone()
+            async with db.execute(
+                "SELECT 1 FROM role_loans WHERE borrower_id=? AND item_id=?", (buyer_id, item_id)
+            ) as cur:
+                borrowing = await cur.fetchone()
+            if (brow and brow[0] > 0) or borrowing:
+                await db.rollback()
+                return False, _err_embed("Ya lo tienes", f"Ya tienes **{item['name']}** (propio o prestado).")
+
+            cur = await db.execute(
+                "UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (price, buyer_id, price)
+            )
+            if cur.rowcount == 0:
+                await db.rollback()
+                balance = await get_balance(buyer_id)
+                return False, _err_embed("Saldo insuficiente", f"Cuesta **{price:,}** 🪙 y tienes **{balance:,}** 🪙.")
+            await db.execute("UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?",
+                             (price - fee, MAX_BALANCE, seller_id))
+            await db.execute("UPDATE inventory SET quantity = quantity - 1 WHERE user_id=? AND item_id=?",
+                             (seller_id, item_id))
+            await db.execute("DELETE FROM inventory WHERE user_id=? AND item_id=? AND quantity <= 0",
+                             (seller_id, item_id))
+            await db.execute(
+                "INSERT INTO inventory (user_id, item_id, quantity) VALUES (?, ?, 1) "
+                "ON CONFLICT(user_id, item_id) DO UPDATE SET quantity = quantity + 1",
+                (buyer_id, item_id),
+            )
+            # el comprador hereda el cooldown del collect (si no, cobraria dos veces en el mismo ciclo)
+            async with db.execute(
+                "SELECT last_collect FROM role_collects WHERE user_id=? AND item_id=?", (seller_id, item_id)
+            ) as cur:
+                crow = await cur.fetchone()
+            if crow:
+                await db.execute(
+                    "INSERT INTO role_collects (user_id, item_id, last_collect) VALUES (?, ?, ?) "
+                    "ON CONFLICT(user_id, item_id) DO UPDATE SET "
+                    "last_collect = MAX(role_collects.last_collect, excluded.last_collect)",
+                    (buyer_id, item_id, crow[0]),
+                )
+            await db.execute("DELETE FROM role_listings WHERE id=?", (listing_id,))
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+    # roles de Discord (si falla algo, el comprador puede usar /use)
+    note = ""
+    try:
+        _, _, error = await grant_shop_role(guild, buyer, item_id)
+        if error:
+            note = f"\n⚠️ {error} Usa `/use` para reclamar el rol de Discord."
+    except (discord.HTTPException, aiosqlite.Error):
+        note = "\n⚠️ No pude asignar el rol de Discord; usa `/use` para reclamarlo."
+    await _remove_shop_role(str(guild.id), seller_id, item_id, "Rol vendido en el mercado de roles")
+    await feature_hook(seller_id, "roles_market")
+
+    embed = discord.Embed(title="🛒 ¡Rol comprado!", color=0x00FF88)
+    embed.description = (
+        f"{buyer.mention} compró **{item['name']}** por **{price:,}** 🪙 a <@{seller_id}>.\n"
+        f"💰 El vendedor recibió **{price - fee:,}** 🪙 (comisión {fee:,}).\n"
+        f"Ya puedes cobrarlo con `/collect`.{note}"
+    )
+    return True, embed
+
+
+async def listing_autocomplete(interaction: discord.Interaction, current: str):
+    t = _plain(current)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT rl.id, rl.item_id, rl.mode, rl.price, rl.days, COALESCE(u.username, rl.seller_id) "
+            "FROM role_listings rl LEFT JOIN users u ON u.user_id = rl.seller_id "
+            "WHERE rl.seller_id != ? ORDER BY rl.id DESC LIMIT 50",
+            (str(interaction.user.id),),
+        ) as cur:
+            rows = await cur.fetchall()
+    choices = []
+    for lid, item_id, mode, price, days, seller in rows:
+        name = SHOP_ITEMS.get(item_id, {}).get("name", item_id)
+        what = "Venta" if mode == "venta" else f"Alquiler {days}d"
+        label = f"#{lid} {name} · {what} · {price:,} 🪙 · {seller}"
+        if t and t not in _plain(label):
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=str(lid)))
+    return choices[:25]
+
+
+async def my_listing_autocomplete(interaction: discord.Interaction, current: str):
+    t = _plain(current)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, item_id, mode, price, days FROM role_listings WHERE seller_id=? ORDER BY id DESC",
+            (str(interaction.user.id),),
+        ) as cur:
+            rows = await cur.fetchall()
+    choices = []
+    for lid, item_id, mode, price, days in rows:
+        name = SHOP_ITEMS.get(item_id, {}).get("name", item_id)
+        what = "Venta" if mode == "venta" else f"Alquiler {days}d"
+        label = f"#{lid} {name} · {what} · {price:,} 🪙"
+        if t and t not in _plain(label):
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=str(lid)))
+    return choices[:25]
+
+
+@rolmercado_group.command(name="publicar", description="Pon un rol de tu inventario en venta o en alquiler")
+@app_commands.describe(
+    rol="Rol de tu inventario",
+    modo="Venta (el rol cambia de dueño) o alquiler (por días)",
+    precio="Precio en monedas (acepta 5m, 500k...)",
+    dias="Solo alquiler: días que dura (1-30)",
+)
+@app_commands.choices(modo=[
+    app_commands.Choice(name="Venta (el rol pasa al comprador)", value="venta"),
+    app_commands.Choice(name="Alquiler (por días)", value="alquiler"),
+])
+async def rolmercado_publicar(
+    interaction: discord.Interaction,
+    rol: str,
+    modo: str,
+    precio: str,
+    dias: app_commands.Range[int, 1, ROLE_LOAN_MAX_DAYS] = 3,
+):
+    item_id = resolve_shop_item(rol)
+    amount = loan_parse_amount(precio)
+    if item_id is None or item_id not in ROLE_ITEMS:
+        await interaction.response.send_message(embed=_err_embed("Rol no válido", "Elígelo de la lista."), ephemeral=True)
+        return
+    if amount is None or amount <= 0:
+        await interaction.response.send_message(
+            embed=_err_embed("Precio no válido", "Escribe un número, por ejemplo `50000000`, `50m` o `500k`."), ephemeral=True)
+        return
+    ok, embed = await role_market_publish(interaction.user, item_id, modo, amount, dias)
+    await interaction.response.send_message(embed=embed, ephemeral=not ok)
+
+
+rolmercado_publicar.autocomplete("rol")(prestar_role_autocomplete)
+
+
+@rolmercado_group.command(name="ver", description="Mira los roles en venta y en alquiler")
+@app_commands.describe(modo="Filtrar por venta o alquiler (opcional)")
+@app_commands.choices(modo=[
+    app_commands.Choice(name="Solo ventas", value="venta"),
+    app_commands.Choice(name="Solo alquileres", value="alquiler"),
+])
+async def rolmercado_ver(interaction: discord.Interaction, modo: _LoanOptional[str] = None):
+    await interaction.response.send_message(embed=await build_rolmercado_embed(modo))
+
+
+@rolmercado_group.command(name="comprar", description="Compra o alquila un rol del mercado")
+@app_commands.describe(anuncio="Elige el anuncio")
+async def rolmercado_comprar(interaction: discord.Interaction, anuncio: str):
+    if not anuncio.strip().lstrip("#").isdigit():
+        await interaction.response.send_message(
+            embed=_err_embed("Elige un anuncio", "Escoge uno de la lista que aparece al escribir."), ephemeral=True)
+        return
+    await interaction.response.defer()
+    ok, embed = await role_market_buy(interaction.guild, interaction.user, int(anuncio.strip().lstrip("#")))
+    if ok:
+        await interaction.followup.send(embed=embed)
+    else:
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+rolmercado_comprar.autocomplete("anuncio")(listing_autocomplete)
+
+
+@rolmercado_group.command(name="retirar", description="Retira uno de tus anuncios del mercado de roles")
+@app_commands.describe(anuncio="Elige tu anuncio")
+async def rolmercado_retirar(interaction: discord.Interaction, anuncio: str):
+    if not anuncio.strip().lstrip("#").isdigit():
+        await interaction.response.send_message(
+            embed=_err_embed("Elige un anuncio", "Escoge uno de la lista que aparece al escribir."), ephemeral=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM role_listings WHERE id=? AND seller_id=?",
+            (int(anuncio.strip().lstrip("#")), str(interaction.user.id)),
+        )
+        await db.commit()
+    if cur.rowcount == 0:
+        await interaction.response.send_message(
+            embed=_err_embed("No encontrado", "Ese anuncio no existe o no es tuyo."), ephemeral=True)
+    else:
+        await interaction.response.send_message("✅ Anuncio retirado del mercado.", ephemeral=True)
+
+
+rolmercado_retirar.autocomplete("anuncio")(my_listing_autocomplete)
+
+
+# ------------------------------------------------------------------ prefijo: ,prestar
 async def role_loan_handle_prefix(message: discord.Message, cmd: str, args: list) -> bool:
     """Devuelve True si el comando era ,prestar (así el bot no sigue buscando)."""
     if cmd != "prestar":
@@ -8982,9 +10059,1933 @@ async def role_loan_handle_prefix(message: discord.Message, cmd: str, args: list
     if item_id is None or item_id not in ROLE_ITEMS:
         await message.channel.send(f"❌ No encontré el rol **{name}**.\n{usage}")
         return True
+    if await role_is_committed(str(message.author.id), item_id):
+        await message.channel.send(embed=_role_loan_err("Ese rol ya está prestado o publicado en el mercado de roles."))
+        return True
     ok, embed = await role_loan_create(message.guild, message.author, borrower, item_id, int(args[-1]))
     await message.channel.send(content=borrower.mention if ok else None, embed=embed)
     return True
+
+
+# =====================================================================
+#  RANKING SEMANAL (/top)  ·  premios automaticos a los 3 primeros
+#  Mide cuanto crecio tu patrimonio en la semana: cartera + banco
+#  + objetos de la tienda (a mitad de precio) - deuda del banco.
+# =====================================================================
+async def compute_networths() -> dict[str, tuple[str, int]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT u.user_id, u.username, u.balance, COALESCE(u.bank, 0), COALESCE(l.remaining, 0) "
+            "FROM users u LEFT JOIN loans l ON l.user_id = u.user_id"
+        ) as cur:
+            rows = await cur.fetchall()
+        async with db.execute("SELECT user_id, item_id, quantity FROM inventory WHERE quantity > 0") as cur:
+            inventory = await cur.fetchall()
+    items_value: dict[str, int] = {}
+    for user_id, item_id, qty in inventory:
+        item = SHOP_ITEMS.get(item_id)
+        if item:
+            items_value[user_id] = items_value.get(user_id, 0) + qty * (item["price"] // 2)
+    return {
+        uid: (name or uid, balance + bank - debt + items_value.get(uid, 0))
+        for uid, name, balance, bank, debt in rows
+    }
+
+
+async def weekly_snapshot_ensure(wk: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM weekly_snapshot WHERE week_key=? LIMIT 1", (wk,)) as cur:
+            if await cur.fetchone():
+                return
+    worths = await compute_networths()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany(
+            "INSERT OR IGNORE INTO weekly_snapshot (week_key, user_id, networth) VALUES (?, ?, ?)",
+            [(wk, uid, worth) for uid, (_, worth) in worths.items()],
+        )
+        await db.execute("DELETE FROM weekly_snapshot WHERE week_key < ?",
+                         ((datetime.fromisoformat(wk) - timedelta(days=21)).date().isoformat(),))
+        await db.commit()
+
+
+async def weekly_standings(wk: str) -> list[tuple[str, str, int]]:
+    """[(user_id, nombre, ganancia)] de mayor a menor para la semana wk."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id, networth FROM weekly_snapshot WHERE week_key=?", (wk,)) as cur:
+            base = dict(await cur.fetchall())
+    if not base:
+        return []
+    worths = await compute_networths()
+    out = [(uid, name, worth - base.get(uid, 1000)) for uid, (name, worth) in worths.items()]
+    out.sort(key=lambda x: x[2], reverse=True)
+    return out
+
+
+async def build_top_embed(viewer_id: str | None = None) -> discord.Embed:
+    wk = week_key()
+    await weekly_snapshot_ensure(wk)
+    standings = await weekly_standings(wk)
+    medals = ["🥇", "🥈", "🥉"]
+    embed = discord.Embed(title="🏆 Top semanal — ganancias", color=0xFFD700)
+    end = next_week_start()
+    lines = []
+    for i, (uid, name, gain) in enumerate(standings[:10]):
+        if gain <= 0:
+            break
+        prefix = medals[i] if i < 3 else f"**#{i + 1}**"
+        lines.append(f"{prefix} **{name}** — {'+' if gain > 0 else ''}{gain:,} 🪙")
+    embed.description = "\n".join(lines) if lines else "Nadie ha ganado monedas esta semana todavía. ¡Sé el primero!"
+    embed.add_field(
+        name="🎁 Premios automáticos",
+        value="\n".join(f"{medals[i]} {p:,} 🪙" for i, p in enumerate(WEEKLY_PRIZES)),
+        inline=True,
+    )
+    embed.add_field(name="⏳ Se reinicia", value=f"<t:{_loan_ts(end.isoformat())}:R>\n(lunes 00:00 UTC)", inline=True)
+    if viewer_id:
+        for i, (uid, name, gain) in enumerate(standings):
+            if uid == viewer_id:
+                embed.set_footer(text=f"Tu posición: #{i + 1} · {gain:+,} 🪙 esta semana")
+                break
+    return embed
+
+
+async def weekly_rollover_check():
+    cur_week = week_key()
+    last = await setting_get("weekly_week")
+    if last is None:
+        await setting_set("weekly_week", cur_week)
+        await weekly_snapshot_ensure(cur_week)
+        return
+    if last == cur_week:
+        await weekly_snapshot_ensure(cur_week)
+        return
+    # La semana `last` termino: se paga y se abre la nueva
+    standings = await weekly_standings(last)
+    winners = [(uid, name, gain) for uid, name, gain in standings[:len(WEEKLY_PRIZES)] if gain > 0]
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (uid, name, gain) in enumerate(winners):
+        prize = WEEKLY_PRIZES[i]
+        await update_balance(uid, prize)
+        lines.append(f"{medals[i]} <@{uid}> — {gain:+,} 🪙 en la semana · premio **{prize:,}** 🪙")
+        await _dm_user(uid, f"🏆 ¡Quedaste en el puesto #{i + 1} del top semanal! Ganaste **{prize:,}** 🪙.")
+    await setting_set("weekly_week", cur_week)
+    await weekly_snapshot_ensure(cur_week)
+    if not lines:
+        return
+    embed = discord.Embed(title="🏆 ¡Terminó el top semanal!", description="\n".join(lines), color=0xFFD700)
+    channel_id = await setting_get("top_channel")
+    if channel_id:
+        channel = client.get_channel(int(channel_id))
+        if channel is not None:
+            try:
+                await channel.send(embed=embed)
+            except discord.HTTPException as exc:
+                print(f"No pude anunciar el top semanal: {exc}")
+
+
+async def weekly_loop():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            await weekly_rollover_check()
+        except Exception as exc:  # el bucle nunca debe morir
+            print(f"Error en weekly_loop: {exc}")
+        await asyncio.sleep(WEEKLY_CHECK_SECONDS)
+
+
+@tree.command(name="top", description="Ranking semanal de ganancias con premios automáticos para los 3 primeros")
+async def top_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+    embed = await build_top_embed(str(interaction.user.id))
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="topcanal", description="[ADMIN] Elige el canal donde se anuncian los ganadores del top semanal")
+@app_commands.describe(canal="Canal de anuncios (por defecto, este canal)")
+@app_commands.default_permissions(administrator=True)
+async def topcanal_command(interaction: discord.Interaction, canal: _LoanOptional[discord.TextChannel] = None):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Solo los administradores pueden usar este comando.", ephemeral=True)
+        return
+    target = canal or interaction.channel
+    await setting_set("top_channel", str(target.id))
+    await interaction.response.send_message(f"✅ Los ganadores del top semanal se anunciarán en {target.mention}.")
+
+
+# =====================================================================
+#  CLANES  ·  banco compartido y misiones semanales en grupo
+# =====================================================================
+async def clan_of(user_id: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT c.id, c.name, c.owner_id, c.bank, c.open FROM clan_members m "
+            "JOIN clans c ON c.id = m.clan_id WHERE m.user_id=?",
+            (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "name": row[1], "owner_id": row[2], "bank": row[3], "open": bool(row[4])}
+
+
+async def clan_by_name(name: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, name, owner_id, bank, open FROM clans WHERE name = ? COLLATE NOCASE", (name.strip(),)
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    return {"id": row[0], "name": row[1], "owner_id": row[2], "bank": row[3], "open": bool(row[4])}
+
+
+async def clan_member_ids(clan_id: int) -> list[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id FROM clan_members WHERE clan_id=? ORDER BY joined_at, user_id", (clan_id,)
+        ) as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+
+async def clan_progress(user_id: str, key: str, n: int = 1):
+    """Suma progreso a las misiones semanales del clan del usuario."""
+    if not any(m["key"] == key for m in CLAN_MISSIONS.values()):
+        return
+    clan = await clan_of(user_id)
+    if not clan:
+        return
+    wk = week_key()
+    completed: list[dict] = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        for mkey, mission in CLAN_MISSIONS.items():
+            if mission["key"] != key:
+                continue
+            async with db.execute(
+                "SELECT progress, done FROM clan_missions WHERE clan_id=? AND week_key=? AND mission_key=?",
+                (clan["id"], wk, mkey),
+            ) as cur:
+                row = await cur.fetchone()
+            progress, done = row if row else (0, 0)
+            if done:
+                continue
+            new_progress = min(progress + n, mission["goal"])
+            finished = new_progress >= mission["goal"]
+            await db.execute(
+                "INSERT INTO clan_missions (clan_id, week_key, mission_key, progress, done) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(clan_id, week_key, mission_key) DO UPDATE SET progress=excluded.progress, done=excluded.done",
+                (clan["id"], wk, mkey, new_progress, 1 if finished else 0),
+            )
+            if finished:
+                await db.execute("UPDATE clans SET bank = MIN(bank + ?, ?) WHERE id=?",
+                                 (mission["reward"], MAX_BALANCE, clan["id"]))
+                completed.append(mission)
+        await db.commit()
+    for mission in completed:
+        asyncio.create_task(_notify_user(
+            user_id,
+            f"🎉 ¡El clan **{clan['name']}** completó la misión **{mission['name']}**! "
+            f"**+{mission['reward']:,}** 🪙 al banco del clan.",
+        ))
+
+
+async def clan_create(user_id: str, username: str, name: str) -> tuple[bool, str]:
+    name = name.strip()
+    if not CLAN_NAME_RE.fullmatch(name):
+        return False, "El nombre debe tener **3 a 20** caracteres (letras, números, espacios, _ o -)."
+    await get_or_create_user(user_id, username)
+    if await clan_of(user_id):
+        return False, "Ya perteneces a un clan. Sal primero con `/clan salir`."
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT 1 FROM clans WHERE name = ? COLLATE NOCASE", (name,)) as cur:
+            if await cur.fetchone():
+                await db.rollback()
+                return False, "Ya existe un clan con ese nombre."
+        cur = await db.execute(
+            "UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?",
+            (CLAN_CREATE_COST, user_id, CLAN_CREATE_COST),
+        )
+        if cur.rowcount == 0:
+            await db.rollback()
+            return False, f"Crear un clan cuesta **{CLAN_CREATE_COST:,}** 🪙 y no te alcanza."
+        now = datetime.utcnow().isoformat()
+        cur = await db.execute(
+            "INSERT INTO clans (name, owner_id, bank, open, created_at) VALUES (?, ?, 0, 1, ?)", (name, user_id, now)
+        )
+        await db.execute("INSERT INTO clan_members (user_id, clan_id, joined_at) VALUES (?, ?, ?)",
+                         (user_id, cur.lastrowid, now))
+        await db.commit()
+    await feature_hook(user_id, "clan_joined")
+    return True, f"🛡️ ¡Clan **{name}** creado! Invita gente con `/clan invitar` o déjalo abierto para que usen `/clan unirse`."
+
+
+async def clan_join(user_id: str, username: str, name: str) -> tuple[bool, str]:
+    await get_or_create_user(user_id, username)
+    if await clan_of(user_id):
+        return False, "Ya perteneces a un clan. Sal primero con `/clan salir`."
+    clan = await clan_by_name(name)
+    if not clan:
+        return False, "No encontré ese clan."
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT COUNT(*) FROM clan_members WHERE clan_id=?", (clan["id"],)) as cur:
+            count = (await cur.fetchone())[0]
+        if count >= CLAN_MAX_MEMBERS:
+            await db.rollback()
+            return False, f"Ese clan está lleno ({CLAN_MAX_MEMBERS}/{CLAN_MAX_MEMBERS})."
+        async with db.execute("SELECT 1 FROM clan_invites WHERE clan_id=? AND user_id=?", (clan["id"], user_id)) as cur:
+            invited = await cur.fetchone() is not None
+        if not clan["open"] and not invited:
+            await db.rollback()
+            return False, "Ese clan es **cerrado**: necesitas una invitación del líder."
+        await db.execute("INSERT INTO clan_members (user_id, clan_id, joined_at) VALUES (?, ?, ?)",
+                         (user_id, clan["id"], datetime.utcnow().isoformat()))
+        await db.execute("DELETE FROM clan_invites WHERE user_id=?", (user_id,))
+        await db.commit()
+    await feature_hook(user_id, "clan_joined")
+    return True, f"✅ Te uniste al clan **{clan['name']}**."
+
+
+async def clan_leave(user_id: str) -> tuple[bool, str]:
+    clan = await clan_of(user_id)
+    if not clan:
+        return False, "No perteneces a ningún clan."
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute("DELETE FROM clan_members WHERE user_id=?", (user_id,))
+        async with db.execute(
+            "SELECT user_id FROM clan_members WHERE clan_id=? ORDER BY joined_at, user_id", (clan["id"],)
+        ) as cur:
+            remaining = [r[0] for r in await cur.fetchall()]
+        if not remaining:
+            # ultimo en salir: el clan se disuelve y el banco es suyo
+            await db.execute("UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?",
+                             (clan["bank"], MAX_BALANCE, user_id))
+            await db.execute("DELETE FROM clans WHERE id=?", (clan["id"],))
+            await db.execute("DELETE FROM clan_invites WHERE clan_id=?", (clan["id"],))
+            await db.execute("DELETE FROM clan_missions WHERE clan_id=?", (clan["id"],))
+            msg = f"Saliste y el clan **{clan['name']}** se disolvió. Recibiste **{clan['bank']:,}** 🪙 del banco."
+        else:
+            if clan["owner_id"] == user_id:
+                await db.execute("UPDATE clans SET owner_id=? WHERE id=?", (remaining[0], clan["id"]))
+                msg = f"Saliste de **{clan['name']}**. El liderazgo pasó a <@{remaining[0]}>."
+            else:
+                msg = f"Saliste del clan **{clan['name']}**."
+        await db.commit()
+    return True, msg
+
+
+async def clan_deposit(user_id: str, amount_text: str) -> tuple[bool, str]:
+    clan = await clan_of(user_id)
+    if not clan:
+        return False, "No perteneces a ningún clan."
+    balance = await get_balance(user_id)
+    amount = parse_amount_or_all(amount_text, balance)
+    if amount is None or amount <= 0:
+        return False, "Escribe una cantidad válida (`all`, `5m`, `500k`...)."
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            "UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (amount, user_id, amount)
+        )
+        if cur.rowcount == 0:
+            await db.rollback()
+            return False, f"No tienes **{amount:,}** 🪙 en la cartera."
+        await db.execute("UPDATE clans SET bank = MIN(bank + ?, ?) WHERE id=?", (amount, MAX_BALANCE, clan["id"]))
+        async with db.execute("SELECT bank FROM clans WHERE id=?", (clan["id"],)) as cur:
+            bank = (await cur.fetchone())[0]
+        await db.commit()
+    return True, f"💰 Depositaste **{amount:,}** 🪙 en el banco de **{clan['name']}**. Banco: **{bank:,}** 🪙."
+
+
+async def clan_withdraw(user_id: str, amount_text: str, target_id: str | None = None) -> tuple[bool, str]:
+    clan = await clan_of(user_id)
+    if not clan:
+        return False, "No perteneces a ningún clan."
+    if clan["owner_id"] != user_id:
+        return False, "Solo el líder puede sacar monedas del banco del clan."
+    amount = parse_amount_or_all(amount_text, clan["bank"])
+    if amount is None or amount <= 0:
+        return False, "Escribe una cantidad válida (`all`, `5m`, `500k`...)."
+    target_id = target_id or user_id
+    if target_id not in await clan_member_ids(clan["id"]):
+        return False, "Solo puedes enviar monedas a miembros del clan."
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("UPDATE clans SET bank = bank - ? WHERE id=? AND bank >= ?", (amount, clan["id"], amount))
+        if cur.rowcount == 0:
+            await db.rollback()
+            return False, f"El banco del clan solo tiene **{clan['bank']:,}** 🪙."
+        await db.execute("UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?",
+                         (amount, MAX_BALANCE, target_id))
+        await db.commit()
+    return True, f"🏦 Sacaste **{amount:,}** 🪙 del banco de **{clan['name']}** y se las diste a <@{target_id}>."
+
+
+async def clan_invite(owner_id: str, target_id: str) -> tuple[bool, str]:
+    clan = await clan_of(owner_id)
+    if not clan or clan["owner_id"] != owner_id:
+        return False, "Solo el líder de un clan puede invitar."
+    if await clan_of(target_id):
+        return False, "Esa persona ya está en un clan."
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO clan_invites (clan_id, user_id) VALUES (?, ?)", (clan["id"], target_id))
+        await db.commit()
+    return True, f"📨 Invitaste a <@{target_id}> a **{clan['name']}**. Que use `/clan unirse {clan['name']}`."
+
+
+async def clan_kick(owner_id: str, target_id: str) -> tuple[bool, str]:
+    clan = await clan_of(owner_id)
+    if not clan or clan["owner_id"] != owner_id:
+        return False, "Solo el líder puede expulsar miembros."
+    if target_id == owner_id:
+        return False, "No puedes expulsarte a ti mismo; usa `/clan salir`."
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("DELETE FROM clan_members WHERE user_id=? AND clan_id=?", (target_id, clan["id"]))
+        await db.commit()
+    if cur.rowcount == 0:
+        return False, "Esa persona no está en tu clan."
+    return True, f"👢 <@{target_id}> fue expulsado de **{clan['name']}**."
+
+
+async def clan_set_open(owner_id: str, is_open: bool) -> tuple[bool, str]:
+    clan = await clan_of(owner_id)
+    if not clan or clan["owner_id"] != owner_id:
+        return False, "Solo el líder puede cambiar el acceso."
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE clans SET open=? WHERE id=?", (1 if is_open else 0, clan["id"]))
+        await db.commit()
+    return True, "🔓 El clan ahora es **abierto**." if is_open else "🔒 El clan ahora es **cerrado** (solo con invitación)."
+
+
+async def clan_disband(owner_id: str) -> tuple[bool, str]:
+    clan = await clan_of(owner_id)
+    if not clan or clan["owner_id"] != owner_id:
+        return False, "Solo el líder puede disolver el clan."
+    members = await clan_member_ids(clan["id"])
+    share, extra = divmod(clan["bank"], len(members))
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        for uid in members:
+            await db.execute("UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?",
+                             (share + (extra if uid == owner_id else 0), MAX_BALANCE, uid))
+        await db.execute("DELETE FROM clan_members WHERE clan_id=?", (clan["id"],))
+        await db.execute("DELETE FROM clan_invites WHERE clan_id=?", (clan["id"],))
+        await db.execute("DELETE FROM clan_missions WHERE clan_id=?", (clan["id"],))
+        await db.execute("DELETE FROM clans WHERE id=?", (clan["id"],))
+        await db.commit()
+    return True, f"💥 El clan **{clan['name']}** fue disuelto. El banco (**{clan['bank']:,}** 🪙) se repartió entre {len(members)} miembro(s)."
+
+
+async def build_clan_info_embed(clan: dict) -> discord.Embed:
+    members = await clan_member_ids(clan["id"])
+    async with aiosqlite.connect(DB_PATH) as db:
+        placeholders = ",".join("?" for _ in members)
+        async with db.execute(
+            f"SELECT user_id, username FROM users WHERE user_id IN ({placeholders})", members
+        ) as cur:
+            names = dict(await cur.fetchall())
+    lines = [f"{'👑' if uid == clan['owner_id'] else '•'} **{names.get(uid, uid)}**" for uid in members]
+    embed = discord.Embed(title=f"🛡️ Clan {clan['name']}", color=0x3498DB)
+    embed.add_field(name="🏦 Banco", value=f"**{clan['bank']:,}** 🪙", inline=True)
+    embed.add_field(name="👥 Miembros", value=f"{len(members)}/{CLAN_MAX_MEMBERS}", inline=True)
+    embed.add_field(name="🚪 Acceso", value="Abierto" if clan["open"] else "Cerrado", inline=True)
+    embed.add_field(name="Integrantes", value="\n".join(lines)[:1024], inline=False)
+    return embed
+
+
+async def build_clan_missions_embed(clan: dict) -> discord.Embed:
+    wk = week_key()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT mission_key, progress, done FROM clan_missions WHERE clan_id=? AND week_key=?", (clan["id"], wk)
+        ) as cur:
+            state = {r[0]: (r[1], r[2]) for r in await cur.fetchall()}
+    embed = discord.Embed(title=f"📋 Misiones semanales — {clan['name']}", color=0x9B59B6)
+    for mkey, mission in CLAN_MISSIONS.items():
+        progress, done = state.get(mkey, (0, 0))
+        status = "✅ **¡Completada!**" if done else f"`[{_bar(progress, mission['goal'])}]` {progress}/{mission['goal']}"
+        embed.add_field(
+            name=f"{mission['name']} — +{mission['reward']:,} 🪙",
+            value=f"{mission['desc']}\n{status}",
+            inline=False,
+        )
+    embed.set_footer(text="El premio va al banco del clan · se reinicia el lunes 00:00 UTC")
+    return embed
+
+
+async def clan_name_autocomplete(interaction: discord.Interaction, current: str):
+    t = _plain(current)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT c.name, c.open, (SELECT COUNT(*) FROM clan_members m WHERE m.clan_id=c.id), "
+            "(SELECT 1 FROM clan_invites i WHERE i.clan_id=c.id AND i.user_id=?) "
+            "FROM clans c ORDER BY c.bank DESC LIMIT 50",
+            (str(interaction.user.id),),
+        ) as cur:
+            rows = await cur.fetchall()
+    choices = []
+    for name, is_open, count, invited in rows:
+        if t and t not in _plain(name):
+            continue
+        tag = "📨 invitación" if invited else ("abierto" if is_open else "cerrado")
+        choices.append(app_commands.Choice(name=f"{name} ({count}/{CLAN_MAX_MEMBERS} · {tag})"[:100], value=name))
+    return choices[:25]
+
+
+clan_group = app_commands.Group(name="clan", description="Clanes: banco compartido y misiones en grupo", guild_only=True)
+tree.add_command(clan_group)
+
+
+async def _clan_reply(interaction: discord.Interaction, result: tuple[bool, str]):
+    ok, text = result
+    await interaction.response.send_message(text if ok else f"❌ {text}", ephemeral=not ok)
+
+
+@clan_group.command(name="crear", description=f"Crea un clan (cuesta {CLAN_CREATE_COST:,} monedas)")
+@app_commands.describe(nombre="Nombre del clan (3-20 caracteres)")
+async def clan_crear(interaction: discord.Interaction, nombre: str):
+    await _clan_reply(interaction, await clan_create(str(interaction.user.id), interaction.user.name, nombre))
+
+
+@clan_group.command(name="unirse", description="Únete a un clan abierto o al que te invitó")
+@app_commands.describe(nombre="Clan al que quieres unirte")
+async def clan_unirse(interaction: discord.Interaction, nombre: str):
+    await _clan_reply(interaction, await clan_join(str(interaction.user.id), interaction.user.name, nombre))
+
+
+clan_unirse.autocomplete("nombre")(clan_name_autocomplete)
+
+
+@clan_group.command(name="salir", description="Sal de tu clan")
+async def clan_salir(interaction: discord.Interaction):
+    await _clan_reply(interaction, await clan_leave(str(interaction.user.id)))
+
+
+@clan_group.command(name="info", description="Mira un clan (por defecto, el tuyo)")
+@app_commands.describe(nombre="Nombre del clan (opcional)")
+async def clan_info(interaction: discord.Interaction, nombre: _LoanOptional[str] = None):
+    clan = await clan_by_name(nombre) if nombre else await clan_of(str(interaction.user.id))
+    if not clan:
+        await interaction.response.send_message("❌ No encontré ese clan (o no estás en ninguno).", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=await build_clan_info_embed(clan))
+
+
+clan_info.autocomplete("nombre")(clan_name_autocomplete)
+
+
+@clan_group.command(name="depositar", description="Deposita monedas en el banco compartido del clan")
+@app_commands.describe(cantidad="Cantidad (acepta all, 5m, 500k)")
+async def clan_depositar(interaction: discord.Interaction, cantidad: str):
+    await _clan_reply(interaction, await clan_deposit(str(interaction.user.id), cantidad))
+
+
+@clan_group.command(name="retirar", description="[Líder] Saca monedas del banco del clan para ti o un miembro")
+@app_commands.describe(cantidad="Cantidad (acepta all, 5m, 500k)", usuario="Miembro que las recibe (por defecto, tú)")
+async def clan_retirar(interaction: discord.Interaction, cantidad: str, usuario: _LoanOptional[discord.Member] = None):
+    await _clan_reply(interaction, await clan_withdraw(
+        str(interaction.user.id), cantidad, str(usuario.id) if usuario else None))
+
+
+@clan_group.command(name="invitar", description="[Líder] Invita a un jugador a tu clan")
+@app_commands.describe(usuario="Jugador a invitar")
+async def clan_invitar(interaction: discord.Interaction, usuario: discord.Member):
+    if usuario.bot:
+        await interaction.response.send_message("❌ No puedes invitar a un bot.", ephemeral=True)
+        return
+    await _clan_reply(interaction, await clan_invite(str(interaction.user.id), str(usuario.id)))
+
+
+@clan_group.command(name="expulsar", description="[Líder] Expulsa a un miembro del clan")
+@app_commands.describe(usuario="Miembro a expulsar")
+async def clan_expulsar(interaction: discord.Interaction, usuario: discord.Member):
+    await _clan_reply(interaction, await clan_kick(str(interaction.user.id), str(usuario.id)))
+
+
+@clan_group.command(name="acceso", description="[Líder] Haz el clan abierto (cualquiera entra) o cerrado (solo invitados)")
+@app_commands.describe(modo="Abierto o cerrado")
+@app_commands.choices(modo=[
+    app_commands.Choice(name="Abierto", value="abierto"),
+    app_commands.Choice(name="Cerrado (solo invitación)", value="cerrado"),
+])
+async def clan_acceso(interaction: discord.Interaction, modo: str):
+    await _clan_reply(interaction, await clan_set_open(str(interaction.user.id), modo == "abierto"))
+
+
+@clan_group.command(name="misiones", description="Mira las misiones semanales de tu clan")
+async def clan_misiones(interaction: discord.Interaction):
+    clan = await clan_of(str(interaction.user.id))
+    if not clan:
+        await interaction.response.send_message("❌ No perteneces a ningún clan.", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=await build_clan_missions_embed(clan))
+
+
+@clan_group.command(name="top", description="Ranking de clanes por banco")
+async def clan_top(interaction: discord.Interaction):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT c.name, c.bank, (SELECT COUNT(*) FROM clan_members m WHERE m.clan_id=c.id) "
+            "FROM clans c ORDER BY c.bank DESC LIMIT 10"
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await interaction.response.send_message("❌ Todavía no hay clanes. Crea el primero con `/clan crear`.", ephemeral=True)
+        return
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [f"{medals[i] if i < 3 else f'**#{i + 1}**'} **{name}** — {bank:,} 🪙 · {count} miembro(s)"
+             for i, (name, bank, count) in enumerate(rows)]
+    await interaction.response.send_message(embed=discord.Embed(
+        title="🏆 Top de clanes", description="\n".join(lines), color=0xFFD700))
+
+
+@clan_group.command(name="disolver", description="[Líder] Disuelve el clan y reparte el banco entre los miembros")
+@app_commands.describe(confirmar="Pon True para confirmar")
+async def clan_disolver(interaction: discord.Interaction, confirmar: bool):
+    if not confirmar:
+        await interaction.response.send_message("❌ Marca `confirmar: True` si de verdad quieres disolver el clan.", ephemeral=True)
+        return
+    await _clan_reply(interaction, await clan_disband(str(interaction.user.id)))
+
+
+# =====================================================================
+#  MINES  ·  revela diamantes, evita las minas y retirate a tiempo
+# =====================================================================
+def mines_multiplier(mines: int, revealed: int) -> float:
+    if revealed <= 0:
+        return 1.0
+    mult = 1.0
+    for i in range(revealed):
+        mult *= (MINES_TILES - i) / (MINES_TILES - mines - i)
+    return mult * MINES_PAYOUT_FACTOR
+
+
+class MinesButton(discord.ui.Button):
+    def __init__(self, idx: int):
+        super().__init__(emoji="❔", style=discord.ButtonStyle.secondary, row=idx // 5)
+        self.idx = idx
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.reveal(interaction, self)
+
+
+class MinesView(discord.ui.View):
+    def __init__(self, user_id: str, bet: int, mines: int):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.bet = bet
+        self.mines = mines
+        self.mine_set = set(random.sample(range(MINES_TILES), mines))
+        self.revealed: set[int] = set()
+        self.finished = False
+        self.message: discord.Message | None = None
+        self.tile_buttons = [MinesButton(i) for i in range(MINES_TILES)]
+        for button in self.tile_buttons:
+            self.add_item(button)
+        self.cash_button = discord.ui.Button(label="💰 Retirar", style=discord.ButtonStyle.success, row=4, disabled=True)
+        self.cash_button.callback = self.cashout_callback
+        self.add_item(self.cash_button)
+
+    def current_payout(self) -> int:
+        return int(self.bet * mines_multiplier(self.mines, len(self.revealed)))
+
+    def make_embed(self, title: str = "💎 Mines", color: int = 0x9B59B6, footer: str | None = None) -> discord.Embed:
+        k = len(self.revealed)
+        embed = discord.Embed(title=title, color=color)
+        lines = [
+            f"💵 Apuesta: **{self.bet:,}** 🪙 · 💣 Minas: **{self.mines}**",
+            f"💎 Diamantes revelados: **{k}/{MINES_TILES - self.mines}**",
+            f"📈 Multiplicador: **x{mines_multiplier(self.mines, k):.2f}** → **{self.current_payout():,}** 🪙",
+        ]
+        if not self.finished and k < MINES_TILES - self.mines:
+            nxt = int(self.bet * mines_multiplier(self.mines, k + 1))
+            lines.append(f"➡️ Siguiente diamante: **x{mines_multiplier(self.mines, k + 1):.2f}** ({nxt:,} 🪙)")
+        embed.description = "\n".join(lines)
+        if footer:
+            embed.set_footer(text=footer)
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("❌ Esta partida no es tuya.", ephemeral=True)
+            return False
+        return True
+
+    def _reveal_board(self, hit: int | None = None):
+        for button in self.tile_buttons:
+            button.disabled = True
+            if button.idx in self.mine_set:
+                button.emoji = "💣"
+                button.style = discord.ButtonStyle.danger if button.idx == hit else discord.ButtonStyle.secondary
+            elif button.idx in self.revealed:
+                button.emoji = "💎"
+                button.style = discord.ButtonStyle.success
+            else:
+                button.emoji = "💎"
+                button.style = discord.ButtonStyle.secondary
+        self.cash_button.disabled = True
+
+    async def reveal(self, interaction: discord.Interaction, button: MinesButton):
+        if self.finished:
+            await interaction.response.defer()
+            return
+        if button.idx in self.mine_set:
+            self.finished = True
+            self._reveal_board(hit=button.idx)
+            self.stop()
+            await log_bet(self.user_id, "💎 Mines", self.bet, -self.bet)
+            embed = self.make_embed("💥 ¡Boom! Pisaste una mina", 0xFF4444, f"Perdiste {self.bet:,} 🪙")
+            await interaction.response.edit_message(embed=embed, view=self)
+            return
+        self.revealed.add(button.idx)
+        button.emoji = "💎"
+        button.style = discord.ButtonStyle.success
+        button.disabled = True
+        self.cash_button.disabled = False
+        if len(self.revealed) >= MINES_TILES - self.mines:
+            await self._cashout(interaction, perfect=True)
+            return
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    async def cashout_callback(self, interaction: discord.Interaction):
+        if self.finished or not self.revealed:
+            await interaction.response.defer()
+            return
+        await self._cashout(interaction)
+
+    async def _cashout(self, interaction: discord.Interaction | None, perfect: bool = False):
+        self.finished = True
+        payout = self.current_payout()
+        await update_balance(self.user_id, payout)
+        await log_bet(self.user_id, "💎 Mines", self.bet, payout - self.bet)
+        if payout > self.bet:
+            await feature_hook(self.user_id, "mines_cashout")
+        self._reveal_board()
+        self.stop()
+        profit = payout - self.bet
+        title = "🏆 ¡Tablero limpio!" if perfect else "💰 Te retiraste a tiempo"
+        embed = self.make_embed(title, 0x00FF88, f"Ganaste {profit:+,} 🪙")
+        if interaction is not None:
+            await interaction.response.edit_message(embed=embed, view=self)
+        elif self.message is not None:
+            try:
+                await self.message.edit(embed=embed, view=self)
+            except discord.HTTPException:
+                pass
+
+    async def on_timeout(self):
+        if self.finished:
+            return
+        if self.revealed:
+            await self._cashout(None)  # tiempo agotado: se retira solo
+            return
+        self.finished = True
+        await update_balance(self.user_id, self.bet)  # no reveló nada: se devuelve la apuesta
+        self._reveal_board()
+        if self.message is not None:
+            try:
+                await self.message.edit(embed=self.make_embed("⏰ Tiempo agotado", 0x95A5A6, "Apuesta devuelta"), view=self)
+            except discord.HTTPException:
+                pass
+
+
+async def mines_create(user_id: str, username: str, bet_text: str, mines: int) -> tuple[str | None, MinesView | None]:
+    if not 1 <= mines <= MINES_MAX:
+        return f"Las minas deben ser entre **1** y **{MINES_MAX}**.", None
+    await get_or_create_user(user_id, username)
+    balance = await get_balance(user_id)
+    bet = parse_amount_or_all(bet_text, balance)
+    if bet is None or bet <= 0:
+        return "Escribe una apuesta válida (`all`, `5m`, `500k`...).", None
+    if bet > balance:
+        return f"Tienes **{balance:,}** 🪙 y quieres apostar **{bet:,}** 🪙.", None
+    await update_balance(user_id, -bet)
+    await track_mission(user_id, "mines_played")
+    return None, MinesView(user_id, bet, mines)
+
+
+@tree.command(name="mines", description="Buscaminas: revela diamantes, evita las minas y retírate a tiempo")
+@app_commands.describe(cantidad="Apuesta (acepta all, 5m, 500k)", minas=f"Cantidad de minas (1-{MINES_MAX}, más minas = más premio)")
+async def mines_command(interaction: discord.Interaction, cantidad: str, minas: app_commands.Range[int, 1, MINES_MAX] = 3):
+    error, view = await mines_create(str(interaction.user.id), interaction.user.name, cantidad, minas)
+    if error:
+        await interaction.response.send_message(embed=_err_embed("No se pudo empezar", error), ephemeral=True)
+        return
+    await interaction.response.send_message(embed=view.make_embed(), view=view)
+    view.message = await interaction.original_response()
+
+
+# =====================================================================
+#  PREFIJO para los comandos nuevos (,top ,logros ,carcel ,fianza ...)
+# =====================================================================
+async def features_handle_prefix(message: discord.Message, cmd: str, args: list) -> bool:
+    uid = str(message.author.id)
+    _last_channel[uid] = message.channel
+    if await jail_block_prefix(message, cmd):
+        return True
+
+    if cmd == "top":
+        await message.channel.send(embed=await build_top_embed(uid))
+        return True
+    if cmd in ("logros", "achievements"):
+        target = message.mentions[0] if message.mentions else message.author
+        await message.channel.send(embed=await logros_embed_for(str(target.id), target.display_name))
+        return True
+    if cmd in ("carcel", "cárcel", "jail"):
+        target = message.mentions[0] if message.mentions else message.author
+        remaining = await jail_remaining(str(target.id))
+        if remaining is None:
+            await message.channel.send(f"✅ **{target.display_name}** no está en la cárcel.")
+        else:
+            await message.channel.send(embed=jail_embed(remaining))
+        return True
+    if cmd in ("fianza", "bail"):
+        await message.channel.send(embed=await jail_pay_bail(uid, message.author.name))
+        return True
+    if cmd in ("misprestamos", "misprestamosroles"):
+        await message.channel.send(embed=await build_misprestamos_embed(uid))
+        return True
+    if cmd == "evento":
+        mult, text = await collect_event_info()
+        await message.channel.send(embed=discord.Embed(
+            title="🎉 Eventos del casino", description=text, color=0x00FF88 if mult > 1 else 0x95A5A6))
+        return True
+    if cmd == "mines":
+        if not args:
+            await message.channel.send("❌ Uso: `,mines <cantidad|all> [minas 1-10]` — ej: `,mines 1m 3`")
+            return True
+        mines = 3
+        if len(args) > 1:
+            if not args[1].isdigit():
+                await message.channel.send("❌ Las minas deben ser un número del 1 al 10.")
+                return True
+            mines = int(args[1])
+        error, view = await mines_create(uid, message.author.name, args[0], mines)
+        if error:
+            await message.channel.send(embed=_err_embed("No se pudo empezar", error))
+            return True
+        view.message = await message.channel.send(embed=view.make_embed(), view=view)
+        return True
+    return False
+
+
+# =====================================================================
+#  /removemoney con "all"
+# =====================================================================
+async def perform_removemoney(target: discord.Member, amount_text: str, include_bank: bool = False):
+    """Quita dinero a un usuario. Devuelve un Embed, o un str con el error."""
+    target_id = str(target.id)
+    await get_or_create_user(target_id, target.name)
+    current = await get_balance(target_id)
+    text = str(amount_text).strip().lower()
+    if text in ALL_WORDS:
+        deduct = current
+    else:
+        amount = loan_parse_amount(text)
+        if amount is None or amount <= 0:
+            return "❌ La cantidad debe ser un número mayor a 0, o `all` para quitar todo."
+        deduct = min(amount, current)
+    await update_balance(target_id, -deduct)
+    bank_removed = 0
+    if include_bank:
+        bank_removed = await get_bank(target_id)
+        if bank_removed:
+            await update_bank(target_id, -bank_removed)
+    new_balance = await get_balance(target_id)
+    description = f"Se quitaron **{deduct:,}** 🪙 de la cartera de {target.mention}."
+    if include_bank:
+        description += f"\n🏦 También se vació el banco: **{bank_removed:,}** 🪙."
+    description += f"\nNuevo saldo: **{new_balance:,}** 🪙"
+    return discord.Embed(title="✅ Dinero Eliminado", description=description, color=0xFFAA00)
+
+
+async def ftorneo_charge_host(user_id: str, entry_fee: int) -> str | None:
+    """Cobra la apuesta de entrada al organizador. Devuelve un error o None."""
+    if entry_fee <= 0:
+        return None
+    balance = await get_balance(user_id)
+    if balance < entry_fee:
+        return f"❌ La apuesta de entrada es **{entry_fee:,}** 🪙 y tienes **{balance:,}** 🪙."
+    await update_balance(user_id, -entry_fee)
+    return None
+
+
+# =====================================================================
+#  PANEL WEB (dashboard) para configurar el bot, estilo UnbelievaBoat
+#  - Corre dentro del mismo proceso del bot (aiohttp).
+#  - Todo lo configurable vive en la base de datos (tabla bot_settings).
+#  - Login con Discord (OAuth2) y/o con contraseña. Ver variables DASHBOARD_*.
+# =====================================================================
+import json as _json
+import hmac as _hmac
+import hashlib as _hashlib
+import base64 as _b64
+import secrets as _secrets
+import time as _time
+from urllib.parse import urlencode as _urlencode
+import aiohttp as _aiohttp
+from aiohttp import web as _web
+
+# ---- valores que antes estaban fijos en el codigo y ahora se editan desde el panel
+WORK_MIN, WORK_MAX, WORK_COOLDOWN_SECONDS = 1_000, 100_000, 30
+SLUT_MIN, SLUT_MAX, SLUT_COOLDOWN_SECONDS, SLUT_CHANCE = 1_000, 100_000, 30, 60
+SLUT_FINE_MIN, SLUT_FINE_MAX = 1_000, 100_000
+CRIME_MIN, CRIME_MAX, CRIME_COOLDOWN_SECONDS, CRIME_CHANCE = 1_000, 100_000, 30, 60
+CRIME_FINE_MIN, CRIME_FINE_MAX = 1_000, 100_000
+ROB_COOLDOWN_MINUTES = 60
+ROB_SUCCESS_CHANCE = 40
+ROB_STEAL_MIN_PCT, ROB_STEAL_MAX_PCT = 10, 40
+ROB_FINE_PCT = 10
+DAILY_FIRST_REWARD = 5_000       # dia 1 de racha
+DAILY_BASE_REWARD = 50_000       # dia 2 de racha
+DAILY_STREAK_STEP = 10_000       # lo que sube cada dia extra (hasta el dia 30)
+LOAN_PERIOD_DAYS = 7
+WEEKLY_PRIZE_1, WEEKLY_PRIZE_2, WEEKLY_PRIZE_3 = WEEKLY_PRIZES
+
+_MONEY_MAX = 10 ** 13
+
+
+def _f(key, label, typ="int", lo=0, hi=_MONEY_MAX, unit="", help="", step=None, sub=None):
+    field = {"key": key, "label": label, "type": typ, "min": lo, "max": hi, "unit": unit, "help": help}
+    if step is not None:
+        field["step"] = step
+    if sub:
+        field["sub"] = sub
+    return field
+
+
+CONFIG_GROUPS_STATIC = [
+    {"id": "work", "icon": "💼", "title": "Work", "desc": "Comando /work y ,work: trabajo seguro que siempre paga.", "fields": [
+        _f("WORK_MIN", "Ganancia mínima", unit="🪙", help="Lo menos que puede pagar un trabajo."),
+        _f("WORK_MAX", "Ganancia máxima", unit="🪙", help="Lo más que puede pagar un trabajo."),
+        _f("WORK_COOLDOWN_SECONDS", "Cooldown", hi=604800, unit="seg", help="Tiempo de espera entre trabajos."),
+    ]},
+    {"id": "slut", "icon": "💋", "title": "Slut", "desc": "Comando /slut y ,slut: arriesgado, puede dar multa.", "fields": [
+        _f("SLUT_MIN", "Ganancia mínima", unit="🪙"),
+        _f("SLUT_MAX", "Ganancia máxima", unit="🪙"),
+        _f("SLUT_CHANCE", "Probabilidad de éxito", hi=100, unit="%", help="Si falla, paga multa."),
+        _f("SLUT_FINE_MIN", "Multa mínima", unit="🪙", help="Nunca se cobra más de lo que el usuario tiene en la cartera."),
+        _f("SLUT_FINE_MAX", "Multa máxima", unit="🪙"),
+        _f("SLUT_COOLDOWN_SECONDS", "Cooldown", hi=604800, unit="seg"),
+    ]},
+    {"id": "crime", "icon": "🦹", "title": "Crime", "desc": "Comando /crime y ,crime: más riesgo, más historias.", "fields": [
+        _f("CRIME_MIN", "Ganancia mínima", unit="🪙"),
+        _f("CRIME_MAX", "Ganancia máxima", unit="🪙"),
+        _f("CRIME_CHANCE", "Probabilidad de éxito", hi=100, unit="%"),
+        _f("CRIME_FINE_MIN", "Multa mínima", unit="🪙"),
+        _f("CRIME_FINE_MAX", "Multa máxima", unit="🪙"),
+        _f("CRIME_COOLDOWN_SECONDS", "Cooldown", hi=604800, unit="seg"),
+    ]},
+    {"id": "rob", "icon": "🥷", "title": "Robos", "desc": "Comando /rob: robarle monedas de la cartera a otro jugador.", "fields": [
+        _f("ROB_SUCCESS_CHANCE", "Probabilidad de éxito", hi=100, unit="%"),
+        _f("ROB_STEAL_MIN_PCT", "Mínimo robado", hi=100, unit="% de la cartera", help="Porcentaje de la cartera de la víctima."),
+        _f("ROB_STEAL_MAX_PCT", "Máximo robado", hi=100, unit="% de la cartera"),
+        _f("ROB_FINE_PCT", "Multa al fallar", hi=100, unit="% de la cartera de la víctima"),
+        _f("ROB_COOLDOWN_MINUTES", "Cooldown", hi=10080, unit="min"),
+    ]},
+    {"id": "jail", "icon": "🔒", "title": "Cárcel", "desc": "Qué pasa cuando te atrapan robando.", "fields": [
+        _f("JAIL_BASE_MINUTES", "Condena base", hi=1440, unit="min", help="Minutos de cárcel la primera vez."),
+        _f("JAIL_EXTRA_MINUTES_PER_STRIKE", "Extra por reincidencia", hi=1440, unit="min", help="Se suma por cada captura seguida."),
+        _f("JAIL_MAX_MINUTES", "Condena máxima", hi=10080, unit="min"),
+        _f("JAIL_STRIKE_RESET_HOURS", "Reinicio de reincidencia", hi=720, unit="horas", help="Sin caer en este tiempo, vuelve a la condena base."),
+        _f("JAIL_BAIL_PER_MINUTE", "Fianza por minuto", unit="🪙", help="Costo de /fianza = minutos restantes × este valor."),
+    ]},
+    {"id": "daily", "icon": "🎁", "title": "Diario", "desc": "Recompensa de /daily con racha de hasta 30 días.", "fields": [
+        _f("DAILY_FIRST_REWARD", "Día 1", unit="🪙"),
+        _f("DAILY_BASE_REWARD", "Día 2", unit="🪙"),
+        _f("DAILY_STREAK_STEP", "Aumento por cada día extra", unit="🪙", help="Día N = día 2 + (N-2) × este valor."),
+    ]},
+    {"id": "loans", "icon": "🏦", "title": "Préstamos", "desc": "El banco del casino (/loan, /debt, /payloan).", "fields": [
+        _f("LOAN_MIN", "Préstamo mínimo", unit="🪙"),
+        _f("LOAN_MAX", "Préstamo máximo", unit="🪙"),
+        _f("LOAN_INTEREST_PERCENT", "Interés por tramo", hi=1000, unit="%", help="Se suma este % por cada tramo de monto prestado."),
+        _f("LOAN_TIER_SIZE", "Tamaño del tramo", lo=1, unit="🪙"),
+        _f("LOAN_WEEKLY_PERCENT", "Cuota", lo=1, hi=100, unit="% de la deuda", help="Porcentaje de la deuda que se paga en cada cuota."),
+        _f("LOAN_LATE_FEE_PERCENT", "Recargo por atraso", hi=100, unit="%"),
+        _f("LOAN_PERIOD_DAYS", "Cada cuánto se cobra", lo=1, hi=60, unit="días"),
+    ]},
+    {"id": "roles", "icon": "🤝", "title": "Roles prestados", "desc": "Préstamo y mercado de roles.", "fields": [
+        _f("ROLE_LOAN_LENDER_PERCENT", "% del collect para el dueño", hi=100, unit="%", help="En /prestar, parte de cada collect que va al dueño del rol."),
+        _f("ROLE_MARKET_FEE_PERCENT", "Comisión del mercado", hi=100, unit="%", help="Se descuenta al vendedor en ventas y alquileres."),
+    ]},
+    {"id": "events", "icon": "🎉", "title": "Eventos", "desc": "Collect doble. Para activar uno ahora mismo usa el Resumen.", "fields": [
+        _f("WEEKEND_DOUBLE_COLLECT", "Collect doble los fines de semana", typ="bool", help="Sábado y domingo (hora UTC)."),
+        _f("COLLECT_EVENT_MULTIPLIER", "Multiplicador del evento", lo=1, hi=10, unit="×"),
+    ]},
+    {"id": "weekly", "icon": "🏆", "title": "Ranking semanal", "desc": "Premios automáticos de /top cada lunes 00:00 UTC.", "fields": [
+        _f("WEEKLY_PRIZE_1", "Premio 1º lugar", unit="🪙"),
+        _f("WEEKLY_PRIZE_2", "Premio 2º lugar", unit="🪙"),
+        _f("WEEKLY_PRIZE_3", "Premio 3º lugar", unit="🪙"),
+    ]},
+    {"id": "clans", "icon": "🛡️", "title": "Clanes", "desc": "Banco compartido y equipos.", "fields": [
+        _f("CLAN_CREATE_COST", "Costo de crear un clan", unit="🪙"),
+        _f("CLAN_MAX_MEMBERS", "Máximo de miembros", lo=2, hi=50),
+    ]},
+    {"id": "games", "icon": "🎰", "title": "Juegos", "desc": "Mines y torneos de luchadores.", "fields": [
+        _f("MINES_PAYOUT_FACTOR", "Pago de Mines", typ="float", lo=0.5, hi=1.0, step=0.01, unit="× justo", help="1.00 = sin ventaja de la casa. 0.96 = 4% de ventaja."),
+        _f("FIGHTER_TOURNAMENT_PRIZE", "Premio del torneo sin apuesta", unit="🪙"),
+        _f("FIGHTER_TOURNAMENT_RAKE_PERCENT", "Comisión del torneo con apuesta", hi=100, unit="%"),
+    ]},
+]
+CONFIG_PAIRS = [
+    ("WORK_MIN", "WORK_MAX"), ("SLUT_MIN", "SLUT_MAX"), ("SLUT_FINE_MIN", "SLUT_FINE_MAX"),
+    ("CRIME_MIN", "CRIME_MAX"), ("CRIME_FINE_MIN", "CRIME_FINE_MAX"), ("ROB_STEAL_MIN_PCT", "ROB_STEAL_MAX_PCT"),
+    ("LOAN_MIN", "LOAN_MAX"),
+]
+ITEM_DEFAULTS: dict = {}
+for _iid, _item in SHOP_ITEMS.items():
+    ITEM_DEFAULTS[f"ITEM:{_iid}:price"] = _item["price"]
+    if _item["category"] == "rol":
+        ITEM_DEFAULTS[f"ITEM:{_iid}:collect_bonus"] = _item["collect_bonus"]
+        ITEM_DEFAULTS[f"ITEM:{_iid}:collect_hours"] = _item["collect_hours"]
+for _fid, _fighter in FIGHTERS.items():
+    ITEM_DEFAULTS[f"FIGHTER:{_fid}:price"] = _fighter["price"]
+CONFIG_DEFAULTS_STATIC = {
+    field["key"]: globals()[field["key"]] for g in CONFIG_GROUPS_STATIC for field in g["fields"]
+}
+
+
+def config_groups() -> list[dict]:
+    """Esquema completo (grupos estaticos + tienda y luchadores generados desde los datos reales)."""
+    shop_fields = []
+    for item_id, item in SHOP_ITEMS.items():
+        shop_fields.append(_f(f"ITEM:{item_id}:price", "Precio", unit="🪙", sub=item["name"]))
+        if item["category"] == "rol":
+            shop_fields.append(_f(f"ITEM:{item_id}:collect_bonus", "Ganancia por /collect", unit="🪙", sub=item["name"]))
+            shop_fields.append(_f(f"ITEM:{item_id}:collect_hours", "Cada cuántas horas", lo=1, hi=720, unit="horas", sub=item["name"]))
+    fighter_fields = [_f(f"FIGHTER:{fid}:price", "Precio", unit="🪙", sub=f["name"]) for fid, f in FIGHTERS.items()]
+    return CONFIG_GROUPS_STATIC + [
+        {"id": "shop", "icon": "🛒", "title": "Tienda y roles", "desc": "Precio de cada objeto y lo que pagan los roles con /collect.", "fields": shop_fields},
+        {"id": "fighters", "icon": "🥊", "title": "Luchadores", "desc": "Precio de cada luchador.", "fields": fighter_fields},
+    ]
+
+
+def config_field_map() -> dict:
+    return {f["key"]: f for g in config_groups() for f in g["fields"]}
+
+
+def config_default(key: str):
+    return CONFIG_DEFAULTS_STATIC[key] if key in CONFIG_DEFAULTS_STATIC else ITEM_DEFAULTS[key]
+
+
+def config_current(key: str):
+    if key.startswith("ITEM:"):
+        _, item_id, field = key.split(":")
+        return SHOP_ITEMS[item_id][field]
+    if key.startswith("FIGHTER:"):
+        _, fighter_id, field = key.split(":")
+        return FIGHTERS[fighter_id][field]
+    return globals()[key]
+
+
+def _config_set_raw(key: str, value):
+    if key.startswith("ITEM:"):
+        _, item_id, field = key.split(":")
+        SHOP_ITEMS[item_id][field] = value
+    elif key.startswith("FIGHTER:"):
+        _, fighter_id, field = key.split(":")
+        FIGHTERS[fighter_id][field] = value
+    else:
+        globals()[key] = value
+
+
+_ROLE_DESC_RE = re.compile(r"Gana \*\*\+[\d,]+\*\* 🪙 cada \d+h con `/collect`\.")
+
+
+def _config_post_apply():
+    """Recalcula lo que se deriva de varios valores (premios, periodo de prestamos, textos de roles)."""
+    globals()["WEEKLY_PRIZES"] = (WEEKLY_PRIZE_1, WEEKLY_PRIZE_2, WEEKLY_PRIZE_3)
+    globals()["LOAN_PERIOD"] = timedelta(days=LOAN_PERIOD_DAYS)
+    for item in SHOP_ITEMS.values():
+        if item["category"] == "rol" and _ROLE_DESC_RE.fullmatch(item.get("description", "")):
+            item["description"] = (
+                f"Gana **+{item['collect_bonus']:,}** 🪙 cada {item['collect_hours']}h con `/collect`."
+            )
+
+
+def config_validate(updates: dict) -> tuple[dict, list[str]]:
+    """Valida los cambios pedidos. Devuelve (valores limpios, lista de errores)."""
+    fields = config_field_map()
+    clean: dict = {}
+    errors: list[str] = []
+    for key, raw in updates.items():
+        field = fields.get(key)
+        if field is None:
+            errors.append(f"Ajuste desconocido: {key}")
+            continue
+        label = f"{field.get('sub') + ' · ' if field.get('sub') else ''}{field['label']}"
+        typ = field["type"]
+        if typ == "bool":
+            if not isinstance(raw, bool):
+                errors.append(f"{label}: debe ser sí/no.")
+                continue
+            clean[key] = raw
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            errors.append(f"{label}: debe ser un número.")
+            continue
+        if typ == "int":
+            if isinstance(raw, float) and not raw.is_integer():
+                errors.append(f"{label}: debe ser un número entero.")
+                continue
+            value = int(raw)
+        else:
+            value = round(float(raw), 4)
+        if not field["min"] <= value <= field["max"]:
+            errors.append(f"{label}: debe estar entre {field['min']:,} y {field['max']:,}.")
+            continue
+        clean[key] = value
+    if not errors:
+        merged = lambda k: clean[k] if k in clean else config_current(k)  # noqa: E731
+        for low, high in CONFIG_PAIRS:
+            if (low in clean or high in clean) and merged(low) > merged(high):
+                lf, hf = fields[low], fields[high]
+                errors.append(f"{lf['label']} no puede ser mayor que {hf['label'].lower()} (revisa el grupo).")
+    return clean, errors
+
+
+def config_apply(clean: dict):
+    for key, value in clean.items():
+        _config_set_raw(key, value)
+    _config_post_apply()
+
+
+async def init_dashboard_tables():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS config_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, user_id TEXT NOT NULL,
+                user_name TEXT NOT NULL, key TEXT NOT NULL, old TEXT, new TEXT)"""
+        )
+        await db.commit()
+
+
+async def config_load():
+    """Lee los ajustes guardados y los aplica (al arrancar el bot)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT key, value FROM bot_settings WHERE key LIKE 'cfg:%'") as cur:
+            rows = await cur.fetchall()
+    saved: dict = {}
+    for key, value in rows:
+        try:
+            saved[key[4:]] = _json.loads(value)
+        except ValueError:
+            continue
+    # cada valor se valida por separado: uno roto no tumba al resto
+    for key, value in saved.items():
+        clean, errors = config_validate({key: value})
+        if not errors:
+            config_apply(clean)
+    _config_post_apply()
+
+
+async def config_save(updates: dict, user_id: str, user_name: str) -> tuple[dict, list[str]]:
+    clean, errors = config_validate(updates)
+    if errors:
+        return {}, errors
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        for key, value in clean.items():
+            old = config_current(key)
+            if value == config_default(key):
+                await db.execute("DELETE FROM bot_settings WHERE key=?", (f"cfg:{key}",))
+            else:
+                await db.execute(
+                    "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (f"cfg:{key}", _json.dumps(value)),
+                )
+            if old != value:
+                await db.execute(
+                    "INSERT INTO config_audit (ts, user_id, user_name, key, old, new) VALUES (?, ?, ?, ?, ?, ?)",
+                    (now, user_id, user_name, key, _json.dumps(old), _json.dumps(value)),
+                )
+        await db.commit()
+    config_apply(clean)
+    return clean, []
+
+
+def config_snapshot() -> list[dict]:
+    """Esquema + valor actual + valor por defecto, listo para enviarlo al panel."""
+    out = []
+    for group in config_groups():
+        fields = []
+        for field in group["fields"]:
+            item = dict(field)
+            item["value"] = config_current(field["key"])
+            item["default"] = config_default(field["key"])
+            fields.append(item)
+        out.append({"id": group["id"], "icon": group["icon"], "title": group["title"],
+                    "desc": group["desc"], "fields": fields})
+    return out
+
+
+async def dashboard_stats() -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*), COALESCE(SUM(balance),0), COALESCE(SUM(bank),0) FROM users") as cur:
+            users, wallet, bank = await cur.fetchone()
+        counts = {}
+        for name, sql in (
+            ("clans", "SELECT COUNT(*) FROM clans"),
+            ("loans", "SELECT COUNT(*) FROM loans"),
+            ("role_loans", "SELECT COUNT(*) FROM role_loans"),
+            ("listings", "SELECT COUNT(*) FROM role_listings"),
+        ):
+            try:
+                async with db.execute(sql) as cur:
+                    counts[name] = (await cur.fetchone())[0]
+            except Exception:
+                counts[name] = 0
+    mult, event_text = await collect_event_info()
+    return {
+        "users": users, "money_wallet": wallet, "money_bank": bank, "guilds": len(client.guilds),
+        "event_multiplier": mult, "event_text": event_text, **counts,
+    }
+
+
+async def dashboard_audit(limit: int = 40) -> list[dict]:
+    fields = config_field_map()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT ts, user_name, key, old, new FROM config_audit ORDER BY id DESC LIMIT ?", (limit,)
+        ) as cur:
+            rows = await cur.fetchall()
+    out = []
+    for ts, user_name, key, old, new in rows:
+        field = fields.get(key)
+        label = key if field is None else f"{field.get('sub') + ' · ' if field.get('sub') else ''}{field['label']}"
+        out.append({"ts": ts, "user": user_name, "label": label, "old": old, "new": new})
+    return out
+
+
+async def dashboard_set_event(hours: int) -> str:
+    if hours <= 0:
+        await setting_del("double_collect_until")
+        return "Evento manual terminado."
+    until = datetime.utcnow() + timedelta(hours=hours)
+    await setting_set("double_collect_until", until.isoformat())
+    return f"Collect x{COLLECT_EVENT_MULTIPLIER} activado por {hours} h."
+
+
+# ------------------------------------------------------------------ /work /slut /crime (config desde el panel)
+def _fmt_secs(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    if seconds >= 3600:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    if seconds >= 60:
+        return f"{seconds // 60}m {seconds % 60}s"
+    return f"{seconds}s"
+
+
+async def run_income_command(kind: str, user_id: str, username: str) -> discord.Embed:
+    """Ejecuta work / slut / crime usando los valores configurados en el panel."""
+    await get_or_create_user(user_id, username)
+    cooldown, col = {
+        "work": (WORK_COOLDOWN_SECONDS, "last_work"),
+        "slut": (SLUT_COOLDOWN_SECONDS, "last_slut"),
+        "crime": (CRIME_COOLDOWN_SECONDS, "last_crime"),
+    }[kind]
+    now = datetime.utcnow()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            f"UPDATE users SET {col}=? WHERE user_id=? AND ({col} IS NULL OR {col} <= ?)",
+            (now.isoformat(), user_id, (now - timedelta(seconds=cooldown)).isoformat()),
+        )
+        await db.commit()
+        if cur.rowcount == 0:
+            async with db.execute(f"SELECT {col} FROM users WHERE user_id=?", (user_id,)) as c2:
+                row = await c2.fetchone()
+            left = cooldown
+            if row and row[0]:
+                left = cooldown - (now - datetime.fromisoformat(row[0])).total_seconds()
+            if kind == "work":
+                return discord.Embed(title="⏰ Aún estás trabajando", color=0xFF4444,
+                                     description=f"Descansa **{_fmt_secs(left)}** antes de volver a trabajar.")
+            return discord.Embed(title="⏰ Cooldown Activo", color=0xFF4444,
+                                 description=f"Espera **{_fmt_secs(left)}** para volver a intentarlo.")
+
+    if kind == "work":
+        earned = random.randint(WORK_MIN, max(WORK_MIN, WORK_MAX))
+        titulo, desc = random.choice([
+            ("👨‍🍳 Cocinero", f"Preparaste platos toda la noche y ganaste **{earned:,}** 🪙."),
+            ("🚗 Taxista", f"Llevaste pasajeros por toda la ciudad y ganaste **{earned:,}** 🪙."),
+            ("💻 Programador", f"Terminaste un proyecto freelance y ganaste **{earned:,}** 🪙."),
+            ("🎸 Músico", f"Tocaste en una plaza y la gente aplaudió. Ganaste **{earned:,}** 🪙."),
+            ("📦 Repartidor", f"Repartiste 30 pedidos y ganaste **{earned:,}** 🪙."),
+            ("🧹 Limpiador", f"Limpiaste el casino de arriba a abajo. Ganaste **{earned:,}** 🪙."),
+        ])
+        await update_balance(user_id, earned)
+        new_bal = await get_balance(user_id)
+        return discord.Embed(title=f"💼 {titulo}", color=0x00FF88,
+                             description=f"{desc}\n\n👛 Saldo actual: **{new_bal:,}** 🪙")
+
+    chance, lo, hi, fine_lo, fine_hi = (
+        (SLUT_CHANCE, SLUT_MIN, SLUT_MAX, SLUT_FINE_MIN, SLUT_FINE_MAX) if kind == "slut"
+        else (CRIME_CHANCE, CRIME_MIN, CRIME_MAX, CRIME_FINE_MIN, CRIME_FINE_MAX)
+    )
+    if random.random() < chance / 100:
+        earned = random.randint(lo, max(lo, hi))
+        if kind == "slut":
+            text = random.choice([
+                f"💋 Una noche rentable. Ganaste **{earned:,}** 🪙.",
+                f"💄 El cliente quedó satisfecho. Ganaste **{earned:,}** 🪙.",
+                f"🌹 Noche de buenas propinas. Ganaste **{earned:,}** 🪙.",
+            ])
+            title, color = "💋 ¡Éxito!", 0xFF69B4
+        else:
+            text = random.choice([
+                f"🏦 Asaltaste un banco pequeño y escapaste con **{earned:,}** 🪙.",
+                f"💎 Vendiste joyas robadas en el mercado negro. Ganaste **{earned:,}** 🪙.",
+                f"🎰 Hackeaste una slot machine. Ganaste **{earned:,}** 🪙.",
+                f"🚗 Robaste un auto de lujo y lo vendiste. Ganaste **{earned:,}** 🪙.",
+                f"📱 Estafaste a un coleccionista con NFTs falsos. Ganaste **{earned:,}** 🪙.",
+            ])
+            title, color = "🦹 ¡Crimen Exitoso!", 0x9B59B6
+        await update_balance(user_id, earned)
+        new_bal = await get_balance(user_id)
+        return discord.Embed(title=title, color=color, description=f"{text}\n\n👛 Saldo: **{new_bal:,}** 🪙")
+
+    lost = min(random.randint(fine_lo, max(fine_lo, fine_hi)), await get_balance(user_id))
+    await update_balance(user_id, -lost)
+    new_bal = await get_balance(user_id)
+    if kind == "slut":
+        text, title = f"La policía te arrestó. Multa: **{lost:,}** 🪙.", "🚔 ¡Te Pillaron!"
+    else:
+        text = random.choice([
+            f"🚔 La policía te atrapó en pleno acto. Multa: **{lost:,}** 🪙.",
+            f"😬 Tu cómplice te traicionó. Perdiste **{lost:,}** 🪙 en sobornos.",
+            f"🔒 Las cámaras te grabaron. Multa judicial: **{lost:,}** 🪙.",
+        ])
+        title = "🚔 ¡Operación Fallida!"
+    return discord.Embed(title=title, color=0xFF4444, description=f"{text}\n\n👛 Saldo: **{new_bal:,}** 🪙")
+
+
+@tree.command(name="work", description="Trabaja para ganar monedas")
+async def work_command(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=await run_income_command("work", str(interaction.user.id), interaction.user.name))
+
+
+@tree.command(name="slut", description="Arriesga para ganar monedas (puede salir mal)")
+async def slut_command(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=await run_income_command("slut", str(interaction.user.id), interaction.user.name))
+
+
+@tree.command(name="crime", description="Comete un crimen: gana monedas o paga una multa")
+async def crime_command(interaction: discord.Interaction):
+    await interaction.response.send_message(
+        embed=await run_income_command("crime", str(interaction.user.id), interaction.user.name))
+
+
+# ------------------------------------------------------------------ servidor web
+DASH_SESSION_HOURS = 12
+_login_attempts: dict = {}     # ip -> (intentos, inicio)  (limite para el login con contraseña)
+
+
+def _dash_env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
+
+
+def _dash_secret() -> bytes:
+    secret = _dash_env("DASHBOARD_SECRET") or (TOKEN or "dashboard") + "|dashboard-v1"
+    return _hashlib.sha256(secret.encode()).digest()
+
+
+def _dash_admin_ids() -> set[str]:
+    return {x for x in re.split(r"[\s,;]+", _dash_env("DASHBOARD_ADMIN_IDS")) if x}
+
+
+def _dash_oauth_ready() -> bool:
+    return bool(_dash_env("DASHBOARD_CLIENT_SECRET"))
+
+
+def _dash_password_ready() -> bool:
+    return bool(_dash_env("DASHBOARD_PASSWORD"))
+
+
+def dash_sign(payload: dict) -> str:
+    raw = _b64.urlsafe_b64encode(_json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+    sig = _hmac.new(_dash_secret(), raw.encode(), _hashlib.sha256).hexdigest()
+    return f"{raw}.{sig}"
+
+
+def dash_unsign(token: str | None) -> dict | None:
+    if not token or "." not in token:
+        return None
+    raw, sig = token.rsplit(".", 1)
+    expected = _hmac.new(_dash_secret(), raw.encode(), _hashlib.sha256).hexdigest()
+    if not _hmac.compare_digest(sig, expected):
+        return None
+    try:
+        data = _json.loads(_b64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict) or data.get("exp", 0) < _time.time():
+        return None
+    return data
+
+
+def dash_user_allowed(user_id: str, guilds: list[dict]) -> bool:
+    """Con DASHBOARD_ADMIN_IDS: solo esos usuarios. Sin ella: administradores de un servidor donde esta el bot."""
+    admins = _dash_admin_ids()
+    if admins:
+        return user_id in admins
+    bot_guilds = {str(g.id) for g in client.guilds}
+    for g in guilds:
+        if str(g.get("id")) in bot_guilds and (g.get("owner") or int(g.get("permissions") or 0) & 0x8):
+            return True
+    return False
+
+
+def _dash_base_url(request) -> str:
+    base = _dash_env("DASHBOARD_URL")
+    if base:
+        return base.rstrip("/")
+    proto = request.headers.get("X-Forwarded-Proto", "http")
+    host = request.headers.get("X-Forwarded-Host") or request.host
+    return f"{proto}://{host}"
+
+
+def _dash_session(request) -> dict | None:
+    return dash_unsign(request.cookies.get("dash_session"))
+
+
+def _dash_start_session(response, request, user_id: str, name: str):
+    token = dash_sign({"uid": user_id, "name": name, "exp": _time.time() + DASH_SESSION_HOURS * 3600})
+    response.set_cookie("dash_session", token, max_age=DASH_SESSION_HOURS * 3600, httponly=True,
+                        samesite="Lax", secure=_dash_base_url(request).startswith("https"), path="/")
+
+
+def _json_error(message: str, status: int):
+    return _web.json_response({"ok": False, "error": message}, status=status)
+
+
+async def _dash_guard(request, write: bool = False):
+    """Devuelve (sesion, None) o (None, respuesta de error)."""
+    session = _dash_session(request)
+    if not session:
+        return None, _json_error("Sesión no iniciada.", 401)
+    if write and request.headers.get("X-Requested-With") != "dashboard":
+        return None, _json_error("Petición no válida.", 403)   # anti-CSRF
+    return session, None
+
+
+async def h_index(request):
+    return _web.Response(text=DASHBOARD_HTML, content_type="text/html", charset="utf-8",
+                         headers={"Cache-Control": "no-store"})
+
+
+async def h_health(request):
+    return _web.Response(text="ok")
+
+
+async def h_me(request):
+    session = _dash_session(request)
+    return _web.json_response({
+        "authenticated": bool(session),
+        "user": {"id": session["uid"], "name": session["name"]} if session else None,
+        "discord": _dash_oauth_ready(),
+        "password": _dash_password_ready(),
+    })
+
+
+async def h_login(request):
+    if not _dash_oauth_ready():
+        raise _web.HTTPFound("/?error=oauth")
+    client_id = _dash_env("DASHBOARD_CLIENT_ID") or str(client.user.id)
+    state = _secrets.token_urlsafe(24)
+    url = "https://discord.com/oauth2/authorize?" + _urlencode({
+        "client_id": client_id, "response_type": "code", "scope": "identify guilds", "state": state,
+        "redirect_uri": _dash_base_url(request) + "/callback", "prompt": "none",
+    })
+    response = _web.HTTPFound(url)
+    response.set_cookie("dash_state", dash_sign({"s": state, "exp": _time.time() + 600}), max_age=600,
+                        httponly=True, samesite="Lax", secure=_dash_base_url(request).startswith("https"), path="/")
+    raise response
+
+
+async def h_callback(request):
+    state_cookie = dash_unsign(request.cookies.get("dash_state"))
+    if request.query.get("error") or not state_cookie or state_cookie.get("s") != request.query.get("state"):
+        raise _web.HTTPFound("/?error=state")
+    code = request.query.get("code")
+    if not code or not _dash_oauth_ready():
+        raise _web.HTTPFound("/?error=oauth")
+    client_id = _dash_env("DASHBOARD_CLIENT_ID") or str(client.user.id)
+    redirect_uri = _dash_base_url(request) + "/callback"
+    try:
+        async with _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=15)) as http:
+            async with http.post("https://discord.com/api/v10/oauth2/token", data={
+                "client_id": client_id, "client_secret": _dash_env("DASHBOARD_CLIENT_SECRET"),
+                "grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri,
+            }) as resp:
+                token = await resp.json()
+            access = token.get("access_token")
+            if not access:
+                raise _web.HTTPFound("/?error=token")
+            headers = {"Authorization": f"Bearer {access}"}
+            async with http.get("https://discord.com/api/v10/users/@me", headers=headers) as resp:
+                user = await resp.json()
+            async with http.get("https://discord.com/api/v10/users/@me/guilds", headers=headers) as resp:
+                guilds = await resp.json()
+    except (_aiohttp.ClientError, ValueError, asyncio.TimeoutError):
+        raise _web.HTTPFound("/?error=network")
+    if not isinstance(user, dict) or "id" not in user or not isinstance(guilds, list):
+        raise _web.HTTPFound("/?error=token")
+    if not dash_user_allowed(str(user["id"]), guilds):
+        raise _web.HTTPFound("/?error=denied")
+    response = _web.HTTPFound("/")
+    _dash_start_session(response, request, str(user["id"]), user.get("global_name") or user.get("username") or "admin")
+    response.del_cookie("dash_state", path="/")
+    raise response
+
+
+async def h_password_login(request):
+    if not _dash_password_ready():
+        return _json_error("El login con contraseña no está activado.", 400)
+    if request.headers.get("X-Requested-With") != "dashboard":
+        return _json_error("Petición no válida.", 403)
+    ip = request.headers.get("X-Forwarded-For", request.remote or "?").split(",")[0].strip()
+    count, start = _login_attempts.get(ip, (0, _time.time()))
+    if _time.time() - start > 600:
+        count, start = 0, _time.time()
+    if count >= 5:
+        return _json_error("Demasiados intentos. Espera unos minutos.", 429)
+    try:
+        body = await request.json()
+    except ValueError:
+        return _json_error("JSON inválido.", 400)
+    password = str(body.get("password", "")) if isinstance(body, dict) else ""
+    if not _hmac.compare_digest(password.encode(), _dash_env("DASHBOARD_PASSWORD").encode()):
+        _login_attempts[ip] = (count + 1, start)
+        return _json_error("Contraseña incorrecta.", 401)
+    _login_attempts.pop(ip, None)
+    response = _web.json_response({"ok": True})
+    _dash_start_session(response, request, "password", "Administrador")
+    return response
+
+
+async def h_logout(request):
+    if request.headers.get("X-Requested-With") != "dashboard":
+        return _json_error("Petición no válida.", 403)
+    response = _web.json_response({"ok": True})
+    response.del_cookie("dash_session", path="/")
+    return response
+
+
+async def h_config_get(request):
+    _, error = await _dash_guard(request)
+    if error:
+        return error
+    return _web.json_response({"ok": True, "groups": config_snapshot()})
+
+
+async def h_config_post(request):
+    session, error = await _dash_guard(request, write=True)
+    if error:
+        return error
+    try:
+        body = await request.json()
+    except ValueError:
+        return _json_error("JSON inválido.", 400)
+    values = body.get("values") if isinstance(body, dict) else None
+    if not isinstance(values, dict) or not values:
+        return _json_error("No hay cambios que guardar.", 400)
+    clean, errors = await config_save(values, session["uid"], session["name"])
+    if errors:
+        return _web.json_response({"ok": False, "error": "Revisa los valores.", "errors": errors}, status=400)
+    return _web.json_response({"ok": True, "saved": len(clean), "groups": config_snapshot()})
+
+
+async def h_config_reset(request):
+    session, error = await _dash_guard(request, write=True)
+    if error:
+        return error
+    try:
+        body = await request.json()
+    except ValueError:
+        return _json_error("JSON inválido.", 400)
+    group_id = body.get("group") if isinstance(body, dict) else None
+    groups = {g["id"]: g for g in config_groups()}
+    if group_id not in groups:
+        return _json_error("Grupo desconocido.", 400)
+    defaults = {f["key"]: config_default(f["key"]) for f in groups[group_id]["fields"]}
+    clean, errors = await config_save(defaults, session["uid"], session["name"])
+    if errors:
+        return _web.json_response({"ok": False, "error": "No se pudo restablecer.", "errors": errors}, status=400)
+    return _web.json_response({"ok": True, "groups": config_snapshot()})
+
+
+async def h_stats(request):
+    _, error = await _dash_guard(request)
+    if error:
+        return error
+    return _web.json_response({"ok": True, "stats": await dashboard_stats(), "audit": await dashboard_audit()})
+
+
+async def h_event(request):
+    session, error = await _dash_guard(request, write=True)
+    if error:
+        return error
+    try:
+        body = await request.json()
+        hours = int(body.get("hours", 0))
+    except (ValueError, TypeError, AttributeError):
+        return _json_error("Horas inválidas.", 400)
+    if not 0 <= hours <= 168:
+        return _json_error("Las horas deben estar entre 0 y 168.", 400)
+    return _web.json_response({"ok": True, "message": await dashboard_set_event(hours)})
+
+
+def build_dashboard_app():
+    app = _web.Application()
+    app.add_routes([
+        _web.get("/", h_index),
+        _web.get("/healthz", h_health),
+        _web.get("/login", h_login),
+        _web.get("/callback", h_callback),
+        _web.post("/login/password", h_password_login),
+        _web.post("/logout", h_logout),
+        _web.get("/api/me", h_me),
+        _web.get("/api/config", h_config_get),
+        _web.post("/api/config", h_config_post),
+        _web.post("/api/config/reset", h_config_reset),
+        _web.get("/api/stats", h_stats),
+        _web.post("/api/event", h_event),
+    ])
+    return app
+
+
+_dashboard_runner = None
+
+
+async def dashboard_start():
+    """Arranca el panel web (una sola vez). Sin metodo de login configurado, no se abre."""
+    global _dashboard_runner
+    if _dashboard_runner is not None:
+        return
+    if not (_dash_oauth_ready() or _dash_password_ready()):
+        print("Panel web desactivado: define DASHBOARD_CLIENT_SECRET (login con Discord) "
+              "o DASHBOARD_PASSWORD (login con contraseña) para activarlo.")
+        return
+    port = int(os.environ.get("PORT", "8080"))
+    runner = _web.AppRunner(build_dashboard_app())
+    await runner.setup()
+    await _web.TCPSite(runner, "0.0.0.0", port).start()
+    _dashboard_runner = runner
+    print(f"Panel web activo en el puerto {port}")
+
+
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Casino Bot · Panel</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27><text y=%27.9em%27 font-size=%2790%27>🎰</text></svg>">
+<style>
+:root{--bg:#0e1015;--panel:#161922;--panel2:#1c2030;--line:#272c3b;--text:#e8eaf0;--muted:#8b93a8;--accent:#5865f2;--accent2:#7983f5;--ok:#2ecc71;--warn:#f1c40f;--bad:#ed4245}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+button{font:inherit;cursor:pointer}
+a{color:var(--accent2)}
+.muted{color:var(--muted)}
+.top{display:flex;align-items:center;justify-content:space-between;padding:12px 18px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+.brand{font-weight:700;font-size:17px}.brand span{margin-left:8px;font-size:11px;background:var(--accent);padding:2px 7px;border-radius:99px;vertical-align:middle}
+.user{display:flex;align-items:center;gap:10px;color:var(--muted)}
+.layout{display:flex;min-height:calc(100vh - 54px)}
+nav{width:230px;flex:none;background:var(--panel);border-right:1px solid var(--line);padding:12px 8px;overflow-y:auto;position:sticky;top:54px;height:calc(100vh - 54px)}
+nav button{display:flex;gap:10px;align-items:center;width:100%;text-align:left;background:none;border:0;color:var(--muted);padding:9px 12px;border-radius:8px;margin-bottom:2px}
+nav button:hover{background:var(--panel2);color:var(--text)}
+nav button.active{background:var(--accent);color:#fff}
+main{flex:1;min-width:0;padding:22px 24px 110px;max-width:900px}
+h1{margin:0 0 4px;font-size:24px}h3{margin:0 0 6px;font-size:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:6px 16px;margin:14px 0}
+.card h3{padding-top:12px}
+.row{display:grid;grid-template-columns:1fr auto;gap:4px 14px;align-items:center;padding:12px 0;border-top:1px solid var(--line)}
+.card h3+.row,.card>.row:first-child{border-top:0}
+.lab b{font-weight:600}.lab small{display:block;color:var(--muted);font-size:12.5px}
+.ctl{display:flex;align-items:center;gap:8px}
+.ctl input[type=number]{width:170px;background:var(--bg);border:1px solid var(--line);color:var(--text);padding:8px 10px;border-radius:8px;font:inherit;text-align:right}
+.ctl input[type=number]:focus{outline:2px solid var(--accent);border-color:transparent}
+.unit{color:var(--muted);font-size:12.5px;min-width:28px}
+.hint{grid-column:1/-1;font-size:12px;color:var(--muted);text-align:right;min-height:0}
+.row.dirty .ctl input{border-color:var(--warn)}
+.row.bad .ctl input{border-color:var(--bad)}
+.row.dirty .hint{color:var(--warn)}
+.reset{background:none;border:1px solid var(--line);color:var(--muted);border-radius:8px;padding:6px 9px}
+.reset:hover{color:var(--text);border-color:var(--muted)}
+.reset[hidden]{display:none}
+.switch{appearance:none;width:44px;height:24px;border-radius:99px;background:#3a3f52;position:relative;cursor:pointer;transition:.15s;border:0}
+.switch::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:.15s}
+.switch:checked{background:var(--ok)}.switch:checked::after{left:23px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px;margin:14px 0}
+.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+.stat small{color:var(--muted)}.stat b{display:block;font-size:22px;margin-top:2px}
+.btn{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:9px 16px;font-weight:600}
+.btn:hover{background:var(--accent2)}.btn.ok{background:var(--ok);color:#06210f}
+.ghost{background:none;border:1px solid var(--line);color:var(--text);border-radius:8px;padding:8px 14px}
+.ghost:hover{border-color:var(--muted)}.ghost.danger{color:var(--bad);margin-top:6px}
+.savebar{position:fixed;left:50%;transform:translateX(-50%);bottom:16px;background:var(--panel2);border:1px solid var(--warn);border-radius:12px;padding:10px 14px;display:flex;gap:12px;align-items:center;z-index:9;box-shadow:0 8px 30px #0008;max-width:calc(100vw - 24px)}
+.hidden{display:none!important}
+#toast{position:fixed;top:64px;right:14px;max-width:min(420px,calc(100vw - 28px));z-index:20;display:flex;flex-direction:column;gap:8px}
+.toast{background:var(--panel2);border:1px solid var(--line);border-left:4px solid var(--ok);padding:10px 14px;border-radius:8px;white-space:pre-line}
+.toast.err{border-left-color:var(--bad)}
+.login{max-width:420px;margin:12vh auto;padding:0 16px}
+.login .card{padding:22px}.login h1{text-align:center}
+.login input{width:100%;background:var(--bg);border:1px solid var(--line);color:var(--text);padding:10px;border-radius:8px;font:inherit;margin:8px 0}
+.login .btn{width:100%;display:block;text-align:center;text-decoration:none;margin-top:8px}
+.err{color:var(--bad)}
+table{width:100%;border-collapse:collapse;font-size:13.5px}th,td{text-align:left;padding:8px 6px;border-top:1px solid var(--line);vertical-align:top}th{color:var(--muted);font-weight:500;border-top:0}
+.inline{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0}
+.inline input{width:90px;background:var(--bg);border:1px solid var(--line);color:var(--text);padding:8px;border-radius:8px;font:inherit}
+@media(max-width:760px){
+ .layout{flex-direction:column}
+ nav{width:auto;height:auto;position:sticky;top:54px;z-index:4;display:flex;overflow-x:auto;padding:8px;border-right:0;border-bottom:1px solid var(--line)}
+ nav button{white-space:nowrap;width:auto;margin:0 4px 0 0;padding:8px 12px}
+ main{padding:16px 12px 120px}
+ .row{grid-template-columns:1fr}.ctl{justify-content:space-between}.ctl input[type=number]{width:100%;flex:1}.hint{text-align:left}
+}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toast"></div>
+<script>
+"use strict";
+const root = document.getElementById('app');
+const S = {me: null, groups: [], stats: null, audit: [], view: 'overview', edits: {}, invalid: new Set()};
+const fmt = n => Number(n).toLocaleString('en-US');
+
+function h(tag, props, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (k === 'class') el.className = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else if (v === true) el.setAttribute(k, '');
+    else if (v !== false && v != null) el.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) {
+    if (kid == null || kid === false) continue;
+    el.append(kid.nodeType ? kid : document.createTextNode(String(kid)));
+  }
+  return el;
+}
+
+async function api(path, method = 'GET', body) {
+  const opts = {method, headers: {'X-Requested-With': 'dashboard'}, credentials: 'same-origin'};
+  if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+  let res;
+  try { res = await fetch(path, opts); } catch (e) { return {status: 0, data: {ok: false, error: 'Sin conexión con el bot.'}}; }
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  return {status: res.status, data};
+}
+
+function toast(msg, isErr) {
+  const t = h('div', {class: 'toast' + (isErr ? ' err' : '')}, msg);
+  document.getElementById('toast').append(t);
+  setTimeout(() => t.remove(), isErr ? 7000 : 3000);
+}
+
+/* ---------------------------------------------------------------- login */
+function renderLogin(me) {
+  const errors = {oauth: 'El login con Discord no está configurado.', state: 'La sesión de login expiró. Intenta de nuevo.',
+    token: 'Discord rechazó el login. Intenta de nuevo.', network: 'No pude hablar con Discord. Intenta de nuevo.',
+    denied: 'Tu cuenta no tiene permiso para usar este panel.'};
+  const code = new URLSearchParams(location.search).get('error');
+  const card = h('div', {class: 'card'}, h('h1', {}, '🎰 Casino Bot'), h('p', {class: 'muted', style: 'text-align:center'}, 'Panel de configuración'));
+  if (code) card.append(h('p', {class: 'err'}, errors[code] || 'No se pudo iniciar sesión.'));
+  if (me.discord) card.append(h('a', {class: 'btn', href: '/login'}, 'Iniciar sesión con Discord'));
+  if (me.password) {
+    const pw = h('input', {type: 'password', placeholder: 'Contraseña del panel', autocomplete: 'current-password'});
+    const msg = h('p', {class: 'err'});
+    const go = async () => {
+      const {data} = await api('/login/password', 'POST', {password: pw.value});
+      if (data.ok) boot(); else msg.textContent = data.error || 'Error.';
+    };
+    pw.addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
+    card.append(h('div', {style: me.discord ? 'margin-top:16px' : ''}, pw, h('button', {class: 'btn', style: 'width:100%', onclick: go}, 'Entrar'), msg));
+  }
+  if (!me.discord && !me.password) card.append(h('p', {class: 'err'}, 'No hay ningún método de login configurado.'));
+  root.replaceChildren(h('div', {class: 'login'}, card));
+}
+
+/* ---------------------------------------------------------------- app */
+function nav() {
+  const items = [{id: 'overview', icon: '📊', title: 'Resumen'}, ...S.groups];
+  return h('nav', {}, items.map(g => {
+    const dirty = g.fields && g.fields.some(f => f.key in S.edits);
+    return h('button', {class: g.id === S.view ? 'active' : '', onclick: () => { S.view = g.id; location.hash = g.id; renderApp(); }},
+      g.icon, ' ', g.title, dirty ? ' •' : '');
+  }));
+}
+
+function renderApp() {
+  S.invalid = new Set();
+  root.replaceChildren(
+    h('header', {class: 'top'},
+      h('div', {class: 'brand'}, '🎰 Casino Bot', h('span', {}, 'Panel')),
+      h('div', {class: 'user'}, S.me.user.name, h('button', {class: 'ghost', onclick: logout}, 'Salir'))),
+    h('div', {class: 'layout'}, nav(), h('main', {id: 'main'}, view())),
+    h('div', {id: 'savebar', class: 'savebar hidden'},
+      h('span', {id: 'savecount'}), h('button', {class: 'ghost', onclick: discard}, 'Descartar'),
+      h('button', {class: 'btn ok', onclick: save}, 'Guardar cambios')));
+  updateSavebar();
+}
+
+function view() {
+  if (S.view === 'overview') return overview();
+  const g = S.groups.find(x => x.id === S.view);
+  return g ? groupView(g) : overview();
+}
+
+function updateSavebar() {
+  const n = Object.keys(S.edits).length + S.invalid.size;
+  const bar = document.getElementById('savebar');
+  if (!bar) return;
+  bar.classList.toggle('hidden', n === 0);
+  document.getElementById('savecount').textContent = n + (n === 1 ? ' cambio sin guardar' : ' cambios sin guardar');
+}
+
+function groupView(g) {
+  const wrap = h('div', {}, h('h1', {}, g.icon + ' ' + g.title), h('p', {class: 'muted'}, g.desc));
+  const blocks = new Map();
+  for (const f of g.fields) { const k = f.sub || ''; if (!blocks.has(k)) blocks.set(k, []); blocks.get(k).push(f); }
+  for (const [sub, fields] of blocks) {
+    const card = h('section', {class: 'card'});
+    if (sub) card.append(h('h3', {}, sub));
+    fields.forEach(f => card.append(fieldRow(f)));
+    wrap.append(card);
+  }
+  wrap.append(h('button', {class: 'ghost danger', onclick: () => resetGroup(g)}, 'Restablecer este grupo a los valores por defecto'));
+  return wrap;
+}
+
+function fieldRow(f) {
+  const cur = (f.key in S.edits) ? S.edits[f.key] : f.value;
+  const isBool = f.type === 'bool';
+  const input = isBool
+    ? h('input', {type: 'checkbox', class: 'switch'})
+    : h('input', {type: 'number', inputmode: f.type === 'int' ? 'numeric' : 'decimal', min: f.min, max: f.max, step: f.step || 1, value: cur});
+  if (isBool) input.checked = !!cur;
+  const hint = h('div', {class: 'hint'});
+  const reset = h('button', {class: 'reset', title: 'Valor por defecto', hidden: true}, '↺');
+  const row = h('div', {class: 'row'},
+    h('div', {class: 'lab'}, h('b', {}, f.label), f.help ? h('small', {}, f.help) : null),
+    h('div', {class: 'ctl'}, input, f.unit ? h('span', {class: 'unit'}, f.unit) : null, reset), hint);
+
+  const refresh = () => {
+    const val = isBool ? input.checked : Number(input.value);
+    const valid = isBool || (input.value !== '' && Number.isFinite(val) && val >= f.min && val <= f.max && (f.type !== 'int' || Number.isInteger(val)));
+    row.classList.toggle('bad', !valid);
+    if (valid) { S.invalid.delete(f.key); if (val === f.value) delete S.edits[f.key]; else S.edits[f.key] = val; }
+    else { S.invalid.add(f.key); delete S.edits[f.key]; }
+    row.classList.toggle('dirty', valid && val !== f.value);
+    reset.hidden = !(valid ? val !== f.default : true);
+    const parts = [];
+    if (!isBool && valid) parts.push(fmt(val));
+    if (!valid) parts.push('Valor no válido (' + fmt(f.min) + ' a ' + fmt(f.max) + ')');
+    else if (val !== f.default) parts.push('por defecto: ' + (isBool ? (f.default ? 'sí' : 'no') : fmt(f.default)));
+    hint.textContent = parts.join(' · ');
+    updateSavebar();
+  };
+  input.addEventListener('input', refresh);
+  reset.addEventListener('click', () => { if (isBool) input.checked = !!f.default; else input.value = f.default; refresh(); });
+  refresh();
+  return row;
+}
+
+function discard() { S.edits = {}; renderApp(); }
+
+async function save() {
+  if (S.invalid.size) { toast('Corrige los valores en rojo antes de guardar.', true); return; }
+  if (!Object.keys(S.edits).length) return;
+  const {data} = await api('/api/config', 'POST', {values: S.edits});
+  if (data.ok) { S.groups = data.groups; S.edits = {}; toast('Guardado ✅ (' + data.saved + ')'); renderApp(); }
+  else toast((data.errors && data.errors.length ? data.errors : [data.error || 'Error']).join('\n'), true);
+}
+
+async function resetGroup(g) {
+  if (!confirm('¿Restablecer "' + g.title + '" a los valores por defecto?')) return;
+  const {data} = await api('/api/config/reset', 'POST', {group: g.id});
+  if (data.ok) { g.fields.forEach(f => delete S.edits[f.key]); S.groups = data.groups; toast('Restablecido ✅'); renderApp(); }
+  else toast((data.errors || [data.error || 'Error']).join('\n'), true);
+}
+
+/* ---------------------------------------------------------------- resumen */
+function cleanEvent(text) {
+  return String(text).replace(/<t:(\d+):[a-zA-Z]>/g, (_, s) => new Date(Number(s) * 1000).toLocaleString()).replace(/\*\*/g, '').replace(/`/g, '');
+}
+
+function overview() {
+  const wrap = h('div', {}, h('h1', {}, '📊 Resumen'), h('p', {class: 'muted'}, 'Estado general del casino y accesos rápidos.'));
+  const st = S.stats;
+  if (!st) { wrap.append(h('p', {class: 'muted'}, 'Cargando…')); return wrap; }
+  const stat = (label, val) => h('div', {class: 'stat'}, h('small', {}, label), h('b', {}, val));
+  wrap.append(h('div', {class: 'grid'},
+    stat('👥 Jugadores', fmt(st.users)), stat('👛 Dinero en carteras', fmt(st.money_wallet) + ' 🪙'),
+    stat('🏦 Dinero en bancos', fmt(st.money_bank) + ' 🪙'), stat('🌐 Servidores', fmt(st.guilds)),
+    stat('🛡️ Clanes', fmt(st.clans)), stat('💳 Préstamos activos', fmt(st.loans)),
+    stat('🤝 Roles prestados', fmt(st.role_loans)), stat('🏪 Anuncios en el mercado', fmt(st.listings))));
+
+  const hours = h('input', {type: 'number', min: 1, max: 168, value: 24});
+  const evt = async (hrs) => {
+    const {data} = await api('/api/event', 'POST', {hours: hrs});
+    toast(data.ok ? data.message : (data.error || 'Error'), !data.ok);
+    await loadStats(); renderApp();
+  };
+  wrap.append(h('section', {class: 'card'}, h('h3', {}, '🎉 Evento de collect doble'),
+    h('p', {class: 'muted', style: 'white-space:pre-line'}, cleanEvent(st.event_text)),
+    h('div', {class: 'inline'}, hours, h('span', {class: 'muted'}, 'horas'),
+      h('button', {class: 'btn', onclick: () => evt(Number(hours.value) || 0)}, 'Activar ahora'),
+      h('button', {class: 'ghost', onclick: () => evt(0)}, 'Terminar evento manual'))));
+
+  const card = h('section', {class: 'card'}, h('h3', {}, '🕘 Últimos cambios'));
+  if (!S.audit.length) card.append(h('p', {class: 'muted'}, 'Todavía no se ha cambiado nada desde el panel.'));
+  else {
+    const tb = h('table', {}, h('tr', {}, h('th', {}, 'Cuándo'), h('th', {}, 'Quién'), h('th', {}, 'Ajuste'), h('th', {}, 'Cambio')));
+    S.audit.forEach(a => tb.append(h('tr', {},
+      h('td', {}, new Date(a.ts + 'Z').toLocaleString()), h('td', {}, a.user), h('td', {}, a.label),
+      h('td', {}, show(a.old) + ' → ' + show(a.new)))));
+    card.append(h('div', {style: 'overflow-x:auto'}, tb));
+  }
+  wrap.append(card);
+  return wrap;
+}
+function show(v) { try { const x = JSON.parse(v); return typeof x === 'number' ? fmt(x) : (x === true ? 'sí' : x === false ? 'no' : String(x)); } catch (e) { return String(v); } }
+
+/* ---------------------------------------------------------------- arranque */
+async function loadStats() {
+  const {data} = await api('/api/stats');
+  if (data.ok) { S.stats = data.stats; S.audit = data.audit; }
+}
+async function logout() { await api('/logout', 'POST', {}); S.edits = {}; boot(); }
+
+async function boot() {
+  const {data: me} = await api('/api/me');
+  if (!me.authenticated) { renderLogin(me); return; }
+  S.me = me;
+  const cfg = await api('/api/config');
+  if (!cfg.data.ok) { renderLogin(me); return; }
+  S.groups = cfg.data.groups;
+  const wanted = location.hash.slice(1);
+  S.view = (wanted && S.groups.some(g => g.id === wanted)) ? wanted : 'overview';
+  renderApp();
+  await loadStats();
+  if (S.view === 'overview') renderApp();
+}
+
+window.addEventListener('beforeunload', e => { if (Object.keys(S.edits).length) { e.preventDefault(); e.returnValue = ''; } });
+boot();
+</script>
+</body>
+</html>
+"""
 
 
 if __name__ == "__main__":
