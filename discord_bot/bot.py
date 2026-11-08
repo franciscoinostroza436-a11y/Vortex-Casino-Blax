@@ -753,6 +753,62 @@ async def get_bank(user_id: str) -> int:
             return row[0] if row else 0
 
 
+async def send_prefix_balance(message: discord.Message, args: list[str]):
+    target = message.author
+    if args:
+        if message.guild is None:
+            await message.channel.send("❌ Para consultar a otra persona, usa el comando dentro de un servidor.")
+            return
+
+        target_text = " ".join(args).strip()
+        match = re.fullmatch(r"<@!?(\d+)>|(\d+)", target_text)
+        if match:
+            target_id = int(match.group(1) or match.group(2))
+            target = message.guild.get_member(target_id)
+            if target is None:
+                try:
+                    target = await message.guild.fetch_member(target_id)
+                except (discord.NotFound, discord.HTTPException):
+                    target = None
+        else:
+            username = target_text.removeprefix("@").casefold()
+            matches = {
+                member.id: member
+                for member in getattr(message.guild, "members", [])
+                if username in {
+                    getattr(member, "name", "").casefold(),
+                    getattr(member, "display_name", "").casefold(),
+                }
+            }
+            if len(matches) == 1:
+                target = next(iter(matches.values()))
+            elif len(matches) > 1:
+                await message.channel.send("❌ Hay varios usuarios con ese nombre. Menciónalo o usa su ID.")
+                return
+            else:
+                target = None
+
+        if target is None:
+            await message.channel.send(
+                "❌ No encontré a ese usuario. Prueba `,bal @usuario` o `,bal ID`."
+            )
+            return
+
+    target_id = str(target.id)
+    if target_id == str(message.author.id):
+        await get_or_create_user(target_id, target.name)
+    bal = await get_balance(target_id)
+    bank_bal = await get_bank(target_id)
+    total = bal + bank_bal
+    target_name = getattr(target, "display_name", target.name)
+    embed = discord.Embed(title=f"💰 Saldo de {target_name}", color=0xFFD700)
+    embed.add_field(name="👛 Cartera", value=f"**{bal:,}** 🪙", inline=True)
+    embed.add_field(name="🏦 Banco", value=f"**{bank_bal:,}** 🪙", inline=True)
+    embed.add_field(name="📊 Total", value=f"**{total:,}** 🪙", inline=True)
+    embed.set_footer(text=f"Casino Bot • Consultado por {message.author.name}")
+    await message.channel.send(embed=embed)
+
+
 MAX_BALANCE = 1_000_000_000_000_000
 
 
@@ -6301,18 +6357,10 @@ async def on_message(message: discord.Message):
     if await features_handle_prefix(message, cmd, args):
         return
 
-    # ,bal
-    if cmd == "bal":
-        await get_or_create_user(user_id, message.author.name)
-        bal = await get_balance(user_id)
-        bank_bal = await get_bank(user_id)
-        total = bal + bank_bal
-        embed = discord.Embed(title="💰 Tu Saldo", color=0xFFD700)
-        embed.add_field(name="👛 Cartera", value=f"**{bal:,}** 🪙", inline=True)
-        embed.add_field(name="🏦 Banco", value=f"**{bank_bal:,}** 🪙", inline=True)
-        embed.add_field(name="📊 Total", value=f"**{total:,}** 🪙", inline=True)
-        embed.set_footer(text=f"Casino Bot • {message.author.name} • El banco es seguro contra robos")
-        await message.channel.send(embed=embed)
+    # ,bal [@usuario|ID]
+    if cmd in ("bal", "balance", "saldo"):
+        await send_prefix_balance(message, args)
+        return
 
     # ,shop
     elif cmd == "shop":
@@ -7320,20 +7368,6 @@ async def on_message(message: discord.Message):
             f"👛 Saldo restante: **{new_bal:,}** 🪙\n\n"
             f"_El sorteo es automático cada **7 días**. ¡Buena suerte! 🍀_"
         )
-        await message.channel.send(embed=embed)
-
-
-    # ,balance / ,bal / ,saldo
-    elif cmd in ("balance", "bal", "saldo"):
-        await get_or_create_user(user_id, message.author.name)
-        bal = await get_balance(user_id)
-        bank_bal = await get_bank(user_id)
-        total = bal + bank_bal
-        embed = discord.Embed(title="💰 Tu Saldo", color=0xFFD700)
-        embed.add_field(name="👛 Cartera", value=f"**{bal:,}** 🪙", inline=True)
-        embed.add_field(name="🏦 Banco", value=f"**{bank_bal:,}** 🪙", inline=True)
-        embed.add_field(name="📊 Total", value=f"**{total:,}** 🪙", inline=True)
-        embed.set_footer(text=f"Casino Bot • {message.author.name} • El banco es seguro contra robos")
         await message.channel.send(embed=embed)
 
     # ,slots <cantidad|all>
