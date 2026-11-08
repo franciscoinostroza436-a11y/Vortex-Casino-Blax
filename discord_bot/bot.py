@@ -6,7 +6,7 @@ import random
 import re
 import unicodedata
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
 DB_PATH = "discord_bot/casino.db"
@@ -3891,7 +3891,8 @@ async def help_cmd(interaction: discord.Interaction):
             "`/rolmercado publicar|ver|comprar|retirar` — Vende o alquila roles\n"
             "`/ftorneo apuesta` — Torneo de luchadores con entrada y premio\n"
             "`/carcel` `/fianza` — Cárcel por robos fallidos\n"
-            "`/evento` — Fines de semana con collect doble"
+            "`/evento` — Configura collect x2 a x10 y su duración (administradores)\n"
+            "`/cancelar evento` — Termina el evento manual (administradores)"
         ),
         inline=False
     )
@@ -4011,6 +4012,15 @@ GUIDE_SECTIONS = (
             "Escribe `,clan ayuda` para ver esta lista en el chat."
         ),
         "commands": ("clan",),
+    },
+    {
+        "id": "events",
+        "title": "🎉 Eventos de collect",
+        "description": (
+            "Los administradores pueden iniciar eventos de collect x2 a x10 y elegir su duración "
+            "desde el panel de `/evento`. Los demás usuarios pueden consultar el estado."
+        ),
+        "commands": ("evento", "cancelar"),
     },
     {
         "id": "shop",
@@ -4160,6 +4170,18 @@ def build_guide_pages() -> list[dict]:
                         "`,clan invitar @usuario` · `,clan expulsar @usuario`\n"
                         "`,clan acceso abierto|cerrado` · `,clan misiones` · `,clan top`\n"
                         "`,clan disolver confirmar` · Los nombres de clan pueden tener espacios."
+                    ),
+                )
+            )
+
+        if section["id"] == "events":
+            page["extra_fields"].append(
+                (
+                    "Cómo usar los eventos",
+                    (
+                        "`/evento` — Los administradores eligen multiplicador x2–x10 y duración en días.\n"
+                        "`/cancelar evento` — Termina el evento manual; requiere Administrador.\n"
+                        "El evento automático de fin de semana no se cancela con este comando."
                     ),
                 )
             )
@@ -8717,6 +8739,7 @@ CLAN_MISSIONS = {                 # misiones semanales del clan; el premio va al
 # ----- evento de doble collect
 WEEKEND_DOUBLE_COLLECT = True     # sabados y domingos (UTC) los roles pagan doble
 COLLECT_EVENT_MULTIPLIER = 2
+COLLECT_EVENT_MULTIPLIER_KEY = "collect_event_multiplier"
 
 # ----- mines
 MINES_TILES = 20                  # 4 filas x 5 columnas
@@ -9154,55 +9177,363 @@ async def carcel_command(interaction: discord.Interaction, usuario: _LoanOptiona
 
 
 # ------------------------------------------------------------------ evento: doble collect
+def _event_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def _configured_collect_multiplier() -> int:
+    try:
+        return max(1, min(10, int(COLLECT_EVENT_MULTIPLIER)))
+    except (TypeError, ValueError):
+        return 2
+
+
 async def _collect_multiplier(db, now: datetime) -> int:
     async with db.execute("SELECT value FROM bot_settings WHERE key='double_collect_until'") as cur:
         row = await cur.fetchone()
     if row:
-        try:
-            if now < datetime.fromisoformat(row[0]):
-                return COLLECT_EVENT_MULTIPLIER
-        except ValueError:
-            pass
+        until = _event_datetime(row[0])
+        if until and now < until:
+            async with db.execute(
+                "SELECT value FROM bot_settings WHERE key=?", (COLLECT_EVENT_MULTIPLIER_KEY,)
+            ) as cur:
+                multiplier_row = await cur.fetchone()
+            try:
+                multiplier = int(multiplier_row[0]) if multiplier_row else _configured_collect_multiplier()
+            except (TypeError, ValueError):
+                multiplier = _configured_collect_multiplier()
+            return max(1, min(10, multiplier))
     if WEEKEND_DOUBLE_COLLECT and now.weekday() >= 5:
-        return COLLECT_EVENT_MULTIPLIER
+        return _configured_collect_multiplier()
     return 1
 
 
 async def collect_event_info(now: datetime | None = None) -> tuple[int, str]:
     """(multiplicador actual, texto de estado)."""
     now = now or datetime.utcnow()
+    if now.tzinfo is not None:
+        now = now.astimezone(timezone.utc).replace(tzinfo=None)
     async with aiosqlite.connect(DB_PATH) as db:
         mult = await _collect_multiplier(db, now)
         async with db.execute("SELECT value FROM bot_settings WHERE key='double_collect_until'") as cur:
             row = await cur.fetchone()
+        async with db.execute(
+            "SELECT value FROM bot_settings WHERE key=?", (COLLECT_EVENT_MULTIPLIER_KEY,)
+        ) as cur:
+            multiplier_row = await cur.fetchone()
     lines = []
     if mult > 1:
         lines.append(f"🎉 **¡Evento activo!** Los roles pagan **x{mult}** en `/collect`.")
     else:
         lines.append("😴 No hay ningún evento activo ahora mismo.")
     if row:
-        try:
-            until = datetime.fromisoformat(row[0])
-            if until > now:
-                lines.append(f"⏳ Evento manual termina <t:{_loan_ts(until.isoformat())}:R>.")
-        except ValueError:
-            pass
+        until = _event_datetime(row[0])
+        if until and until > now:
+            try:
+                manual_multiplier = int(multiplier_row[0]) if multiplier_row else _configured_collect_multiplier()
+            except (TypeError, ValueError):
+                manual_multiplier = _configured_collect_multiplier()
+            lines.append(
+                f"⏳ Evento manual x{manual_multiplier} termina "
+                f"<t:{_loan_ts(until.isoformat())}:R>."
+            )
     if WEEKEND_DOUBLE_COLLECT:
         if now.weekday() >= 5:
             end = datetime.fromisoformat(week_key(now)) + timedelta(days=7)
-            lines.append(f"📅 Fin de semana de collect x{COLLECT_EVENT_MULTIPLIER}: termina <t:{_loan_ts(end.isoformat())}:R>.")
+            lines.append(
+                f"📅 Fin de semana de collect x{_configured_collect_multiplier()}: "
+                f"termina <t:{_loan_ts(end.isoformat())}:R>."
+            )
         else:
             start = datetime.fromisoformat(week_key(now)) + timedelta(days=5)
-            lines.append(f"📅 Próximo fin de semana x{COLLECT_EVENT_MULTIPLIER}: empieza <t:{_loan_ts(start.isoformat())}:R> (sábado 00:00 UTC).")
+            lines.append(
+                f"📅 Próximo fin de semana x{_configured_collect_multiplier()}: "
+                f"empieza <t:{_loan_ts(start.isoformat())}:R> (sábado 00:00 UTC)."
+            )
     return mult, "\n".join(lines)
 
 
-@tree.command(name="evento", description="Mira si hay un evento de collect doble activo")
+async def manual_collect_event_active() -> bool:
+    until = _event_datetime(await setting_get("double_collect_until"))
+    return until is not None and until > datetime.utcnow()
+
+
+async def save_manual_collect_event(multiplier: int, until: datetime):
+    multiplier = int(multiplier)
+    if not 1 <= multiplier <= 10:
+        raise ValueError("El multiplicador debe estar entre x1 y x10.")
+    until = until.astimezone(timezone.utc).replace(tzinfo=None) if until.tzinfo else until
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        for key, value in (
+            ("double_collect_until", until.isoformat()),
+            (COLLECT_EVENT_MULTIPLIER_KEY, str(multiplier)),
+        ):
+            await db.execute(
+                "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+        await db.commit()
+
+
+async def cancel_manual_collect_event() -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT value FROM bot_settings WHERE key='double_collect_until'"
+        ) as cur:
+            row = await cur.fetchone()
+        await db.execute(
+            "DELETE FROM bot_settings WHERE key IN ('double_collect_until', ?)",
+            (COLLECT_EVENT_MULTIPLIER_KEY,),
+        )
+        await db.commit()
+    until = _event_datetime(row[0]) if row else None
+    return until is not None and until > datetime.utcnow()
+
+
+def interaction_is_admin(interaction: discord.Interaction) -> bool:
+    permissions = getattr(interaction.user, "guild_permissions", None)
+    return bool(permissions and permissions.administrator)
+
+
+class CollectEventMultiplierSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(
+            placeholder="Elige el multiplicador",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label=f"Collect x{multiplier}", value=str(multiplier))
+                for multiplier in range(2, 11)
+            ],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view: CollectEventPanelView = self.view
+        view.multiplier = int(self.values[0])
+        await interaction.response.edit_message(embed=view.make_embed(), view=view)
+
+
+class CollectEventDurationSelect(discord.ui.Select):
+    def __init__(self):
+        common_durations = (1, 2, 3, 5, 7, 14, 30, 60, 90, 180, 365)
+        super().__init__(
+            placeholder="Elige la duración",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=f"{days} día" if days == 1 else f"{days} días",
+                    value=str(days),
+                )
+                for days in common_durations
+            ],
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view: CollectEventPanelView = self.view
+        view.duration_days = int(self.values[0])
+        await interaction.response.edit_message(embed=view.make_embed(), view=view)
+
+
+class CollectEventDurationModal(discord.ui.Modal, title="Duración personalizada"):
+    days = discord.ui.TextInput(
+        label="Duración en días (1–365)",
+        placeholder="Ejemplo: 12",
+        min_length=1,
+        max_length=3,
+    )
+
+    def __init__(self, parent_view: "CollectEventPanelView"):
+        super().__init__()
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        view = self.parent_view
+        if str(interaction.user.id) != view.owner_id or not interaction_is_admin(interaction):
+            await interaction.response.send_message(
+                "Solo el administrador que abrió el panel puede cambiar estos valores.",
+                ephemeral=True,
+            )
+            return
+        try:
+            days = int(self.days.value.strip())
+        except ValueError:
+            await interaction.response.send_message("Escribe un número válido de días.", ephemeral=True)
+            return
+        if not 1 <= days <= 365:
+            await interaction.response.send_message(
+                "La duración debe estar entre 1 y 365 días.", ephemeral=True
+            )
+            return
+        view.duration_days = days
+        if view.message:
+            try:
+                await view.message.edit(embed=view.make_embed(), view=view)
+            except discord.HTTPException:
+                await interaction.response.send_message(
+                    "No pude actualizar el panel. Vuelve a ejecutar `/evento`.",
+                    ephemeral=True,
+                )
+                return
+        await interaction.response.send_message(
+            f"✅ Duración fijada en {days} día(s). Pulsa «Activar evento» en el panel.",
+            ephemeral=True,
+        )
+
+
+class CollectEventCustomDurationButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Días personalizados",
+            emoji="✏️",
+            style=discord.ButtonStyle.secondary,
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(CollectEventDurationModal(self.view))
+
+
+class CollectEventActivateButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Activar evento",
+            emoji="🎉",
+            style=discord.ButtonStyle.success,
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view: CollectEventPanelView = self.view
+        if view.done:
+            await interaction.response.send_message("Este panel ya se usó.", ephemeral=True)
+            return
+        if await manual_collect_event_active():
+            await interaction.response.send_message(
+                "Ya hay un evento manual activo. Usa `/cancelar evento` antes de iniciar otro.",
+                ephemeral=True,
+            )
+            return
+        until = datetime.utcnow() + timedelta(days=view.duration_days)
+        await save_manual_collect_event(view.multiplier, until)
+        view.done = True
+        embed = discord.Embed(
+            title="🎉 Evento de collect activado",
+            description=(
+                f"Los roles pagan **x{view.multiplier}** durante **{view.duration_days} día(s)**.\n"
+                f"Termina <t:{_loan_ts(until.isoformat())}:F> "
+                f"(<t:{_loan_ts(until.isoformat())}:R>)."
+            ),
+            color=0x00FF88,
+        )
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+class CollectEventPanelView(discord.ui.View):
+    def __init__(self, owner_id: str, current_status: str = ""):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.multiplier = 2
+        self.duration_days = 1
+        self.current_status = current_status
+        self.done = False
+        self.message: discord.InteractionMessage | None = None
+        self.add_item(CollectEventMultiplierSelect())
+        self.add_item(CollectEventDurationSelect())
+        self.add_item(CollectEventCustomDurationButton())
+        self.add_item(CollectEventActivateButton())
+
+    def make_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="🎉 Configurar evento de collect",
+            description=(
+                "Elige el multiplicador y la duración. El evento se aplica a las ganancias de `/collect`."
+            ),
+            color=0x9B59B6,
+        )
+        embed.add_field(name="Multiplicador elegido", value=f"**x{self.multiplier}**", inline=True)
+        embed.add_field(name="Duración elegida", value=f"**{self.duration_days} día(s)**", inline=True)
+        if self.current_status:
+            embed.add_field(name="Estado actual", value=self.current_status[:1024], inline=False)
+        embed.set_footer(text="Duración: 1 a 365 días · Solo el administrador que abrió el panel puede usarlo")
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) != self.owner_id:
+            await interaction.response.send_message(
+                "Este panel pertenece a otro administrador.", ephemeral=True
+            )
+            return False
+        if not interaction_is_admin(interaction):
+            await interaction.response.send_message(
+                "Necesitas permiso de Administrador para controlar el evento.", ephemeral=True
+            )
+            return False
+        return True
+
+
+@tree.command(name="evento", description="Consulta el evento o abre el panel para configurarlo")
 async def evento_command(interaction: discord.Interaction):
     mult, text = await collect_event_info()
-    embed = discord.Embed(title="🎉 Eventos del casino", description=text,
-                          color=0x00FF88 if mult > 1 else 0x95A5A6)
+    if interaction.guild is not None and interaction_is_admin(interaction):
+        view = CollectEventPanelView(str(interaction.user.id), text)
+        await interaction.response.send_message(
+            embed=view.make_embed(),
+            view=view,
+            ephemeral=True,
+        )
+        view.message = await interaction.original_response()
+        return
+    embed = discord.Embed(
+        title="🎉 Eventos del casino",
+        description=text,
+        color=0x00FF88 if mult > 1 else 0x95A5A6,
+    )
     await interaction.response.send_message(embed=embed)
+
+
+cancelar_group = app_commands.Group(
+    name="cancelar",
+    description="Cancela eventos manuales activos",
+    guild_only=True,
+)
+tree.add_command(cancelar_group)
+
+
+@cancelar_group.command(name="evento", description="[ADMIN] Termina el evento manual de collect")
+@app_commands.default_permissions(administrator=True)
+async def cancelar_evento_command(interaction: discord.Interaction):
+    if not interaction_is_admin(interaction):
+        await interaction.response.send_message(
+            "❌ Solo los administradores pueden cancelar el evento.",
+            ephemeral=True,
+        )
+        return
+    was_active = await cancel_manual_collect_event()
+    if was_active:
+        message = (
+            "✅ Evento manual de collect cancelado. El evento automático de fin de semana "
+            "seguirá activo si corresponde."
+        )
+    else:
+        message = (
+            "No había un evento manual activo. El evento automático de fin de semana, "
+            "si corresponde, no se cancela con este comando."
+        )
+    await interaction.response.send_message(message, ephemeral=True)
 
 
 @tree.command(name="doblecollect", description="[ADMIN] Activa collect doble por unas horas (0 = terminar el evento)")
@@ -9213,13 +9544,14 @@ async def doblecollect_command(interaction: discord.Interaction, horas: app_comm
         await interaction.response.send_message("❌ Solo los administradores pueden usar este comando.", ephemeral=True)
         return
     if horas == 0:
-        await setting_del("double_collect_until")
+        await cancel_manual_collect_event()
         await interaction.response.send_message("✅ Evento manual de collect doble terminado.")
         return
     until = datetime.utcnow() + timedelta(hours=horas)
-    await setting_set("double_collect_until", until.isoformat())
+    multiplier = _configured_collect_multiplier()
+    await save_manual_collect_event(multiplier, until)
     await interaction.response.send_message(
-        f"🎉 **¡Collect x{COLLECT_EVENT_MULTIPLIER} activado!** Los roles pagan el doble hasta "
+        f"🎉 **¡Collect x{multiplier} activado!** Los roles pagan el multiplicador configurado hasta "
         f"<t:{_loan_ts(until.isoformat())}:f> (<t:{_loan_ts(until.isoformat())}:R>)."
     )
 
@@ -11442,11 +11774,12 @@ async def dashboard_audit(limit: int = 40) -> list[dict]:
 
 async def dashboard_set_event(hours: int) -> str:
     if hours <= 0:
-        await setting_del("double_collect_until")
+        await cancel_manual_collect_event()
         return "Evento manual terminado."
     until = datetime.utcnow() + timedelta(hours=hours)
-    await setting_set("double_collect_until", until.isoformat())
-    return f"Collect x{COLLECT_EVENT_MULTIPLIER} activado por {hours} h."
+    multiplier = _configured_collect_multiplier()
+    await save_manual_collect_event(multiplier, until)
+    return f"Collect x{multiplier} activado por {hours} h."
 
 
 # ------------------------------------------------------------------ /work /slut /crime (config desde el panel)
