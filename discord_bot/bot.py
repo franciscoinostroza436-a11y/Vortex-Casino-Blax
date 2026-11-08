@@ -3886,7 +3886,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`/top` — Ranking semanal con premios automáticos\n"
             "`/logros` — Insignias y progreso\n"
             "`/mines cantidad minas` — Buscaminas con retiro a tiempo\n"
-            "`/clan crear|unirse|info|depositar|misiones...` — Clanes con banco y misiones\n"
+            "`/clan ...` o `,clan ...` — Clanes con banco y misiones\n"
             "`/prestar` `/devolver` `/misprestamos` — Presta roles y mira tus cobros\n"
             "`/rolmercado publicar|ver|comprar|retirar` — Vende o alquila roles\n"
             "`/ftorneo apuesta` — Torneo de luchadores con entrada y premio\n"
@@ -4002,6 +4002,15 @@ GUIDE_SECTIONS = (
             "roulette", "slots", "blackjack", "coinflip", "rob", "duel", "crash",
             "bet", "tournament", "ruleta-en-vivo",
         ),
+    },
+    {
+        "id": "clans",
+        "title": "🛡️ Clanes",
+        "description": (
+            "Los comandos del clan también funcionan como comandos de texto con coma. "
+            "Escribe `,clan ayuda` para ver esta lista en el chat."
+        ),
+        "commands": ("clan",),
     },
     {
         "id": "shop",
@@ -4139,6 +4148,21 @@ def build_guide_pages() -> list[dict]:
             ]
             if role_lines:
                 page["extra_fields"].append(("Ganancias de roles", "\n".join(role_lines)))
+
+        if section["id"] == "clans":
+            page["extra_fields"].append(
+                (
+                    "Comandos con coma",
+                    (
+                        "`,clan crear <nombre>` · `,clan unirse <nombre>`\n"
+                        "`,clan salir` · `,clan info [nombre]`\n"
+                        "`,clan depositar <cantidad>` · `,clan retirar <cantidad> [@miembro]`\n"
+                        "`,clan invitar @usuario` · `,clan expulsar @usuario`\n"
+                        "`,clan acceso abierto|cerrado` · `,clan misiones` · `,clan top`\n"
+                        "`,clan disolver confirmar` · Los nombres de clan pueden tener espacios."
+                    ),
+                )
+            )
 
         if commands or page["extra_fields"]:
             pages.append(page)
@@ -6243,6 +6267,10 @@ async def on_message(message: discord.Message):
     cmd = parts[0].lower()
     args = parts[1:]
     user_id = str(message.author.id)
+
+    if cmd == "clan":
+        await clan_handle_prefix(message, args)
+        return
 
     if await loan_handle_prefix(message, cmd, args):
         return
@@ -10649,6 +10677,157 @@ async def clan_disolver(interaction: discord.Interaction, confirmar: bool):
         await interaction.response.send_message("❌ Marca `confirmar: True` si de verdad quieres disolver el clan.", ephemeral=True)
         return
     await _clan_reply(interaction, await clan_disband(str(interaction.user.id)))
+
+
+async def clan_handle_prefix(message: discord.Message, args: list[str]):
+    """Permite usar todos los subcomandos de /clan con el prefijo de texto ','."""
+    if message.guild is None:
+        await message.channel.send("❌ Los comandos del clan solo se pueden usar dentro de un servidor.")
+        return
+
+    if not args or args[0].lower() in {"ayuda", "help"}:
+        embed = discord.Embed(
+            title="🛡️ Comandos del clan",
+            description=(
+                "También puedes usar los comandos slash con `/clan`.\n"
+                "Los nombres con espacios se escriben completos; para usuarios, menciona a la persona."
+            ),
+            color=0x3498DB,
+        )
+        embed.add_field(
+            name="Miembros",
+            value=(
+                "`,clan crear <nombre>`\n"
+                "`,clan unirse <nombre>`\n"
+                "`,clan salir`\n"
+                "`,clan info [nombre]`\n"
+                "`,clan misiones` · `,clan top`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Banco y liderazgo",
+            value=(
+                "`,clan depositar <cantidad>`\n"
+                "`,clan retirar <cantidad> [@miembro]`\n"
+                "`,clan invitar @usuario` · `,clan expulsar @usuario`\n"
+                "`,clan acceso abierto|cerrado`\n"
+                "`,clan disolver confirmar`"
+            ),
+            inline=False,
+        )
+        await message.channel.send(embed=embed)
+        return
+
+    subcommand = args[0].lower()
+    params = args[1:]
+    user_id = str(message.author.id)
+
+    async def send_result(result: tuple[bool, str]):
+        ok, text = result
+        await message.channel.send(text if ok else f"❌ {text}")
+
+    async def resolve_member(token: str) -> discord.Member | None:
+        match = re.fullmatch(r"(?:<@!?(\d+)>|(\d+))", token)
+        if not match:
+            return None
+        target_id = int(match.group(1) or match.group(2))
+        member = message.guild.get_member(target_id)
+        if member:
+            return member
+        try:
+            return await message.guild.fetch_member(target_id)
+        except (discord.NotFound, discord.HTTPException):
+            return None
+
+    if subcommand == "crear":
+        if not params:
+            await message.channel.send("Uso: `,clan crear <nombre>`.")
+            return
+        await send_result(await clan_create(user_id, message.author.name, " ".join(params)))
+    elif subcommand == "unirse":
+        if not params:
+            await message.channel.send("Uso: `,clan unirse <nombre>`.")
+            return
+        await send_result(await clan_join(user_id, message.author.name, " ".join(params)))
+    elif subcommand == "salir":
+        await send_result(await clan_leave(user_id))
+    elif subcommand == "info":
+        clan = await clan_by_name(" ".join(params)) if params else await clan_of(user_id)
+        if not clan:
+            await message.channel.send("❌ No encontré ese clan (o no estás en ninguno).")
+            return
+        await message.channel.send(embed=await build_clan_info_embed(clan))
+    elif subcommand == "depositar":
+        if len(params) != 1:
+            await message.channel.send("Uso: `,clan depositar <cantidad>`.")
+            return
+        await send_result(await clan_deposit(user_id, params[0]))
+    elif subcommand == "retirar":
+        if not 1 <= len(params) <= 2:
+            await message.channel.send("Uso: `,clan retirar <cantidad> [@miembro]`.")
+            return
+        target_id = None
+        if len(params) == 2:
+            member = await resolve_member(params[1])
+            if member is None:
+                await message.channel.send("❌ Menciona a un miembro del servidor para recibir las monedas.")
+                return
+            target_id = str(member.id)
+        await send_result(await clan_withdraw(user_id, params[0], target_id))
+    elif subcommand in {"invitar", "expulsar"}:
+        if len(params) != 1:
+            await message.channel.send(f"Uso: `,clan {subcommand} @usuario`.")
+            return
+        member = await resolve_member(params[0])
+        if member is None:
+            await message.channel.send("❌ Menciona a un miembro de este servidor.")
+            return
+        if subcommand == "invitar":
+            if member.bot:
+                await message.channel.send("❌ No puedes invitar a un bot.")
+                return
+            await send_result(await clan_invite(user_id, str(member.id)))
+        else:
+            await send_result(await clan_kick(user_id, str(member.id)))
+    elif subcommand == "acceso":
+        if len(params) != 1 or params[0].lower() not in {"abierto", "cerrado"}:
+            await message.channel.send("Uso: `,clan acceso abierto` o `,clan acceso cerrado`.")
+            return
+        await send_result(await clan_set_open(user_id, params[0].lower() == "abierto"))
+    elif subcommand == "misiones":
+        clan = await clan_of(user_id)
+        if not clan:
+            await message.channel.send("❌ No perteneces a ningún clan.")
+            return
+        await message.channel.send(embed=await build_clan_missions_embed(clan))
+    elif subcommand == "top":
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT c.name, c.bank, (SELECT COUNT(*) FROM clan_members m WHERE m.clan_id=c.id) "
+                "FROM clans c ORDER BY c.bank DESC LIMIT 10"
+            ) as cur:
+                rows = await cur.fetchall()
+        if not rows:
+            await message.channel.send("❌ Todavía no hay clanes. Crea el primero con `,clan crear <nombre>`.")
+            return
+        medals = ["🥇", "🥈", "🥉"]
+        lines = [
+            f"{medals[i] if i < 3 else f'**#{i + 1}**'} **{name}** — {bank:,} 🪙 · {count} miembro(s)"
+            for i, (name, bank, count) in enumerate(rows)
+        ]
+        await message.channel.send(
+            embed=discord.Embed(title="🏆 Top de clanes", description="\n".join(lines), color=0xFFD700)
+        )
+    elif subcommand == "disolver":
+        if len(params) != 1 or params[0].lower() != "confirmar":
+            await message.channel.send("Para confirmar, escribe `,clan disolver confirmar`.")
+            return
+        await send_result(await clan_disband(user_id))
+    else:
+        await message.channel.send(
+            f"❌ No reconozco el subcomando `{subcommand}`. Escribe `,clan ayuda` para ver los comandos."
+        )
 
 
 # =====================================================================
