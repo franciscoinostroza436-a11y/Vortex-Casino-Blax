@@ -1,6 +1,6 @@
 import discord
 from discord import app_commands
-import aiosqlite
+import aiosqlite as _aiosqlite_real
 import asyncio
 import random
 import re
@@ -9,7 +9,86 @@ import os
 from datetime import datetime, timedelta, timezone
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
-DB_PATH = "discord_bot/casino.db"
+# =====================================================================
+#  ECONOMÍA POR SERVIDOR (infraestructura)
+#  Cada servidor tiene su propio archivo de base de datos. Todo el código que
+#  hace `aiosqlite.connect(DB_PATH)` usa automáticamente la base del servidor
+#  donde se está ejecutando el comando (ver enter_guild más abajo).
+# =====================================================================
+import contextvars
+import sqlite3 as _sqlite3
+
+LEGACY_DB_PATH = "discord_bot/casino.db"            # la base vieja (economía compartida)
+GLOBAL_DB_PATH = "discord_bot/global.db"            # blacklist, ajustes del panel, mapa de servidores
+GUILD_DB_TEMPLATE = "discord_bot/casino_{guild_id}.db"
+
+ADDPUNTOS_MAX = 16_666_666_666_665                  # máximo de puntos por uso de /addpuntos
+
+
+class _GuildDBPath:
+    """Marcador que significa 'la base de datos del servidor actual'."""
+
+    def __repr__(self):
+        return "<base de datos del servidor actual>"
+
+
+DB_PATH = _GuildDBPath()
+
+_current_guild: contextvars.ContextVar = contextvars.ContextVar("current_guild", default=None)
+_guild_paths: dict = {}          # guild_id -> archivo .db
+_guild_ready: set = set()        # servidores con tablas ya creadas
+_guild_init_lock = None
+
+
+class NoGuildContext(RuntimeError):
+    """Se intentó usar la economía fuera de un servidor."""
+
+
+def _resolve_db_path(database):
+    if isinstance(database, _GuildDBPath):
+        guild_id = _current_guild.get()
+        if guild_id is None:
+            raise NoGuildContext("Esta acción necesita un servidor y no se ejecutó dentro de uno.")
+        path = _guild_paths.get(guild_id)
+        if path is None:
+            raise NoGuildContext(f"El servidor {guild_id} todavía no está preparado.")
+        return path
+    return database
+
+
+class _AiosqliteProxy:
+    """Igual que aiosqlite, pero entiende el marcador DB_PATH."""
+
+    def connect(self, database, *args, **kwargs):
+        return _aiosqlite_real.connect(_resolve_db_path(database), *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(_aiosqlite_real, name)
+
+
+aiosqlite = _AiosqliteProxy()
+
+
+class GuildView(discord.ui.View):
+    """Vista que fija el servidor correcto antes de ejecutar cualquier botón o menú."""
+
+    async def _scheduled_task(self, *args, **kwargs):
+        interaction = next((a for a in args if isinstance(a, discord.Interaction)), None)
+        if interaction is not None and not await _enter_interaction(interaction):
+            return
+        await super()._scheduled_task(*args, **kwargs)
+
+
+class GuildModal(discord.ui.Modal):
+    """Igual que GuildView, para formularios (modals)."""
+
+    async def _scheduled_task(self, *args, **kwargs):
+        interaction = next((a for a in args if isinstance(a, discord.Interaction)), None)
+        if interaction is not None and not await _enter_interaction(interaction):
+            return
+        await super()._scheduled_task(*args, **kwargs)
+
+
 
 SHOP_ITEMS = {
     "anti_rob": {
@@ -1113,37 +1192,43 @@ async def run_lottery_draw():
                 pass
 
 
+async def _lottery_tick():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT value FROM lottery_meta WHERE key = 'last_draw'") as cur:
+            row = await cur.fetchone()
+            last_draw = row[0] if row else None
+
+    now = datetime.utcnow()
+    if last_draw is None:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR IGNORE INTO lottery_meta (key, value) VALUES ('last_draw', ?)",
+                             (now.isoformat(),))
+            await db.commit()
+        return
+
+    last_dt = datetime.fromisoformat(last_draw)
+    if (now - last_dt) >= timedelta(days=7):
+        await run_lottery_draw()
+
+
 async def lottery_loop():
     await client.wait_until_ready()
     while not client.is_closed():
         await asyncio.sleep(60)
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT value FROM lottery_meta WHERE key = 'last_draw'") as cur:
-                row = await cur.fetchone()
-                last_draw = row[0] if row else None
-
-        now = datetime.utcnow()
-        if last_draw is None:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("INSERT OR IGNORE INTO lottery_meta (key, value) VALUES ('last_draw', ?)",
-                                 (now.isoformat(),))
-                await db.commit()
-            continue
-
-        last_dt = datetime.fromisoformat(last_draw)
-        if (now - last_dt) >= timedelta(days=7):
-            await run_lottery_draw()
-
+        await for_each_guild(_lottery_tick)
 
 @client.event
 async def on_ready():
     global _background_started
-    await init_db()
-    await init_shield_table()
-    await loan_init_table()
-    await init_role_loans_table()
-    await init_extras_tables()
-    await init_dashboard_tables()
+    await init_global_db()
+    await load_blacklist()
+    await load_guild_map()
+    await run_economy_migration()
+    for guild in list(client.guilds):
+        try:
+            await enter_guild(guild.id)
+        except Exception as exc:
+            print(f"No pude preparar el servidor {guild.id}: {exc}")
     await config_load()
     await tree.sync()
     if not _background_started:
@@ -2458,7 +2543,7 @@ async def shield_role_loop():
     await client.wait_until_ready()
     while not client.is_closed():
         try:
-            await expire_shield_roles()
+            await for_each_guild(expire_shield_roles)
         except Exception as exc:  # el bucle nunca debe morir
             print(f"Error en shield_role_loop: {exc}")
         await asyncio.sleep(20)
@@ -2520,7 +2605,7 @@ class ShopBuySelect(discord.ui.Select):
         )
 
 
-class ShopBuyView(discord.ui.View):
+class ShopBuyView(GuildView):
     def __init__(self, owner_id: str):
         super().__init__(timeout=180)
         self.purchase_completed = False
@@ -2545,7 +2630,7 @@ class QuantityButton(discord.ui.Button):
         await interaction.response.edit_message(embed=result, view=None)
 
 
-class CustomQuantityModal(discord.ui.Modal, title="Cantidad a comprar"):
+class CustomQuantityModal(GuildModal, title="Cantidad a comprar"):
     cantidad = discord.ui.TextInput(
         label=f"¿Cuántos quieres? (1-{MAX_BUY_QTY})",
         placeholder="Ej: 12",
@@ -2597,7 +2682,7 @@ class BackToShopButton(discord.ui.Button):
         )
 
 
-class ShopQuantityView(discord.ui.View):
+class ShopQuantityView(GuildView):
     def __init__(self, owner_id: str, item_id: str):
         super().__init__(timeout=180)
         self.owner_id = owner_id
@@ -2814,7 +2899,7 @@ def bj_embed(player_hand, dealer_hand, bet, reveal_dealer=False, result_msg=None
     return embed
 
 
-class BlackjackView(discord.ui.View):
+class BlackjackView(GuildView):
     def __init__(self, user_id, bet, player_hand, dealer_hand, deck, balance):
         super().__init__(timeout=60)
         self.user_id = user_id
@@ -2926,7 +3011,7 @@ async def blackjack(interaction: discord.Interaction, cantidad: int):
     await interaction.response.send_message(embed=embed, view=view)
 
 
-class CoinflipChallengeView(discord.ui.View):
+class CoinflipChallengeView(GuildView):
     def __init__(self, challenger_id: str, challenger_name: str, challenged: discord.Member, bet: int):
         super().__init__(timeout=60)
         self.challenger_id = challenger_id
@@ -3055,7 +3140,7 @@ async def coinflip(interaction: discord.Interaction, usuario: discord.Member, ca
     await interaction.response.send_message(embed=embed, view=view)
 
 
-class DuelChallengeView(discord.ui.View):
+class DuelChallengeView(GuildView):
     def __init__(self, challenger_id: str, challenger_name: str, challenged: discord.Member, bet: int):
         super().__init__(timeout=60)
         self.challenger_id = challenger_id
@@ -3218,7 +3303,7 @@ def generate_crash_point() -> float:
         return round(random.uniform(20.0, 50.0), 2)
 
 
-class CrashView(discord.ui.View):
+class CrashView(GuildView):
     def __init__(self, user_id: str, bet: int, crash_point: float):
         super().__init__(timeout=None)
         self.user_id = user_id
@@ -3525,7 +3610,7 @@ async def use_item_autocomplete(interaction: discord.Interaction, current: str):
 use.autocomplete("item")(use_item_autocomplete)
 
 
-class BetView(discord.ui.View):
+class BetView(GuildView):
     def __init__(self, challenger_id: str, challenged_id: str, amount: int, challenger_name: str):
         super().__init__(timeout=60)
         self.challenger_id = challenger_id
@@ -3742,7 +3827,7 @@ async def sell(interaction: discord.Interaction, item: str):
     await interaction.response.send_message(embed=embed)
 
 
-class TournamentView(discord.ui.View):
+class TournamentView(GuildView):
     MAX_PLAYERS = 8
 
     def __init__(self, host_id: str, host_name: str, buy_in: int):
@@ -3942,6 +4027,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`/top` — Ranking semanal con premios automáticos\n"
             "`/logros` — Insignias y progreso\n"
             "`/mines cantidad minas` — Buscaminas con retiro a tiempo\n"
+            "`/hilo cantidad` o `,hilo cantidad` — Hi-Lo: mayor, menor o igual\n"
             "`/clan ...` o `,clan ...` — Clanes con banco y misiones\n"
             "`/prestar` `/devolver` `/misprestamos` — Presta roles y mira tus cobros\n"
             "`/rolmercado publicar|ver|comprar|retirar` — Vende o alquila roles\n"
@@ -4481,7 +4567,7 @@ def build_fighter_shop_embed() -> discord.Embed:
     return embed
 
 
-class FighterReplaceConfirmView(discord.ui.View):
+class FighterReplaceConfirmView(GuildView):
     def __init__(self, owner_id: int, fighter_id: str, expected_current_id: str):
         super().__init__(timeout=120)
         self.owner_id = owner_id
@@ -4618,7 +4704,7 @@ class FighterBuySelect(discord.ui.Select):
         )
 
 
-class FighterShopView(discord.ui.View):
+class FighterShopView(GuildView):
     def __init__(self, owner_id: int):
         super().__init__(timeout=180)
         self.purchase_completed = False
@@ -4786,7 +4872,7 @@ async def fight_slash(interaction: discord.Interaction, usuario: discord.Member)
 FIGHTER_TOURNAMENT_PRIZE = 60_000_000
 FIGHTER_TOURNAMENT_RAKE_PERCENT = 5   # comisión del casino cuando el torneo tiene apuesta de entrada
 
-class FighterTournamentView(discord.ui.View):
+class FighterTournamentView(GuildView):
     MAX_PLAYERS = 8
 
     def __init__(self, host_id: str, host_name: str, entry_fee: int = 0):
@@ -5014,6 +5100,8 @@ def stat_quantity_embed(stat: str, points: int) -> discord.Embed:
 async def apply_stat_points(user_id: str, stat: str, cantidad: int):
     """Devuelve (embed, error, puntos_restantes)."""
     emoji, label, col, per = STAT_INFO[stat]
+    if cantidad > ADDPUNTOS_MAX:
+        return None, f"❌ El máximo por uso es **{ADDPUNTOS_MAX:,}** puntos.", 0
     fid = await _current_fighter_id(user_id)
     if fid is None:
         return None, "❌ No tienes luchador. Compra uno con `/buyfighter`.", 0
@@ -5079,7 +5167,7 @@ class StatSelect(discord.ui.Select):
         )
 
 
-class StatPanelView(discord.ui.View):
+class StatPanelView(GuildView):
     def __init__(self, owner_id: str):
         super().__init__(timeout=180)
         self.owner_id = owner_id
@@ -5106,8 +5194,8 @@ class StatAmountButton(discord.ui.Button):
         await _apply_and_show(interaction, view.owner_id, view.stat, self.amount)
 
 
-class StatAmountModal(discord.ui.Modal, title="Puntos a invertir"):
-    cantidad = discord.ui.TextInput(label="¿Cuántos puntos?", placeholder="Ej: 7", min_length=1, max_length=6)
+class StatAmountModal(GuildModal, title="Puntos a invertir"):
+    cantidad = discord.ui.TextInput(label="¿Cuántos puntos?", placeholder="Ej: 7", min_length=1, max_length=14)
 
     def __init__(self, parent_view: "StatQuantityView"):
         super().__init__()
@@ -5121,6 +5209,10 @@ class StatAmountModal(discord.ui.Modal, title="Puntos a invertir"):
             return
         if amount <= 0:
             await interaction.response.send_message("❌ La cantidad debe ser mayor a 0.", ephemeral=True)
+            return
+        if amount > ADDPUNTOS_MAX:
+            await interaction.response.send_message(
+                f"❌ El máximo por uso es **{ADDPUNTOS_MAX:,}** puntos.", ephemeral=True)
             return
         if self.parent_view.done:
             await interaction.response.send_message("Este panel ya se usó.", ephemeral=True)
@@ -5150,7 +5242,7 @@ class StatBackButton(discord.ui.Button):
         await interaction.response.edit_message(embed=embed, view=StatPanelView(owner_id))
 
 
-class StatQuantityView(discord.ui.View):
+class StatQuantityView(GuildView):
     def __init__(self, owner_id: str, stat: str, points: int):
         super().__init__(timeout=180)
         self.owner_id = owner_id
@@ -5181,7 +5273,7 @@ class StatQuantityView(discord.ui.View):
 async def addpuntos_slash(
     interaction: discord.Interaction,
     stat: str | None = None,
-    cantidad: _Optional[app_commands.Range[int, 1, 10000]] = None,
+    cantidad: _Optional[app_commands.Range[int, 1, ADDPUNTOS_MAX]] = None,
 ):
     user_id = str(interaction.user.id)
     key = resolve_stat(stat) if stat else None
@@ -5320,7 +5412,7 @@ def _parse_live_bet_field(raw: str) -> tuple[int, str] | None:
     return None
 
 
-class LiveBetModal(discord.ui.Modal, title="🎰 Tus Apuestas"):
+class LiveBetModal(GuildModal, title="🎰 Tus Apuestas"):
     apuesta1 = discord.ui.TextInput(
         label="Apuesta 1",
         placeholder="ej: 1000 red  |  500 17  |  all even",
@@ -5393,7 +5485,7 @@ class LiveBetModal(discord.ui.Modal, title="🎰 Tus Apuestas"):
         await self._live_view.refresh_embed()
 
 
-class LiveRouletteView(discord.ui.View):
+class LiveRouletteView(GuildView):
     MAX_PLAYERS = 10
 
     def __init__(self, host_id: str, host_name: str, timeout_secs: int = 60):
@@ -5672,7 +5764,7 @@ class FootballPackSelect(discord.ui.Select):
             pass
 
 
-class FootballPackStoreView(discord.ui.View):
+class FootballPackStoreView(GuildView):
     def __init__(self, owner_id: str):
         super().__init__(timeout=180)
         self.purchase_completed = False
@@ -5996,7 +6088,7 @@ class MarketBuySelect(discord.ui.Select):
             await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-class MarketBuyView(discord.ui.View):
+class MarketBuyView(GuildView):
     def __init__(self, listings: list[tuple], rarity_filter: str = ""):
         super().__init__(timeout=180)
         self.rarity_filter = rarity_filter
@@ -6128,7 +6220,7 @@ async def misventas_slash(interaction: discord.Interaction):
 
 # ─────────────────────────────────────────────────────────────────────────
 
-class TradeView(discord.ui.View):
+class TradeView(GuildView):
     """Accept/Decline buttons for a card trade proposal."""
 
     def __init__(self, from_uid: str, to_uid: str,
@@ -6345,6 +6437,12 @@ async def on_message(message: discord.Message):
     cmd = parts[0].lower()
     args = parts[1:]
     user_id = str(message.author.id)
+
+    if cmd == "blacklist":
+        await blacklist_handle_prefix(message, args)
+        return
+    if not await enter_message(message, cmd):
+        return
 
     if cmd == "clan":
         await clan_handle_prefix(message, args)
@@ -8611,14 +8709,14 @@ async def _loan_loop():
     await client.wait_until_ready()
     while not client.is_closed():
         try:
-            await _loan_process_due()
+            await for_each_guild(_loan_process_due)
         except Exception as exc:  # el bucle nunca debe morir
             print(f"Error en el bucle de préstamos: {exc}")
         await asyncio.sleep(LOAN_CHECK_SECONDS)
 
 
 # ------------------------------------------------------------------ interfaz
-class LoanConfirmView(discord.ui.View):
+class LoanConfirmView(GuildView):
     def __init__(self, owner_id: str, amount: int):
         super().__init__(timeout=60)
         self.owner_id = owner_id
@@ -8743,11 +8841,11 @@ JAIL_MAX_MINUTES = 60
 JAIL_STRIKE_RESET_HOURS = 24      # sin caer en este tiempo, el contador de reincidencia se reinicia
 JAIL_BAIL_PER_MINUTE = 5_000_000  # fianza = minutos que faltan x esto
 JAIL_BLOCKED_COMMANDS = {         # comandos slash bloqueados mientras estas preso
-    "rob", "slots", "roulette", "ruleta-en-vivo", "blackjack", "crash", "mines",
+    "rob", "slots", "roulette", "ruleta-en-vivo", "blackjack", "crash", "mines", "hilo",
     "coinflip", "duel", "bet", "fight", "ftorneo",
 }
 JAIL_BLOCKED_PREFIX = {           # lo mismo para los comandos con coma
-    "rob", "slots", "slot", "tragamonedas", "roulette", "blackjack", "bj", "crash", "mines",
+    "rob", "slots", "slot", "tragamonedas", "roulette", "blackjack", "bj", "crash", "mines", "hilo",
     "coinflip", "cf", "duel", "bet", "fight", "ftorneo", "lroulette", "liveroulette", "ruleta",
 }
 
@@ -8826,15 +8924,19 @@ def _err_embed(title: str, message: str) -> discord.Embed:
     return discord.Embed(title=f"❌ {title}", description=message, color=0xFF4444)
 
 
-async def setting_get(key: str, default: str | None = None) -> str | None:
-    async with aiosqlite.connect(DB_PATH) as db:
+def _settings_db(scope: str):
+    return GLOBAL_DB_PATH if scope == "global" else DB_PATH
+
+
+async def setting_get(key: str, default: str | None = None, *, scope: str = "guild") -> str | None:
+    async with aiosqlite.connect(_settings_db(scope)) as db:
         async with db.execute("SELECT value FROM bot_settings WHERE key=?", (key,)) as cur:
             row = await cur.fetchone()
     return row[0] if row else default
 
 
-async def setting_set(key: str, value: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+async def setting_set(key: str, value: str, *, scope: str = "guild"):
+    async with aiosqlite.connect(_settings_db(scope)) as db:
         await db.execute(
             "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -8843,8 +8945,8 @@ async def setting_set(key: str, value: str):
         await db.commit()
 
 
-async def setting_del(key: str):
-    async with aiosqlite.connect(DB_PATH) as db:
+async def setting_del(key: str, *, scope: str = "guild"):
+    async with aiosqlite.connect(_settings_db(scope)) as db:
         await db.execute("DELETE FROM bot_settings WHERE key=?", (key,))
         await db.commit()
 
@@ -9024,7 +9126,7 @@ async def _announce_achievements(user_id: str, keys: list[str]):
     await _notify_user(user_id, f"<@{user_id}> 🏅 **¡Logro desbloqueado!**\n" + "\n".join(lines))
 
 
-_PLAY_ACTIONS = {"slots_played", "roulette_played", "crash_played", "mines_played"}
+_PLAY_ACTIONS = {"slots_played", "roulette_played", "crash_played", "mines_played", "hilo_played"}
 
 
 async def feature_hook(user_id: str, action: str, n: int = 1):
@@ -9166,19 +9268,42 @@ async def jail_pay_bail(user_id: str, username: str) -> discord.Embed:
 
 
 async def _jail_interaction_check(interaction: discord.Interaction) -> bool:
+    """Se ejecuta antes de cada comando slash: fija el servidor, aplica la blacklist y la cárcel."""
     try:
-        _last_channel[str(interaction.user.id)] = interaction.channel
-        if interaction.type is discord.InteractionType.application_command:
-            name = (interaction.data or {}).get("name")
-            if name in JAIL_BLOCKED_COMMANDS:
-                remaining = await jail_remaining(str(interaction.user.id))
-                if remaining is not None:
-                    await interaction.response.send_message(embed=jail_embed(remaining), ephemeral=True)
-                    return False
+        uid = str(interaction.user.id)
+        _last_channel[uid] = interaction.channel
+        is_command = interaction.type is discord.InteractionType.application_command
+        name = (interaction.data or {}).get("name")
+        if name == "blacklist":
+            return True   # es global; el propio comando comprueba que seas el dueño
+        if interaction.guild_id is None:
+            if is_command and name in ("help", "guía"):
+                return True   # no usan la economía
+            if is_command:
+                await interaction.response.send_message(
+                    "❌ La economía es por servidor: usa los comandos dentro de un servidor.", ephemeral=True)
+            return False
+        try:
+            await enter_guild(interaction.guild_id)
+        except Exception as exc:
+            print(f"Error preparando el servidor {interaction.guild_id}: {exc}")
+            if is_command:
+                await interaction.response.send_message(
+                    "❌ No pude preparar la economía de este servidor. Inténtalo de nuevo.", ephemeral=True)
+            return False
+        if is_command and name not in BLACKLIST_EXEMPT_COMMANDS:
+            blocked = _blacklist_block_for(interaction)
+            if blocked:
+                await interaction.response.send_message(blocked, ephemeral=True)
+                return False
+        if is_command and name in JAIL_BLOCKED_COMMANDS:
+            remaining = await jail_remaining(uid)
+            if remaining is not None:
+                await interaction.response.send_message(embed=jail_embed(remaining), ephemeral=True)
+                return False
     except Exception as exc:
-        print(f"Error en el chequeo de carcel: {exc}")
+        print(f"Error en el chequeo previo del comando: {exc}")
     return True
-
 
 tree.interaction_check = _jail_interaction_check
 
@@ -9382,7 +9507,7 @@ class CollectEventDurationSelect(discord.ui.Select):
         await interaction.response.edit_message(embed=view.make_embed(), view=view)
 
 
-class CollectEventDurationModal(discord.ui.Modal, title="Duración personalizada"):
+class CollectEventDurationModal(GuildModal, title="Duración personalizada"):
     days = discord.ui.TextInput(
         label="Duración en días (1–365)",
         placeholder="Ejemplo: 12",
@@ -9476,7 +9601,7 @@ class CollectEventActivateButton(discord.ui.Button):
         await interaction.response.edit_message(embed=embed, view=None)
 
 
-class CollectEventPanelView(discord.ui.View):
+class CollectEventPanelView(GuildView):
     def __init__(self, owner_id: str, current_status: str = ""):
         super().__init__(timeout=300)
         self.owner_id = owner_id
@@ -9850,7 +9975,7 @@ async def role_loan_loop():
     await client.wait_until_ready()
     while not client.is_closed():
         try:
-            await expire_role_loans()
+            await for_each_guild(expire_role_loans)
         except Exception as exc:  # el bucle nunca debe morir
             print(f"Error en role_loan_loop: {exc}")
         await asyncio.sleep(ROLE_LOAN_CHECK_SECONDS)
@@ -10582,7 +10707,7 @@ async def weekly_loop():
     await client.wait_until_ready()
     while not client.is_closed():
         try:
-            await weekly_rollover_check()
+            await for_each_guild(weekly_rollover_check)
         except Exception as exc:  # el bucle nunca debe morir
             print(f"Error en weekly_loop: {exc}")
         await asyncio.sleep(WEEKLY_CHECK_SECONDS)
@@ -11217,7 +11342,7 @@ class MinesButton(discord.ui.Button):
         await self.view.reveal(interaction, self)
 
 
-class MinesView(discord.ui.View):
+class MinesView(GuildView):
     def __init__(self, user_id: str, bet: int, mines: int):
         super().__init__(timeout=120)
         self.user_id = user_id
@@ -11414,6 +11539,17 @@ async def features_handle_prefix(message: discord.Message, cmd: str, args: list)
             return True
         view.message = await message.channel.send(embed=view.make_embed(), view=view)
         return True
+    if cmd == "hilo":
+        if not args:
+            await message.channel.send("❌ Uso: `,hilo <cantidad|all>` — ej: `,hilo 1m`")
+            return True
+        error, view = await hilo_create(uid, message.author.name, args[0], message.author.display_name,
+                                        message.author.display_avatar.url)
+        if error:
+            await message.channel.send(embed=_err_embed("No se pudo empezar", error))
+            return True
+        view.message = await message.channel.send(embed=view.make_embed(), view=view)
+        return True
     return False
 
 
@@ -11456,6 +11592,566 @@ async def ftorneo_charge_host(user_id: str, entry_fee: int) -> str | None:
         return f"❌ La apuesta de entrada es **{entry_fee:,}** 🪙 y tienes **{balance:,}** 🪙."
     await update_balance(user_id, -entry_fee)
     return None
+
+
+# =====================================================================
+#  ECONOMÍA POR SERVIDOR · BLACKLIST · HI-LO
+# =====================================================================
+async def init_global_db():
+    os.makedirs(os.path.dirname(GLOBAL_DB_PATH) or ".", exist_ok=True)
+    async with aiosqlite.connect(GLOBAL_DB_PATH) as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS bot_settings (key TEXT PRIMARY KEY, value TEXT)")
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS blacklist (
+                user_id TEXT PRIMARY KEY, username TEXT, reason TEXT, added_by TEXT, added_at TEXT)"""
+        )
+        await db.execute("CREATE TABLE IF NOT EXISTS guild_dbs (guild_id TEXT PRIMARY KEY, path TEXT NOT NULL)")
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS config_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, user_id TEXT NOT NULL,
+                user_name TEXT NOT NULL, key TEXT NOT NULL, old TEXT, new TEXT)"""
+        )
+        await db.commit()
+
+
+def _backup_sqlite(src: str, dst: str):
+    """Copia una base SQLite de forma consistente (incluye lo que esté en el WAL)."""
+    source = _sqlite3.connect(src)
+    try:
+        target = _sqlite3.connect(dst)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+    finally:
+        source.close()
+
+
+def _read_legacy_panel_settings() -> list:
+    try:
+        conn = _sqlite3.connect(LEGACY_DB_PATH)
+        try:
+            return conn.execute("SELECT key, value FROM bot_settings WHERE key LIKE 'cfg:%'").fetchall()
+        finally:
+            conn.close()
+    except _sqlite3.Error:
+        return []
+
+
+async def _map_guild(guild_id: str, path: str):
+    _guild_paths[guild_id] = path
+    async with aiosqlite.connect(GLOBAL_DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO guild_dbs (guild_id, path) VALUES (?, ?) "
+            "ON CONFLICT(guild_id) DO UPDATE SET path=excluded.path",
+            (guild_id, path),
+        )
+        await db.commit()
+
+
+async def load_guild_map():
+    async with aiosqlite.connect(GLOBAL_DB_PATH) as db:
+        async with db.execute("SELECT guild_id, path FROM guild_dbs") as cur:
+            for guild_id, path in await cur.fetchall():
+                _guild_paths[guild_id] = path
+
+
+async def run_economy_migration():
+    """Una sola vez: cada servidor actual recibe una copia de la economía vieja (compartida).
+
+    Desde ese momento cada servidor evoluciona por separado. Los servidores que se agreguen
+    después empiezan de cero. Con LEGACY_GUILD_ID solo ese servidor recibe la economía vieja.
+    """
+    if await setting_get("economy_split_done", scope="global"):
+        return
+    if os.path.exists(LEGACY_DB_PATH):
+        only = os.environ.get("LEGACY_GUILD_ID", "").strip()
+        for guild in list(client.guilds):
+            if only and str(guild.id) != only:
+                continue
+            dest = GUILD_DB_TEMPLATE.format(guild_id=guild.id)
+            if not os.path.exists(dest):
+                await asyncio.to_thread(_backup_sqlite, LEGACY_DB_PATH, dest)
+            await _map_guild(str(guild.id), dest)
+            print(f"Economía copiada al servidor {guild.name} ({guild.id}).")
+        rows = await asyncio.to_thread(_read_legacy_panel_settings)
+        if rows:
+            async with aiosqlite.connect(GLOBAL_DB_PATH) as db:
+                for key, value in rows:
+                    await db.execute("INSERT OR IGNORE INTO bot_settings (key, value) VALUES (?, ?)", (key, value))
+                await db.commit()
+    await setting_set("economy_split_done", "1", scope="global")
+
+
+async def _init_guild_tables():
+    await init_db()
+    await init_shield_table()
+    await loan_init_table()
+    await init_role_loans_table()
+    await init_extras_tables()
+
+
+async def enter_guild(guild_id) -> None:
+    """Fija el servidor actual (para esta tarea) y prepara su base de datos si hace falta."""
+    global _guild_init_lock
+    gid = str(guild_id)
+    _current_guild.set(gid)
+    if gid in _guild_ready:
+        return
+    if _guild_init_lock is None:
+        _guild_init_lock = asyncio.Lock()
+    async with _guild_init_lock:
+        if gid in _guild_ready:
+            return
+        if gid not in _guild_paths:
+            os.makedirs(os.path.dirname(GUILD_DB_TEMPLATE) or ".", exist_ok=True)
+            await _map_guild(gid, GUILD_DB_TEMPLATE.format(guild_id=gid))
+        await _init_guild_tables()
+        _guild_ready.add(gid)
+
+
+async def for_each_guild(fn):
+    """Ejecuta una tarea una vez por servidor, cada una con su propia economía."""
+    for guild in list(client.guilds):
+        try:
+            await enter_guild(guild.id)
+            await fn()
+        except Exception as exc:
+            print(f"Error en {getattr(fn, '__name__', 'tarea')} (servidor {guild.id}): {exc}")
+
+
+# ---------------------------------------------------------------- blacklist
+BLACKLIST_OWNER_USERNAME = "jose_antonio972"
+BLACKLIST_BLOCKED_TEXT = "🚫 Estás en la **blacklist**: ya no puedes usar la economía del bot."
+_blacklist_ids: set = set()
+BLACKLIST_EXEMPT_COMMANDS = {   # no son economía: siguen funcionando para todos
+    "help", "guía", "guia", "blacklist", "ban", "unban", "kick", "mute", "unmute",
+    "clear", "lock", "unlock", "addrole", "removerole",
+}
+BLACKLIST_EXEMPT_PREFIX = BLACKLIST_EXEMPT_COMMANDS | {"ayuda"}
+
+
+async def load_blacklist():
+    async with aiosqlite.connect(GLOBAL_DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM blacklist") as cur:
+            _blacklist_ids.clear()
+            _blacklist_ids.update(r[0] for r in await cur.fetchall())
+
+
+async def blacklist_authorized(user) -> bool:
+    """Solo jose_antonio972 (o los IDs de BLACKLIST_OWNER_IDS). La primera vez se fija su ID."""
+    uid = str(user.id)
+    env_ids = {x for x in re.split(r"[\s,;]+", os.environ.get("BLACKLIST_OWNER_IDS", "")) if x}
+    if uid in env_ids:
+        return True
+    pinned = await setting_get("blacklist_owner_id", scope="global")
+    if pinned:
+        return uid == pinned
+    if (getattr(user, "name", "") or "").lower() == BLACKLIST_OWNER_USERNAME:
+        await setting_set("blacklist_owner_id", uid, scope="global")
+        return True
+    return False
+
+
+async def blacklist_add(user_id: str, username: str, reason: str, added_by: str) -> bool:
+    async with aiosqlite.connect(GLOBAL_DB_PATH) as db:
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO blacklist (user_id, username, reason, added_by, added_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, reason, added_by, datetime.utcnow().isoformat()),
+        )
+        await db.commit()
+        added = cur.rowcount == 1
+    _blacklist_ids.add(user_id)
+    return added
+
+
+async def blacklist_remove(user_id: str) -> bool:
+    async with aiosqlite.connect(GLOBAL_DB_PATH) as db:
+        cur = await db.execute("DELETE FROM blacklist WHERE user_id=?", (user_id,))
+        await db.commit()
+        removed = cur.rowcount == 1
+    _blacklist_ids.discard(user_id)
+    return removed
+
+
+async def blacklist_entries() -> list:
+    async with aiosqlite.connect(GLOBAL_DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, username, reason, added_at FROM blacklist ORDER BY added_at DESC"
+        ) as cur:
+            return await cur.fetchall()
+
+
+def build_blacklist_embed(rows: list) -> discord.Embed:
+    embed = discord.Embed(title="🚫 Blacklist de economía", color=0xED4245)
+    if not rows:
+        embed.description = "La blacklist está vacía."
+        return embed
+    lines = []
+    for uid, name, reason, _ts in rows[:40]:
+        lines.append(f"<@{uid}> (`{name or uid}`)" + (f" — {reason}" if reason else ""))
+    embed.description = "\n".join(lines)[:4000]
+    embed.set_footer(text=f"{len(rows)} usuario(s) en la blacklist")
+    return embed
+
+
+def _blacklist_block_for(interaction: discord.Interaction) -> str | None:
+    uid = str(interaction.user.id)
+    if uid in _blacklist_ids:
+        return BLACKLIST_BLOCKED_TEXT
+    data = interaction.data or {}
+    resolved = (data.get("resolved") or {}).get("users") or {}
+    for target_id, info in resolved.items():
+        if target_id != uid and target_id in _blacklist_ids:
+            name = (info or {}).get("username", target_id)
+            return f"🚫 **{name}** está en la blacklist: no puedes hacer acciones de economía con esa persona."
+    return None
+
+
+async def _enter_interaction(interaction: discord.Interaction) -> bool:
+    """Para botones y formularios: fija el servidor y bloquea DMs y blacklist. False = ya se respondió."""
+    try:
+        if interaction.guild_id is None:
+            message = "❌ La economía es por servidor: usa esto dentro de un servidor."
+        else:
+            await enter_guild(interaction.guild_id)
+            message = BLACKLIST_BLOCKED_TEXT if str(interaction.user.id) in _blacklist_ids else None
+    except Exception as exc:
+        print(f"Error preparando el servidor: {exc}")
+        message = "❌ No pude preparar la economía de este servidor. Inténtalo de nuevo."
+    if message is None:
+        return True
+    try:
+        await interaction.response.send_message(message, ephemeral=True)
+    except Exception:
+        pass
+    return False
+
+
+async def enter_message(message: discord.Message, cmd: str) -> bool:
+    """Para comandos con prefijo: fija el servidor y bloquea DMs y blacklist."""
+    _last_channel[str(message.author.id)] = message.channel
+    if message.guild is None:
+        if cmd in BLACKLIST_EXEMPT_PREFIX:
+            return True   # ayuda y moderación no usan la economía
+        await message.channel.send("❌ La economía es por servidor: usa los comandos dentro de un servidor.")
+        return False
+    try:
+        await enter_guild(message.guild.id)
+    except Exception as exc:
+        print(f"Error preparando el servidor: {exc}")
+        await message.channel.send("❌ No pude preparar la economía de este servidor. Inténtalo de nuevo.")
+        return False
+    if cmd in BLACKLIST_EXEMPT_PREFIX:
+        return True
+    author_id = str(message.author.id)
+    if author_id in _blacklist_ids:
+        await message.channel.send(BLACKLIST_BLOCKED_TEXT)
+        return False
+    for member in message.mentions:
+        if str(member.id) != author_id and str(member.id) in _blacklist_ids:
+            await message.channel.send(
+                f"🚫 **{member.display_name}** está en la blacklist: no puedes hacer acciones de economía con esa persona.")
+            return False
+    return True
+
+
+blacklist_group = app_commands.Group(
+    name="blacklist", description="Gestiona la blacklist de la economía (solo el dueño del bot)"
+)
+tree.add_command(blacklist_group)
+
+
+async def _blacklist_gate(interaction: discord.Interaction) -> bool:
+    if await blacklist_authorized(interaction.user):
+        return True
+    await interaction.response.send_message(
+        f"❌ Solo **{BLACKLIST_OWNER_USERNAME}** puede usar este comando.", ephemeral=True)
+    return False
+
+
+@blacklist_group.command(name="add", description="Mete a un usuario en la blacklist (no podrá usar la economía en ningún servidor)")
+@app_commands.describe(usuario="Usuario a bloquear", razon="Motivo (opcional)")
+async def blacklist_add_cmd(interaction: discord.Interaction, usuario: discord.User, razon: str = ""):
+    if not await _blacklist_gate(interaction):
+        return
+    if usuario.bot or usuario.id == interaction.user.id:
+        await interaction.response.send_message("❌ No puedes poner en la blacklist a un bot ni a ti mismo.", ephemeral=True)
+        return
+    added = await blacklist_add(str(usuario.id), usuario.name, razon.strip()[:200], str(interaction.user.id))
+    await interaction.response.send_message(
+        f"🚫 **{usuario.name}** {'fue añadido a' if added else 'ya estaba en'} la blacklist.", ephemeral=True)
+
+
+@blacklist_group.command(name="remove", description="Saca a un usuario de la blacklist")
+@app_commands.describe(usuario="Usuario a perdonar")
+async def blacklist_remove_cmd(interaction: discord.Interaction, usuario: discord.User):
+    if not await _blacklist_gate(interaction):
+        return
+    removed = await blacklist_remove(str(usuario.id))
+    await interaction.response.send_message(
+        f"✅ **{usuario.name}** salió de la blacklist." if removed else f"ℹ️ **{usuario.name}** no estaba en la blacklist.",
+        ephemeral=True)
+
+
+@blacklist_group.command(name="list", description="Muestra quién está en la blacklist")
+async def blacklist_list_cmd(interaction: discord.Interaction):
+    if not await _blacklist_gate(interaction):
+        return
+    await interaction.response.send_message(embed=build_blacklist_embed(await blacklist_entries()), ephemeral=True)
+
+
+async def blacklist_handle_prefix(message: discord.Message, args: list):
+    if not await blacklist_authorized(message.author):
+        await message.channel.send(f"❌ Solo **{BLACKLIST_OWNER_USERNAME}** puede usar este comando.")
+        return
+    usage = "❌ Uso: `,blacklist add @usuario [razón]` · `,blacklist remove @usuario` · `,blacklist list`"
+    sub = args[0].lower() if args else ""
+    if sub in ("list", "lista"):
+        await message.channel.send(embed=build_blacklist_embed(await blacklist_entries()))
+        return
+    if sub not in ("add", "agregar", "remove", "quitar"):
+        await message.channel.send(usage)
+        return
+    target_id, rest = None, args[1:]
+    if message.mentions:
+        target_id = str(message.mentions[0].id)
+        rest = [a for a in rest if not re.fullmatch(r"<@!?\d+>", a)]
+    elif rest and rest[0].isdigit():
+        target_id, rest = rest[0], rest[1:]
+    if target_id is None:
+        await message.channel.send(usage)
+        return
+    name = target_id
+    try:
+        user = client.get_user(int(target_id)) or await client.fetch_user(int(target_id))
+        name = user.name
+        if user.bot:
+            await message.channel.send("❌ No puedes poner en la blacklist a un bot.")
+            return
+    except (discord.HTTPException, ValueError):
+        pass
+    if target_id == str(message.author.id):
+        await message.channel.send("❌ No puedes ponerte a ti mismo en la blacklist.")
+        return
+    if sub in ("add", "agregar"):
+        added = await blacklist_add(target_id, name, " ".join(rest)[:200], str(message.author.id))
+        await message.channel.send(f"🚫 **{name}** {'fue añadido a' if added else 'ya estaba en'} la blacklist.")
+    else:
+        removed = await blacklist_remove(target_id)
+        await message.channel.send(f"✅ **{name}** salió de la blacklist." if removed else f"ℹ️ **{name}** no estaba en la blacklist.")
+
+
+# =====================================================================
+#  HI-LO (mayor, menor o igual)  ·  ,hilo <cantidad>  y  /hilo
+# =====================================================================
+HILO_PAYOUT_FACTOR = 0.97          # 1.00 = pago justo; 0.97 = 3% de ventaja de la casa
+HILO_DECKS = 3                     # barajas del mazo (156 cartas)
+_HILO_RANKS = ["A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K"]
+_HILO_SUITS = ["♠️", "♥️", "♦️", "♣️"]
+_HILO_GUESS = {"higher": "mayor", "lower": "menor", "same": "igual"}
+
+
+def hilo_new_shoe() -> list:
+    shoe = [(rank, suit) for _ in range(HILO_DECKS) for rank in range(1, 14) for suit in range(4)]
+    random.shuffle(shoe)
+    return shoe
+
+
+def hilo_card_text(card) -> str:
+    return f"**{_HILO_RANKS[card[0] - 1]}** {_HILO_SUITS[card[1]]}"
+
+
+def hilo_odds(card, shoe) -> dict:
+    """Multiplicador de cada opción según las cartas que quedan (None = imposible)."""
+    n = len(shoe)
+    counts = {
+        "higher": sum(1 for r, _ in shoe if r > card[0]),
+        "lower": sum(1 for r, _ in shoe if r < card[0]),
+        "same": sum(1 for r, _ in shoe if r == card[0]),
+    }
+    return {k: (None if c == 0 or n == 0 else max(1.01, HILO_PAYOUT_FACTOR * n / c)) for k, c in counts.items()}
+
+
+def hilo_fmt_mult(mult: float) -> str:
+    return f"x{mult:.2f}".rstrip("0").rstrip(".")
+
+
+class HiloButton(discord.ui.Button):
+    def __init__(self, kind: str, **kwargs):
+        super().__init__(**kwargs)
+        self.kind = kind
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.on_press(interaction, self.kind)
+
+
+class HiloView(GuildView):
+    def __init__(self, user_id: str, bet: int, author_name: str = "", author_icon: str | None = None):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.bet = bet
+        self.author_name = author_name
+        self.author_icon = author_icon
+        self.shoe = hilo_new_shoe()
+        self.current = self.shoe.pop()
+        self.next_card = None
+        self.state = "playing"            # playing | busy | won | lost | timeout
+        self.guess = None
+        self.mult = 0.0
+        self.profit = 0
+        self.reshuffled = False
+        self.message: discord.Message | None = None
+        self._build()
+
+    # ---- interfaz
+    def _build(self):
+        self.clear_items()
+        finished = self.state in ("won", "lost", "timeout")
+        if self.state in ("won", "lost"):
+            self.add_item(HiloButton("again", label="Jugar otra vez", style=discord.ButtonStyle.success, row=0))
+        odds = hilo_odds(self.current, self.shoe)
+        for kind, emoji, word in (("higher", "⬆️", "Mayor"), ("lower", "⬇️", "Menor"), ("same", "🟰", "Igual")):
+            mult = odds[kind]
+            label = f"{word} ({hilo_fmt_mult(mult)})" if mult else f"{word} (—)"
+            self.add_item(HiloButton(
+                kind, label=label, emoji=emoji, style=discord.ButtonStyle.primary, row=0 if self.state == "playing" else 1,
+                disabled=finished or self.state == "busy" or mult is None,
+            ))
+        self.add_item(HiloButton("help", label="Ayuda", emoji="❓", style=discord.ButtonStyle.secondary, row=2))
+
+    def make_embed(self) -> discord.Embed:
+        color = {"won": 0x2ECC71, "lost": 0xED4245, "timeout": 0x95A5A6}.get(self.state, 0x9B59B6)
+        embed = discord.Embed(title="🃏 Hi-Lo", color=color)
+        if self.author_name:
+            embed.set_author(name=self.author_name, icon_url=self.author_icon)
+        if self.state == "won":
+            head = f"✅ Adivinaste **{_HILO_GUESS[self.guess]}** y ganaste **{self.profit:,}** 🪙 ({hilo_fmt_mult(self.mult)})!"
+        elif self.state == "lost":
+            head = f"❌ Elegiste **{_HILO_GUESS[self.guess]}** y perdiste **{self.bet:,}** 🪙."
+        elif self.state == "timeout":
+            head = "⏰ Se acabó el tiempo. Tu apuesta fue devuelta."
+        else:
+            head = f"💵 Apuesta: **{self.bet:,}** 🪙\n¿La siguiente carta será **mayor**, **menor** o **igual**?"
+        embed.description = head
+        embed.add_field(name="Tu carta", value=f"{hilo_card_text(self.current)}\nValor: **{self.current[0]}**", inline=False)
+        if self.next_card is not None:
+            embed.add_field(name="Siguiente carta",
+                            value=f"{hilo_card_text(self.next_card)}\nValor: **{self.next_card[0]}**", inline=False)
+        footer = f"Cartas restantes: {len(self.shoe)}"
+        if self.reshuffled and self.state == "playing":
+            footer += " · 🔀 mazo nuevo"
+        embed.set_footer(text=footer)
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("❌ Esta partida no es tuya.", ephemeral=True)
+            return False
+        return True
+
+    # ---- acciones
+    async def on_press(self, interaction: discord.Interaction, kind: str):
+        if kind == "help":
+            await interaction.response.send_message(
+                "**🃏 Cómo se juega Hi-Lo**\n"
+                "Ves una carta (A=1, J=11, Q=12, K=13). Adivina si la siguiente será **mayor**, **menor** o **igual**.\n"
+                "• Cuanto menos probable, más paga: el multiplicador sale de las cartas que quedan en el mazo.\n"
+                "• Si aciertas ganas tu apuesta × multiplicador; si fallas pierdes la apuesta.\n"
+                "• Si sale una carta igual y elegiste mayor o menor, pierdes.\n"
+                "• Con **Jugar otra vez** repites la misma apuesta.",
+                ephemeral=True)
+            return
+        if kind == "again":
+            await self._again(interaction)
+            return
+        await self._guess(interaction, kind)
+
+    async def _guess(self, interaction: discord.Interaction, kind: str):
+        if self.state != "playing":
+            await interaction.response.defer()
+            return
+        mult = hilo_odds(self.current, self.shoe)[kind]
+        if mult is None:
+            await interaction.response.send_message("❌ Esa opción no es posible con esta carta.", ephemeral=True)
+            return
+        self.state = "busy"
+        nxt = self.shoe.pop()
+        won = ((kind == "higher" and nxt[0] > self.current[0]) or (kind == "lower" and nxt[0] < self.current[0])
+               or (kind == "same" and nxt[0] == self.current[0]))
+        payout = int(self.bet * mult) if won else 0
+        if won:
+            await update_balance(self.user_id, payout)
+        await log_bet(self.user_id, "🃏 Hi-Lo", self.bet, payout - self.bet)
+        self.next_card, self.guess, self.mult = nxt, kind, mult
+        self.profit = payout - self.bet
+        self.state = "won" if won else "lost"
+        self._build()
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    async def _again(self, interaction: discord.Interaction):
+        if self.state not in ("won", "lost"):
+            await interaction.response.defer()
+            return
+        balance = await get_balance(self.user_id)
+        if balance < self.bet:
+            await interaction.response.send_message(
+                f"❌ Necesitas **{self.bet:,}** 🪙 para jugar otra vez y tienes **{balance:,}** 🪙.", ephemeral=True)
+            return
+        previous = self.state
+        self.state = "busy"
+        try:
+            await update_balance(self.user_id, -self.bet)
+            await track_mission(self.user_id, "hilo_played")
+        except Exception:
+            self.state = previous
+            raise
+        self.reshuffled = len(self.shoe) < 20
+        if self.reshuffled:
+            self.shoe = hilo_new_shoe()
+        self.current, self.next_card, self.guess = self.shoe.pop(), None, None
+        self.state = "playing"
+        self._build()
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    async def on_timeout(self):
+        refunded = self.state == "playing"
+        if refunded:
+            self.state = "timeout"
+            await update_balance(self.user_id, self.bet)
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(embed=self.make_embed() if refunded else None, view=self)
+            except discord.HTTPException:
+                pass
+
+
+async def hilo_create(user_id: str, username: str, bet_text: str, author_name: str = "", author_icon: str | None = None):
+    """Devuelve (error, vista). Cobra la apuesta si todo está bien."""
+    await get_or_create_user(user_id, username)
+    balance = await get_balance(user_id)
+    bet = parse_amount_or_all(bet_text, balance)
+    if bet is None or bet <= 0:
+        return "Escribe una apuesta válida (`all`, `5m`, `500k`...).", None
+    if bet > balance:
+        return f"Tienes **{balance:,}** 🪙 y quieres apostar **{bet:,}** 🪙.", None
+    await update_balance(user_id, -bet)
+    await track_mission(user_id, "hilo_played")
+    return None, HiloView(user_id, bet, author_name, author_icon)
+
+
+@tree.command(name="hilo", description="Hi-Lo: adivina si la siguiente carta es mayor, menor o igual")
+@app_commands.describe(cantidad="Apuesta (acepta all, 5m, 500k)")
+async def hilo_command(interaction: discord.Interaction, cantidad: str):
+    error, view = await hilo_create(str(interaction.user.id), interaction.user.name, cantidad,
+                                    interaction.user.display_name, interaction.user.display_avatar.url)
+    if error:
+        await interaction.response.send_message(embed=_err_embed("No se pudo empezar", error), ephemeral=True)
+        return
+    await interaction.response.send_message(embed=view.make_embed(), view=view)
+    view.message = await interaction.original_response()
 
 
 # =====================================================================
@@ -11571,6 +12267,7 @@ CONFIG_GROUPS_STATIC = [
     ]},
     {"id": "games", "icon": "🎰", "title": "Juegos", "desc": "Mines y torneos de luchadores.", "fields": [
         _f("MINES_PAYOUT_FACTOR", "Pago de Mines", typ="float", lo=0.5, hi=1.0, step=0.01, unit="× justo", help="1.00 = sin ventaja de la casa. 0.96 = 4% de ventaja."),
+        _f("HILO_PAYOUT_FACTOR", "Pago de Hi-Lo", typ="float", lo=0.5, hi=1.0, step=0.01, unit="× justo", help="1.00 = sin ventaja de la casa. 0.97 = 3% de ventaja."),
         _f("FIGHTER_TOURNAMENT_PRIZE", "Premio del torneo sin apuesta", unit="🪙"),
         _f("FIGHTER_TOURNAMENT_RAKE_PERCENT", "Comisión del torneo con apuesta", hi=100, unit="%"),
     ]},
@@ -11699,7 +12396,7 @@ def config_apply(clean: dict):
 
 
 async def init_dashboard_tables():
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(GLOBAL_DB_PATH) as db:
         await db.execute(
             """CREATE TABLE IF NOT EXISTS config_audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, user_id TEXT NOT NULL,
@@ -11710,7 +12407,7 @@ async def init_dashboard_tables():
 
 async def config_load():
     """Lee los ajustes guardados y los aplica (al arrancar el bot)."""
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(GLOBAL_DB_PATH) as db:
         async with db.execute("SELECT key, value FROM bot_settings WHERE key LIKE 'cfg:%'") as cur:
             rows = await cur.fetchall()
     saved: dict = {}
@@ -11732,7 +12429,7 @@ async def config_save(updates: dict, user_id: str, user_name: str) -> tuple[dict
     if errors:
         return {}, errors
     now = datetime.utcnow().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(GLOBAL_DB_PATH) as db:
         for key, value in clean.items():
             old = config_current(key)
             if value == config_default(key):
@@ -11769,31 +12466,53 @@ def config_snapshot() -> list[dict]:
 
 
 async def dashboard_stats() -> dict:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*), COALESCE(SUM(balance),0), COALESCE(SUM(bank),0) FROM users") as cur:
-            users, wallet, bank = await cur.fetchone()
-        counts = {}
-        for name, sql in (
-            ("clans", "SELECT COUNT(*) FROM clans"),
-            ("loans", "SELECT COUNT(*) FROM loans"),
-            ("role_loans", "SELECT COUNT(*) FROM role_loans"),
-            ("listings", "SELECT COUNT(*) FROM role_listings"),
-        ):
-            try:
-                async with db.execute(sql) as cur:
-                    counts[name] = (await cur.fetchone())[0]
-            except Exception:
-                counts[name] = 0
-    mult, event_text = await collect_event_info()
-    return {
-        "users": users, "money_wallet": wallet, "money_bank": bank, "guilds": len(client.guilds),
-        "event_multiplier": mult, "event_text": event_text, **counts,
-    }
+    totals = {"users": 0, "money_wallet": 0, "money_bank": 0, "clans": 0, "loans": 0, "role_loans": 0, "listings": 0}
+    per_guild, manual_events, event_text = [], 0, None
+    for guild in list(client.guilds):
+        try:
+            await enter_guild(guild.id)
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(balance),0), COALESCE(SUM(bank),0) FROM users"
+                ) as cur:
+                    users, wallet, bank = await cur.fetchone()
+                counts = {}
+                for name, sql in (
+                    ("clans", "SELECT COUNT(*) FROM clans"),
+                    ("loans", "SELECT COUNT(*) FROM loans"),
+                    ("role_loans", "SELECT COUNT(*) FROM role_loans"),
+                    ("listings", "SELECT COUNT(*) FROM role_listings"),
+                ):
+                    try:
+                        async with db.execute(sql) as cur:
+                            counts[name] = (await cur.fetchone())[0]
+                    except Exception:
+                        counts[name] = 0
+            mult, text = await collect_event_info()
+            if await manual_collect_event_active():
+                manual_events += 1
+        except Exception as exc:
+            print(f"Estadísticas: no pude leer el servidor {guild.id}: {exc}")
+            continue
+        totals["users"] += users
+        totals["money_wallet"] += wallet
+        totals["money_bank"] += bank
+        for key, value in counts.items():
+            totals[key] += value
+        per_guild.append({"id": str(guild.id), "name": guild.name, "users": users,
+                          "money": wallet + bank, "event_multiplier": mult})
+        event_text = event_text or text
+    event_text = event_text or "No hay servidores."
+    if manual_events:
+        event_text += f"\n🎛️ Evento manual activo en {manual_events} servidor(es)."
+    return {**totals, "guilds": len(client.guilds), "per_guild": per_guild,
+            "event_multiplier": max([g["event_multiplier"] for g in per_guild] or [1]), "event_text": event_text}
+
 
 
 async def dashboard_audit(limit: int = 40) -> list[dict]:
     fields = config_field_map()
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(GLOBAL_DB_PATH) as db:
         async with db.execute(
             "SELECT ts, user_name, key, old, new FROM config_audit ORDER BY id DESC LIMIT ?", (limit,)
         ) as cur:
@@ -11807,13 +12526,21 @@ async def dashboard_audit(limit: int = 40) -> list[dict]:
 
 
 async def dashboard_set_event(hours: int) -> str:
-    if hours <= 0:
-        await cancel_manual_collect_event()
-        return "Evento manual terminado."
-    until = datetime.utcnow() + timedelta(hours=hours)
+    """Activa o termina el evento manual en TODOS los servidores."""
     multiplier = _configured_collect_multiplier()
-    await save_manual_collect_event(multiplier, until)
-    return f"Collect x{multiplier} activado por {hours} h."
+    until = datetime.utcnow() + timedelta(hours=hours)
+
+    async def _apply():
+        if hours <= 0:
+            await cancel_manual_collect_event()
+        else:
+            await save_manual_collect_event(multiplier, until)
+
+    await for_each_guild(_apply)
+    if hours <= 0:
+        return "Evento manual terminado en todos los servidores."
+    return f"Collect x{multiplier} activado por {hours} h en todos los servidores."
+
 
 
 # ------------------------------------------------------------------ /work /slut /crime (config desde el panel)
@@ -12479,13 +13206,18 @@ function overview() {
     stat('🛡️ Clanes', fmt(st.clans)), stat('💳 Préstamos activos', fmt(st.loans)),
     stat('🤝 Roles prestados', fmt(st.role_loans)), stat('🏪 Anuncios en el mercado', fmt(st.listings))));
 
+  if (st.per_guild && st.per_guild.length) {
+    const tb = h('table', {}, h('tr', {}, h('th', {}, 'Servidor'), h('th', {}, 'Jugadores'), h('th', {}, 'Dinero total'), h('th', {}, 'Collect')));
+    st.per_guild.forEach(g => tb.append(h('tr', {}, h('td', {}, g.name), h('td', {}, fmt(g.users)), h('td', {}, fmt(g.money) + ' 🪙'), h('td', {}, 'x' + g.event_multiplier))));
+    wrap.append(h('section', {class: 'card'}, h('h3', {}, '🌐 Economía por servidor'), h('div', {style: 'overflow-x:auto'}, tb)));
+  }
   const hours = h('input', {type: 'number', min: 1, max: 168, value: 24});
   const evt = async (hrs) => {
     const {data} = await api('/api/event', 'POST', {hours: hrs});
     toast(data.ok ? data.message : (data.error || 'Error'), !data.ok);
     await loadStats(); renderApp();
   };
-  wrap.append(h('section', {class: 'card'}, h('h3', {}, '🎉 Evento de collect doble'),
+  wrap.append(h('section', {class: 'card'}, h('h3', {}, '🎉 Evento de collect (todos los servidores)'),
     h('p', {class: 'muted', style: 'white-space:pre-line'}, cleanEvent(st.event_text)),
     h('div', {class: 'inline'}, hours, h('span', {class: 'muted'}, 'horas'),
       h('button', {class: 'btn', onclick: () => evt(Number(hours.value) || 0)}, 'Activar ahora'),
