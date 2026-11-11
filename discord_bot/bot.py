@@ -90,7 +90,7 @@ class GuildModal(discord.ui.Modal):
 
 
 
-SHOP_ITEMS = {
+_BASE_SHOP_ITEMS = {
     "anti_rob": {
         "name": "🛡️ Escudo Anti-Robos",
         "price": 800_000,
@@ -217,7 +217,49 @@ SHOP_ITEMS = {
     },
 }
 
-ROLE_ITEMS = [k for k, v in SHOP_ITEMS.items() if v["category"] == "rol"]
+from collections.abc import Mapping as _Mapping, Sequence as _Sequence
+
+_custom_shop: dict = {}   # servidor -> {id: objeto}: roles que los admins añadieron con /añadir rol
+
+
+class _ShopMapping(_Mapping):
+    """La tienda: los objetos base + los roles propios del servidor en el que se está ejecutando el comando."""
+
+    def _all(self):
+        custom = _custom_shop.get(_current_guild.get())
+        return {**_BASE_SHOP_ITEMS, **custom} if custom else _BASE_SHOP_ITEMS
+
+    def __getitem__(self, key):
+        return self._all()[key]
+
+    def __iter__(self):
+        return iter(self._all())
+
+    def __len__(self):
+        return len(self._all())
+
+
+class _RoleItems(_Sequence):
+    """IDs de los objetos de categoría 'rol' del servidor actual."""
+
+    def _ids(self):
+        return [k for k, v in SHOP_ITEMS.items() if v["category"] == "rol"]
+
+    def __getitem__(self, index):
+        return self._ids()[index]
+
+    def __len__(self):
+        return len(self._ids())
+
+    def __iter__(self):
+        return iter(self._ids())
+
+    def __contains__(self, item):
+        return item in self._ids()
+
+
+SHOP_ITEMS = _ShopMapping()
+ROLE_ITEMS = _RoleItems()
 ROLE_LOAN_LENDER_PERCENT = 50     # % de cada collect de un rol prestado que va para su dueño
 
 
@@ -736,7 +778,7 @@ async def init_db():
                 WHERE inventory.item_id IN ({role_placeholders})
                   AND users.last_collect IS NOT NULL
                 """,
-                ROLE_ITEMS,
+                list(ROLE_ITEMS),
             )
         await db.execute("""
             CREATE TABLE IF NOT EXISTS lottery_tickets (
@@ -4028,12 +4070,13 @@ async def help_cmd(interaction: discord.Interaction):
             "`/logros` — Insignias y progreso\n"
             "`/mines cantidad minas` — Buscaminas con retiro a tiempo\n"
             "`/hilo cantidad` o `,hilo cantidad` — Hi-Lo: mayor, menor o igual\n"
+            "`/añadir rol` · `/quitar rol` — (admins) Roles propios en la tienda\n"
             "`/clan ...` o `,clan ...` — Clanes con banco y misiones\n"
             "`/prestar` `/devolver` `/misprestamos` — Presta roles y mira tus cobros\n"
             "`/rolmercado publicar|ver|comprar|retirar` — Vende o alquila roles\n"
             "`/ftorneo apuesta` — Torneo de luchadores con entrada y premio\n"
             "`/carcel` `/fianza` — Cárcel por robos fallidos\n"
-            "`/evento` — Configura collect x2 a x10 y su duración (administradores)\n"
+            "`/evento` — Configura collect x2 a x50 y su duración (administradores)\n"
             "`/cancelar evento` — Termina el evento manual (administradores)"
         ),
         inline=False
@@ -4159,7 +4202,7 @@ GUIDE_SECTIONS = (
         "id": "events",
         "title": "🎉 Eventos de collect",
         "description": (
-            "Los administradores pueden iniciar eventos de collect x2 a x10 y elegir su duración "
+            "Los administradores pueden iniciar eventos de collect x2 a x50 y elegir su duración "
             "desde el panel de `/evento`. Los demás usuarios pueden consultar el estado."
         ),
         "commands": ("evento", "cancelar"),
@@ -4321,7 +4364,7 @@ def build_guide_pages() -> list[dict]:
                 (
                     "Cómo usar los eventos",
                     (
-                        "`/evento` — Los administradores eligen multiplicador x2–x10 y duración en días.\n"
+                        "`/evento` — Los administradores eligen multiplicador x2–x50 y duración en días.\n"
                         "`/cancelar evento` — Termina el evento manual; requiere Administrador.\n"
                         "El evento automático de fin de semana no se cancela con este comando."
                     ),
@@ -8872,6 +8915,7 @@ CLAN_MISSIONS = {                 # misiones semanales del clan; el premio va al
 WEEKEND_DOUBLE_COLLECT = True     # sabados y domingos (UTC) los roles pagan doble
 COLLECT_EVENT_MULTIPLIER = 2
 COLLECT_EVENT_MULTIPLIER_KEY = "collect_event_multiplier"
+MANUAL_EVENT_MAX_MULTIPLIER = 50   # tope de los eventos manuales (/evento); el de fin de semana usa COLLECT_EVENT_MULTIPLIER (x2)
 
 # ----- mines
 MINES_TILES = 20                  # 4 filas x 5 columnas
@@ -8979,6 +9023,10 @@ async def init_extras_tables():
                 clan_id INTEGER NOT NULL, week_key TEXT NOT NULL, mission_key TEXT NOT NULL,
                 progress INTEGER NOT NULL DEFAULT 0, done INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (clan_id, week_key, mission_key))""",
+            """CREATE TABLE IF NOT EXISTS custom_items (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL, price INTEGER NOT NULL,
+                collect_bonus INTEGER NOT NULL, collect_hours INTEGER NOT NULL, role_id TEXT NOT NULL,
+                created_by TEXT, created_at TEXT)""",
             """CREATE TABLE IF NOT EXISTS role_listings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id TEXT NOT NULL, item_id TEXT NOT NULL,
                 mode TEXT NOT NULL, price INTEGER NOT NULL, days INTEGER NOT NULL DEFAULT 0,
@@ -9369,7 +9417,10 @@ async def _collect_multiplier(db, now: datetime) -> int:
                 multiplier = int(multiplier_row[0]) if multiplier_row else _configured_collect_multiplier()
             except (TypeError, ValueError):
                 multiplier = _configured_collect_multiplier()
-            return max(1, min(10, multiplier))
+            multiplier = max(1, min(MANUAL_EVENT_MAX_MULTIPLIER, multiplier))
+            if WEEKEND_DOUBLE_COLLECT and now.weekday() >= 5:
+                multiplier = max(multiplier, _configured_collect_multiplier())   # nunca por debajo del de fin de semana
+            return multiplier
     if WEEKEND_DOUBLE_COLLECT and now.weekday() >= 5:
         return _configured_collect_multiplier()
     return 1
@@ -9427,8 +9478,8 @@ async def manual_collect_event_active() -> bool:
 
 async def save_manual_collect_event(multiplier: int, until: datetime):
     multiplier = int(multiplier)
-    if not 1 <= multiplier <= 10:
-        raise ValueError("El multiplicador debe estar entre x1 y x10.")
+    if not 1 <= multiplier <= MANUAL_EVENT_MAX_MULTIPLIER:
+        raise ValueError(f"El multiplicador debe estar entre x1 y x{MANUAL_EVENT_MAX_MULTIPLIER}.")
     until = until.astimezone(timezone.utc).replace(tzinfo=None) if until.tzinfo else until
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("BEGIN IMMEDIATE")
@@ -9465,15 +9516,38 @@ def interaction_is_admin(interaction: discord.Interaction) -> bool:
     return bool(permissions and permissions.administrator)
 
 
+_EVENT_MULTIPLIERS = (2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 30, 35, 40, 45, 50)
+_EVENT_DURATIONS = (1, 2, 3, 5, 7, 14, 30, 60, 90, 180, 365)
+
+
+def _event_multiplier_emoji(multiplier: int) -> str:
+    if multiplier <= 3:
+        return "⚡"
+    if multiplier <= 6:
+        return "🔥"
+    if multiplier <= 9:
+        return "🌟"
+    if multiplier <= 15:
+        return "💎"
+    if multiplier <= 30:
+        return "🚀"
+    return "🏆" if multiplier >= 50 else "👑"
+
+
 class CollectEventMultiplierSelect(discord.ui.Select):
-    def __init__(self):
+    def __init__(self, selected: int = 2):
         super().__init__(
             placeholder="Elige el multiplicador",
             min_values=1,
             max_values=1,
             options=[
-                discord.SelectOption(label=f"Collect x{multiplier}", value=str(multiplier))
-                for multiplier in range(2, 11)
+                discord.SelectOption(
+                    label=f"Collect x{multiplier} — ganancias x{multiplier} 🪙",
+                    value=str(multiplier),
+                    emoji=_event_multiplier_emoji(multiplier),
+                    default=multiplier == selected,
+                )
+                for multiplier in _EVENT_MULTIPLIERS
             ],
             row=0,
         )
@@ -9481,22 +9555,24 @@ class CollectEventMultiplierSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         view: CollectEventPanelView = self.view
         view.multiplier = int(self.values[0])
+        view.sync_defaults()
         await interaction.response.edit_message(embed=view.make_embed(), view=view)
 
 
 class CollectEventDurationSelect(discord.ui.Select):
-    def __init__(self):
-        common_durations = (1, 2, 3, 5, 7, 14, 30, 60, 90, 180, 365)
+    def __init__(self, selected: int = 1):
         super().__init__(
             placeholder="Elige la duración",
             min_values=1,
             max_values=1,
             options=[
                 discord.SelectOption(
-                    label=f"{days} día" if days == 1 else f"{days} días",
+                    label=(f"{days} día" if days == 1 else f"{days} días") + f" — {days * 24:,} horas",
                     value=str(days),
+                    emoji="🕐" if days <= 3 else ("📅" if days <= 30 else "🗓️"),
+                    default=days == selected,
                 )
-                for days in common_durations
+                for days in _EVENT_DURATIONS
             ],
             row=1,
         )
@@ -9504,6 +9580,7 @@ class CollectEventDurationSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         view: CollectEventPanelView = self.view
         view.duration_days = int(self.values[0])
+        view.sync_defaults()
         await interaction.response.edit_message(embed=view.make_embed(), view=view)
 
 
@@ -9538,6 +9615,7 @@ class CollectEventDurationModal(GuildModal, title="Duración personalizada"):
             )
             return
         view.duration_days = days
+        view.sync_defaults()
         if view.message:
             try:
                 await view.message.edit(embed=view.make_embed(), view=view)
@@ -9610,16 +9688,27 @@ class CollectEventPanelView(GuildView):
         self.current_status = current_status
         self.done = False
         self.message: discord.InteractionMessage | None = None
-        self.add_item(CollectEventMultiplierSelect())
-        self.add_item(CollectEventDurationSelect())
+        self.add_item(CollectEventMultiplierSelect(self.multiplier))
+        self.add_item(CollectEventDurationSelect(self.duration_days))
         self.add_item(CollectEventCustomDurationButton())
         self.add_item(CollectEventActivateButton())
+
+    def sync_defaults(self):
+        """Marca en cada menú la opción elegida para que se vea al cerrarlo."""
+        for child in self.children:
+            if isinstance(child, CollectEventMultiplierSelect):
+                for option in child.options:
+                    option.default = option.value == str(self.multiplier)
+            elif isinstance(child, CollectEventDurationSelect):
+                for option in child.options:
+                    option.default = option.value == str(self.duration_days)
 
     def make_embed(self) -> discord.Embed:
         embed = discord.Embed(
             title="🎉 Configurar evento de collect",
             description=(
-                "Elige el multiplicador y la duración. El evento se aplica a las ganancias de `/collect`."
+                f"Elige el multiplicador (hasta **x{MANUAL_EVENT_MAX_MULTIPLIER}**) y la duración. "
+                "El evento se aplica a las ganancias de `/collect`."
             ),
             color=0x9B59B6,
         )
@@ -9627,7 +9716,7 @@ class CollectEventPanelView(GuildView):
         embed.add_field(name="Duración elegida", value=f"**{self.duration_days} día(s)**", inline=True)
         if self.current_status:
             embed.add_field(name="Estado actual", value=self.current_status[:1024], inline=False)
-        embed.set_footer(text="Duración: 1 a 365 días · Solo el administrador que abrió el panel puede usarlo")
+        embed.set_footer(text=f"Hasta x{MANUAL_EVENT_MAX_MULTIPLIER} · Duración: 1 a 365 días · Solo el administrador que abrió el panel puede usarlo")
         return embed
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -9695,10 +9784,17 @@ async def cancelar_evento_command(interaction: discord.Interaction):
     await interaction.response.send_message(message, ephemeral=True)
 
 
-@tree.command(name="doblecollect", description="[ADMIN] Activa collect doble por unas horas (0 = terminar el evento)")
-@app_commands.describe(horas="Horas que dura el evento (0 para terminarlo)")
+@tree.command(name="doblecollect", description="[ADMIN] Activa un evento de collect por unas horas (0 = terminar el evento)")
+@app_commands.describe(
+    horas="Horas que dura el evento (0 para terminarlo)",
+    multiplicador=f"Multiplicador del evento (2-{MANUAL_EVENT_MAX_MULTIPLIER}, por defecto 2)",
+)
 @app_commands.default_permissions(administrator=True)
-async def doblecollect_command(interaction: discord.Interaction, horas: app_commands.Range[int, 0, 168]):
+async def doblecollect_command(
+    interaction: discord.Interaction,
+    horas: app_commands.Range[int, 0, 168],
+    multiplicador: app_commands.Range[int, 2, MANUAL_EVENT_MAX_MULTIPLIER] = 2,
+):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ Solo los administradores pueden usar este comando.", ephemeral=True)
         return
@@ -9707,10 +9803,10 @@ async def doblecollect_command(interaction: discord.Interaction, horas: app_comm
         await interaction.response.send_message("✅ Evento manual de collect doble terminado.")
         return
     until = datetime.utcnow() + timedelta(hours=horas)
-    multiplier = _configured_collect_multiplier()
+    multiplier = multiplicador
     await save_manual_collect_event(multiplier, until)
     await interaction.response.send_message(
-        f"🎉 **¡Collect x{multiplier} activado!** Los roles pagan el multiplicador configurado hasta "
+        f"🎉 **¡Collect x{multiplier} activado!** Los roles pagan x{multiplier} hasta "
         f"<t:{_loan_ts(until.isoformat())}:f> (<t:{_loan_ts(until.isoformat())}:R>)."
     )
 
@@ -11496,6 +11592,8 @@ async def features_handle_prefix(message: discord.Message, cmd: str, args: list)
     _last_channel[uid] = message.channel
     if await jail_block_prefix(message, cmd):
         return True
+    if await shop_handle_prefix(message, cmd, args):
+        return True
 
     if cmd == "top":
         await message.channel.send(embed=await build_top_embed(uid))
@@ -11689,6 +11787,7 @@ async def _init_guild_tables():
     await loan_init_table()
     await init_role_loans_table()
     await init_extras_tables()
+    await load_custom_items()
 
 
 async def enter_guild(guild_id) -> None:
@@ -12155,6 +12254,257 @@ async def hilo_command(interaction: discord.Interaction, cantidad: str):
 
 
 # =====================================================================
+#  TIENDA: /añadir rol y /quitar rol  (roles propios de cada servidor)
+# =====================================================================
+SHOP_MAX_ITEMS = 25          # el menú desplegable de Discord admite 25 opciones
+SHOP_CUSTOM_MAX_NAME = 32
+SHOP_CUSTOM_MAX_DESC = 70
+SHOP_PRICE_MAX = 10 ** 13
+
+
+async def load_custom_items():
+    """Carga en memoria los roles que los administradores añadieron a la tienda de este servidor."""
+    gid = _current_guild.get()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, name, description, price, collect_bonus, collect_hours, role_id FROM custom_items ORDER BY rowid"
+        ) as cur:
+            rows = await cur.fetchall()
+    _custom_shop[gid] = {
+        item_id: {
+            "name": name, "description": description, "price": price, "category": "rol",
+            "collect_bonus": bonus, "collect_hours": hours, "custom": True, "discord_role_id": role_id,
+        }
+        for item_id, name, description, price, bonus, hours, role_id in rows
+    }
+
+
+def _shop_err(message: str) -> discord.Embed:
+    return discord.Embed(title="❌ No se pudo", description=message, color=0xFF4444)
+
+
+async def shop_add_role(
+    guild: discord.Guild,
+    member: discord.Member,
+    role: discord.Role,
+    price_text: str,
+    bonus_text: str,
+    hours: int,
+    name: str | None = None,
+    description: str | None = None,
+    emoji: str | None = None,
+) -> tuple[bool, discord.Embed]:
+    """Añade (o actualiza) un rol de Discord como objeto de la tienda de este servidor."""
+    if not member.guild_permissions.administrator:
+        return False, _shop_err("Solo los administradores del servidor pueden añadir roles a la tienda.")
+    if role.is_default() or role.managed:
+        return False, _shop_err("No puedo vender @everyone ni roles de bots o integraciones.")
+    me = guild.me
+    if me is None or not me.guild_permissions.manage_roles:
+        return False, _shop_err("Necesito el permiso **Gestionar roles** para entregar roles.")
+    if role >= me.top_role:
+        return False, _shop_err(
+            f"{role.mention} está por encima (o al mismo nivel) de mi rol más alto, así que no podría entregarlo. "
+            "Sube mi rol en *Ajustes del servidor → Roles*.")
+    price = loan_parse_amount(str(price_text))
+    bonus = loan_parse_amount(str(bonus_text))
+    if price is None or not 1 <= price <= SHOP_PRICE_MAX:
+        return False, _shop_err(f"El precio debe ser un número entre 1 y {SHOP_PRICE_MAX:,} (acepta `5m`, `500k`).")
+    if bonus is None or not 1 <= bonus <= SHOP_PRICE_MAX:
+        return False, _shop_err(f"La ganancia por collect debe ser un número entre 1 y {SHOP_PRICE_MAX:,}.")
+    if not 1 <= int(hours) <= 720:
+        return False, _shop_err("Las horas entre collects deben estar entre 1 y 720.")
+    name = " ".join((name or role.name).split())
+    if not 1 <= len(name) <= SHOP_CUSTOM_MAX_NAME:
+        return False, _shop_err(f"El nombre debe tener entre 1 y {SHOP_CUSTOM_MAX_NAME} caracteres.")
+    emoji = (emoji or "🎭").strip()
+    if not 1 <= len(emoji) <= 8:
+        return False, _shop_err("Usa un emoji normal (por ejemplo 🔥), no un emoji personalizado.")
+    description = " ".join((description or "").split())
+    if len(description) > SHOP_CUSTOM_MAX_DESC:
+        return False, _shop_err(f"La descripción puede tener como máximo {SHOP_CUSTOM_MAX_DESC} caracteres.")
+
+    await enter_guild(guild.id)
+    gid = str(guild.id)
+    custom = _custom_shop.setdefault(gid, {})
+    existing_id = next((i for i, it in custom.items() if it.get("discord_role_id") == str(role.id)), None)
+    full_name = f"{emoji} Rol: {name}"
+    wanted = _plain(name)
+    for item_id, item in SHOP_ITEMS.items():
+        if item_id == existing_id:
+            continue
+        if wanted in (_plain(item["name"].split("Rol:", 1)[-1]), _plain(item_id)) or _plain(full_name) == _plain(item["name"]):
+            return False, _shop_err(f"Ya existe un objeto llamado **{item['name']}**. Elige otro nombre.")
+    if existing_id is None and len(SHOP_ITEMS) >= SHOP_MAX_ITEMS:
+        return False, _shop_err(
+            f"La tienda ya tiene el máximo de **{SHOP_MAX_ITEMS}** objetos (es el límite del menú de Discord). "
+            "Quita alguno con `/quitar rol`.")
+
+    if not description:
+        description = f"Gana **+{bonus:,}** 🪙 cada {hours}h con `/collect`."
+    else:
+        description = f"{description} — **+{bonus:,}** 🪙 cada {hours}h"
+    if existing_id is None:
+        seq = int(await setting_get("custom_item_seq", "0") or 0) + 1
+        await setting_set("custom_item_seq", str(seq))
+        item_id = f"c{seq}"
+    else:
+        item_id = existing_id
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await db.execute(
+                "INSERT INTO custom_items (id, name, description, price, collect_bonus, collect_hours, role_id, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, "
+                "description=excluded.description, price=excluded.price, collect_bonus=excluded.collect_bonus, "
+                "collect_hours=excluded.collect_hours, role_id=excluded.role_id",
+                (item_id, full_name, description, price, bonus, int(hours), str(role.id), str(member.id),
+                 datetime.utcnow().isoformat()),
+            )
+            await db.execute(
+                "INSERT INTO shop_guild_roles (guild_id, item_id, role_id) VALUES (?, ?, ?) "
+                "ON CONFLICT(guild_id, item_id) DO UPDATE SET role_id=excluded.role_id",
+                (gid, item_id, str(role.id)),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    custom[item_id] = {
+        "name": full_name, "description": description, "price": price, "category": "rol",
+        "collect_bonus": bonus, "collect_hours": int(hours), "custom": True, "discord_role_id": str(role.id),
+    }
+    embed = discord.Embed(title="🛒 Rol actualizado en la tienda" if existing_id else "🛒 Rol añadido a la tienda",
+                          color=0x00FF88)
+    embed.description = (
+        f"**{full_name}** ↔ {role.mention}\n"
+        f"💵 Precio: **{price:,}** 🪙\n"
+        f"💰 Gana **{bonus:,}** 🪙 cada **{int(hours)}h** con `/collect`\n"
+        f"🆔 ID: `{item_id}`\n\n"
+        "Los jugadores lo compran con `/buy` y reclaman el rol de Discord con `/use`."
+    )
+    embed.set_footer(text=f"Objetos en la tienda: {len(SHOP_ITEMS)}/{SHOP_MAX_ITEMS}")
+    return True, embed
+
+
+async def shop_remove_role(guild: discord.Guild, member: discord.Member, text: str) -> tuple[bool, discord.Embed]:
+    if not member.guild_permissions.administrator:
+        return False, _shop_err("Solo los administradores del servidor pueden quitar roles de la tienda.")
+    await enter_guild(guild.id)
+    gid = str(guild.id)
+    custom = _custom_shop.get(gid, {})
+    item_id = resolve_shop_item(text)
+    if item_id not in custom:
+        return False, _shop_err("Solo se pueden quitar los roles que se añadieron con `/añadir rol`.")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute(
+                "SELECT COUNT(*) FROM inventory WHERE item_id=? AND quantity > 0", (item_id,)
+            ) as cur:
+                owners = (await cur.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM role_loans WHERE item_id=?", (item_id,)) as cur:
+                loans = (await cur.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM role_listings WHERE item_id=?", (item_id,)) as cur:
+                listings = (await cur.fetchone())[0]
+            if owners or loans or listings:
+                await db.rollback()
+                return False, _shop_err(
+                    f"No se puede quitar: **{owners}** jugador(es) lo tienen, **{loans}** préstamo(s) activo(s) y "
+                    f"**{listings}** anuncio(s) en el mercado. Solo se pueden quitar roles que nadie tenga.")
+            await db.execute("DELETE FROM custom_items WHERE id=?", (item_id,))
+            await db.execute("DELETE FROM shop_guild_roles WHERE guild_id=? AND item_id=?", (gid, item_id))
+            await db.execute("DELETE FROM role_collects WHERE item_id=?", (item_id,))
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    removed = custom.pop(item_id)
+    return True, discord.Embed(title="🗑️ Rol quitado de la tienda", color=0x00FF88,
+                               description=f"**{removed['name']}** ya no está en la tienda.")
+
+
+async def custom_item_autocomplete(interaction: discord.Interaction, current: str):
+    t = _plain(current)
+    gid = str(interaction.guild_id)
+    choices = []
+    for item_id, item in _custom_shop.get(gid, {}).items():
+        if t and t not in _plain(item["name"]):
+            continue
+        choices.append(app_commands.Choice(name=f"{item['name']} · {item['price']:,} 🪙"[:100], value=item_id))
+    return choices[:25]
+
+
+anadir_group = app_commands.Group(
+    name="añadir", description="Añade objetos a la tienda de este servidor", guild_only=True,
+    default_permissions=discord.Permissions(administrator=True),
+)
+quitar_group = app_commands.Group(
+    name="quitar", description="Quita objetos de la tienda de este servidor", guild_only=True,
+    default_permissions=discord.Permissions(administrator=True),
+)
+tree.add_command(anadir_group)
+tree.add_command(quitar_group)
+
+
+@anadir_group.command(name="rol", description="Añade un rol de Discord a la tienda (si ya estaba, lo actualiza)")
+@app_commands.describe(
+    rol="Rol de Discord que se entregará a quien lo compre",
+    precio="Precio en monedas (acepta 5m, 500k)",
+    ganancia="Monedas que paga cada /collect (acepta 5m, 500k)",
+    horas="Cada cuántas horas se puede cobrar (1-720)",
+    nombre="Nombre en la tienda (por defecto, el nombre del rol)",
+    descripcion="Descripción corta (opcional)",
+    emoji="Emoji del objeto (por defecto 🎭)",
+)
+async def anadir_rol_command(
+    interaction: discord.Interaction,
+    rol: discord.Role,
+    precio: str,
+    ganancia: str,
+    horas: app_commands.Range[int, 1, 720],
+    nombre: _Optional[str] = None,
+    descripcion: _Optional[str] = None,
+    emoji: _Optional[str] = None,
+):
+    ok, embed = await shop_add_role(interaction.guild, interaction.user, rol, precio, ganancia, horas,
+                                    nombre, descripcion, emoji)
+    await interaction.response.send_message(embed=embed, ephemeral=not ok)
+
+
+@quitar_group.command(name="rol", description="Quita de la tienda un rol que añadiste (solo si nadie lo tiene)")
+@app_commands.describe(rol="Rol de la tienda que quieres quitar")
+async def quitar_rol_command(interaction: discord.Interaction, rol: str):
+    ok, embed = await shop_remove_role(interaction.guild, interaction.user, rol)
+    await interaction.response.send_message(embed=embed, ephemeral=not ok)
+
+
+quitar_rol_command.autocomplete("rol")(custom_item_autocomplete)
+
+
+async def shop_handle_prefix(message: discord.Message, cmd: str, args: list) -> bool:
+    """,añadir rol @rol <precio> <ganancia> <horas> [nombre]   ·   ,quitar rol <nombre>"""
+    if cmd not in ("añadir", "anadir", "quitar") or not args or args[0].lower() not in ("rol", "role"):
+        return False
+    if cmd == "quitar":
+        if len(args) < 2:
+            await message.channel.send("❌ Uso: `,quitar rol <nombre o ID>`")
+            return True
+        ok, embed = await shop_remove_role(message.guild, message.author, " ".join(args[1:]))
+        await message.channel.send(embed=embed)
+        return True
+    usage = "❌ Uso: `,añadir rol @rol <precio> <ganancia> <horas> [nombre]` — ej: `,añadir rol @VIP 5m 100k 12 Súper VIP`"
+    rest = [a for a in args[1:] if not re.fullmatch(r"<@&\d+>", a)]
+    if not message.role_mentions or len(rest) < 3 or not rest[2].isdigit():
+        await message.channel.send(usage)
+        return True
+    ok, embed = await shop_add_role(message.guild, message.author, message.role_mentions[0], rest[0], rest[1],
+                                    int(rest[2]), " ".join(rest[3:]) or None)
+    await message.channel.send(embed=embed)
+    return True
+
+
+# =====================================================================
 #  PANEL WEB (dashboard) para configurar el bot, estilo UnbelievaBoat
 #  - Corre dentro del mismo proceso del bot (aiohttp).
 #  - Todo lo configurable vive en la base de datos (tabla bot_settings).
@@ -12254,7 +12604,7 @@ CONFIG_GROUPS_STATIC = [
     ]},
     {"id": "events", "icon": "🎉", "title": "Eventos", "desc": "Collect doble. Para activar uno ahora mismo usa el Resumen.", "fields": [
         _f("WEEKEND_DOUBLE_COLLECT", "Collect doble los fines de semana", typ="bool", help="Sábado y domingo (hora UTC)."),
-        _f("COLLECT_EVENT_MULTIPLIER", "Multiplicador del evento", lo=1, hi=10, unit="×"),
+        _f("COLLECT_EVENT_MULTIPLIER", "Multiplicador del fin de semana", lo=1, hi=10, unit="×", help="Solo el evento automático de sábado y domingo (por defecto ×2). Los eventos manuales de /evento llegan hasta ×50."),
     ]},
     {"id": "weekly", "icon": "🏆", "title": "Ranking semanal", "desc": "Premios automáticos de /top cada lunes 00:00 UTC.", "fields": [
         _f("WEEKLY_PRIZE_1", "Premio 1º lugar", unit="🪙"),
@@ -12278,7 +12628,7 @@ CONFIG_PAIRS = [
     ("LOAN_MIN", "LOAN_MAX"),
 ]
 ITEM_DEFAULTS: dict = {}
-for _iid, _item in SHOP_ITEMS.items():
+for _iid, _item in _BASE_SHOP_ITEMS.items():
     ITEM_DEFAULTS[f"ITEM:{_iid}:price"] = _item["price"]
     if _item["category"] == "rol":
         ITEM_DEFAULTS[f"ITEM:{_iid}:collect_bonus"] = _item["collect_bonus"]
@@ -12293,7 +12643,7 @@ CONFIG_DEFAULTS_STATIC = {
 def config_groups() -> list[dict]:
     """Esquema completo (grupos estaticos + tienda y luchadores generados desde los datos reales)."""
     shop_fields = []
-    for item_id, item in SHOP_ITEMS.items():
+    for item_id, item in _BASE_SHOP_ITEMS.items():
         shop_fields.append(_f(f"ITEM:{item_id}:price", "Precio", unit="🪙", sub=item["name"]))
         if item["category"] == "rol":
             shop_fields.append(_f(f"ITEM:{item_id}:collect_bonus", "Ganancia por /collect", unit="🪙", sub=item["name"]))
@@ -12341,7 +12691,7 @@ def _config_post_apply():
     """Recalcula lo que se deriva de varios valores (premios, periodo de prestamos, textos de roles)."""
     globals()["WEEKLY_PRIZES"] = (WEEKLY_PRIZE_1, WEEKLY_PRIZE_2, WEEKLY_PRIZE_3)
     globals()["LOAN_PERIOD"] = timedelta(days=LOAN_PERIOD_DAYS)
-    for item in SHOP_ITEMS.values():
+    for item in _BASE_SHOP_ITEMS.values():
         if item["category"] == "rol" and _ROLE_DESC_RE.fullmatch(item.get("description", "")):
             item["description"] = (
                 f"Gana **+{item['collect_bonus']:,}** 🪙 cada {item['collect_hours']}h con `/collect`."
@@ -12525,9 +12875,9 @@ async def dashboard_audit(limit: int = 40) -> list[dict]:
     return out
 
 
-async def dashboard_set_event(hours: int) -> str:
+async def dashboard_set_event(hours: int, multiplier: int | None = None) -> str:
     """Activa o termina el evento manual en TODOS los servidores."""
-    multiplier = _configured_collect_multiplier()
+    multiplier = int(multiplier) if multiplier else _configured_collect_multiplier()
     until = datetime.utcnow() + timedelta(hours=hours)
 
     async def _apply():
@@ -12907,11 +13257,14 @@ async def h_event(request):
     try:
         body = await request.json()
         hours = int(body.get("hours", 0))
+        multiplier = int(body.get("multiplier") or 2)
     except (ValueError, TypeError, AttributeError):
-        return _json_error("Horas inválidas.", 400)
+        return _json_error("Horas o multiplicador inválidos.", 400)
     if not 0 <= hours <= 168:
         return _json_error("Las horas deben estar entre 0 y 168.", 400)
-    return _web.json_response({"ok": True, "message": await dashboard_set_event(hours)})
+    if hours > 0 and not 2 <= multiplier <= MANUAL_EVENT_MAX_MULTIPLIER:
+        return _json_error(f"El multiplicador debe estar entre 2 y {MANUAL_EVENT_MAX_MULTIPLIER}.", 400)
+    return _web.json_response({"ok": True, "message": await dashboard_set_event(hours, multiplier)})
 
 
 def build_dashboard_app():
@@ -13211,15 +13564,16 @@ function overview() {
     st.per_guild.forEach(g => tb.append(h('tr', {}, h('td', {}, g.name), h('td', {}, fmt(g.users)), h('td', {}, fmt(g.money) + ' 🪙'), h('td', {}, 'x' + g.event_multiplier))));
     wrap.append(h('section', {class: 'card'}, h('h3', {}, '🌐 Economía por servidor'), h('div', {style: 'overflow-x:auto'}, tb)));
   }
+  const mult = h('input', {type: 'number', min: 2, max: 50, value: 2});
   const hours = h('input', {type: 'number', min: 1, max: 168, value: 24});
   const evt = async (hrs) => {
-    const {data} = await api('/api/event', 'POST', {hours: hrs});
+    const {data} = await api('/api/event', 'POST', {hours: hrs, multiplier: Number(mult.value) || 2});
     toast(data.ok ? data.message : (data.error || 'Error'), !data.ok);
     await loadStats(); renderApp();
   };
   wrap.append(h('section', {class: 'card'}, h('h3', {}, '🎉 Evento de collect (todos los servidores)'),
     h('p', {class: 'muted', style: 'white-space:pre-line'}, cleanEvent(st.event_text)),
-    h('div', {class: 'inline'}, hours, h('span', {class: 'muted'}, 'horas'),
+    h('div', {class: 'inline'}, h('span', {class: 'muted'}, 'Multiplicador ×'), mult, hours, h('span', {class: 'muted'}, 'horas'),
       h('button', {class: 'btn', onclick: () => evt(Number(hours.value) || 0)}, 'Activar ahora'),
       h('button', {class: 'ghost', onclick: () => evt(0)}, 'Terminar evento manual'))));
 
