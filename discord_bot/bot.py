@@ -970,11 +970,11 @@ async def add_to_inventory(user_id: str, item_id: str, quantity: int = 1):
         await db.commit()
 
 
-async def remove_from_inventory(user_id: str, item_id: str):
+async def remove_from_inventory(user_id: str, item_id: str, quantity: int = 1):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "UPDATE inventory SET quantity = quantity - 1 WHERE user_id = ? AND item_id = ?",
-            (user_id, item_id)
+            "UPDATE inventory SET quantity = quantity - ? WHERE user_id = ? AND item_id = ?",
+            (quantity, user_id, item_id)
         )
         await db.execute(
             "DELETE FROM inventory WHERE user_id = ? AND item_id = ? AND quantity <= 0",
@@ -1035,7 +1035,7 @@ async def collect_available_role_earnings(
             await db.commit()
             return [], [], [], {}, {}, 1
 
-        multiplier = await _collect_multiplier(db, now)
+        multiplier = 1   # el más alto de los roles que se cobran (para el aviso)
 
         async with db.execute(
             "SELECT item_id, last_collect FROM role_collects WHERE user_id=?",
@@ -1055,7 +1055,9 @@ async def collect_available_role_earnings(
         if ready_roles:
             total_bonus = 0
             for role_id in ready_roles:
-                base = SHOP_ITEMS[role_id]["collect_bonus"] * multiplier
+                role_multiplier = await _collect_multiplier(db, now, role_id)
+                multiplier = max(multiplier, role_multiplier)
+                base = SHOP_ITEMS[role_id]["collect_bonus"] * role_multiplier
                 if role_id in borrowed_info:
                     lender_id, pct = borrowed_info[role_id]
                     lender_share = base * pct // 100
@@ -1264,6 +1266,7 @@ async def on_ready():
     global _background_started
     await init_global_db()
     await load_blacklist()
+    await load_owner_mode()
     await load_guild_map()
     await run_economy_migration()
     for guild in list(client.guilds):
@@ -1819,8 +1822,10 @@ async def rob(interaction: discord.Interaction, usuario: discord.Member):
 
 @tree.command(name="addmoney", description="[ADMIN] Añade monedas a un usuario")
 @app_commands.describe(usuario="Usuario objetivo", cantidad="Cantidad a añadir")
-@app_commands.default_permissions(administrator=True)
 async def addmoney(interaction: discord.Interaction, usuario: discord.Member, cantidad: int):
+    if not is_admin_member(interaction.user):
+        await interaction.response.send_message("❌ Solo los administradores pueden usar este comando.", ephemeral=True)
+        return
     if cantidad <= 0:
         await interaction.response.send_message("❌ La cantidad debe ser mayor a 0.", ephemeral=True)
         return
@@ -1839,9 +1844,8 @@ async def addmoney(interaction: discord.Interaction, usuario: discord.Member, ca
     cantidad="Cantidad a quitar, o all para quitar todo el dinero de la cartera",
     banco="Quitar también todo lo que tiene en el banco",
 )
-@app_commands.default_permissions(administrator=True)
 async def removemoney(interaction: discord.Interaction, usuario: discord.Member, cantidad: str, banco: bool = False):
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_member(interaction.user):
         await interaction.response.send_message("❌ Solo los administradores pueden usar este comando.", ephemeral=True)
         return
     result = await perform_removemoney(usuario, cantidad, banco)
@@ -1854,7 +1858,7 @@ async def removemoney(interaction: discord.Interaction, usuario: discord.Member,
 @tree.command(name="resetmoney", description="Reinicia el saldo de cartera a 0 (admins pueden resetear a otros)")
 @app_commands.describe(usuario="[Solo admins] Usuario a resetear (opcional, por defecto tú mismo)")
 async def resetmoney_slash(interaction: discord.Interaction, usuario: discord.Member = None):
-    is_admin = interaction.user.guild_permissions.administrator
+    is_admin = is_admin_member(interaction.user)
     if usuario and not is_admin:
         await interaction.response.send_message("❌ Solo los administradores pueden resetear el saldo de otros usuarios.", ephemeral=True)
         return
@@ -2469,8 +2473,8 @@ async def complete_shop_purchase(
         )
     if item_data["category"] == "proteccion":
         description += (
-            f"\n\n💡 Usa `/use {item_id}` para activarlo: te protege **{SHIELD_MINUTES} min** "
-            "y recibes un rol temporal que se quita solo."
+            f"\n\n💡 Usa `/use {item_id}` para activarlo: te protege **{fmt_minutes_es(SHIELD_MINUTES)}** "
+            "(si usas varios a la vez, el tiempo se suma) y recibes un rol temporal que se quita solo."
         )
     embed.description = description
     return embed
@@ -2493,18 +2497,58 @@ async def init_shield_table():
         await db.commit()
 
 
+def fmt_minutes_es(minutes: int) -> str:
+    """90 -> '1 hora y 30 minutos', 180 -> '3 horas'."""
+    days, rest = divmod(int(minutes), 1440)
+    hours, mins = divmod(rest, 60)
+    parts = []
+    if days:
+        parts.append(f"{days} {'día' if days == 1 else 'días'}")
+    if hours:
+        parts.append(f"{hours} {'hora' if hours == 1 else 'horas'}")
+    if mins:
+        parts.append(f"{mins} {'minuto' if mins == 1 else 'minutos'}")
+    if not parts:
+        return "0 minutos"
+    return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " y " + parts[-1]
+
+
 async def activate_anti_rob(
-    user: discord.User | discord.Member, guild: discord.Guild | None, remaining_before: int
+    user: discord.User | discord.Member, guild: discord.Guild | None, remaining_before: int, count: int = 1
 ) -> discord.Embed:
-    """Gasta un escudo, activa la proteccion y (si se puede) asigna el rol temporal."""
+    """Gasta `count` escudos y suma SHIELD_MINUTES por cada uno (también sobre un escudo ya activo)."""
     user_id = str(user.id)
-    expires = datetime.utcnow() + timedelta(minutes=SHIELD_MINUTES)
-    await remove_from_inventory(user_id, "anti_rob")
+    count = max(1, int(count))
+    now = datetime.utcnow()
+    previous_left = timedelta(0)
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET shield_until = ? WHERE user_id = ?", (expires.isoformat(), user_id)
-        )
-        await db.commit()
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            cur = await db.execute(
+                "UPDATE inventory SET quantity = quantity - ? WHERE user_id = ? AND item_id = 'anti_rob' AND quantity >= ?",
+                (count, user_id, count),
+            )
+            if cur.rowcount == 0:
+                await db.rollback()
+                return discord.Embed(title="❌ Escudos insuficientes", color=0xFF4444,
+                                     description=f"No tienes **{count}** escudos para usar.")
+            await db.execute("DELETE FROM inventory WHERE user_id = ? AND item_id = 'anti_rob' AND quantity <= 0", (user_id,))
+            async with db.execute("SELECT shield_until FROM users WHERE user_id = ?", (user_id,)) as cur:
+                row = await cur.fetchone()
+            base = now
+            if row and row[0]:
+                try:
+                    active_until = datetime.fromisoformat(row[0])
+                    if active_until > now:
+                        base, previous_left = active_until, active_until - now
+                except ValueError:
+                    pass
+            expires = base + timedelta(minutes=SHIELD_MINUTES * count)
+            await db.execute("UPDATE users SET shield_until = ? WHERE user_id = ?", (expires.isoformat(), user_id))
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
 
     role_note = ""
     if guild is not None and isinstance(user, discord.Member):
@@ -2535,14 +2579,19 @@ async def activate_anti_rob(
         else:
             role_note = f"\n⚠️ {error} El escudo funciona igual."
 
-    embed = discord.Embed(title="🛡️ ¡Escudo Anti-Robos Activado!", color=0x3498DB)
-    embed.description = (
-        f"🔒 Estás protegido de robos durante **1 hora y 30 minutos**.\n\n"
-        f"⏰ Expira a las **{expires.strftime('%H:%M UTC')}**"
-        f"{role_note}\n"
-        f"📦 Escudos restantes: **{remaining_before - 1}**"
-    )
-    return embed
+    added = SHIELD_MINUTES * count
+    total_left = _loan_math.ceil((expires - now).total_seconds() / 60)
+    ts = _loan_ts(expires.isoformat())
+    lines = [f"🛡️ Usaste **{count}** {'escudo' if count == 1 else 'escudos'} · **{fmt_minutes_es(SHIELD_MINUTES)}** cada uno"]
+    if previous_left.total_seconds() > 0:
+        lines.append(f"➕ Se sumaron **{fmt_minutes_es(added)}** a tu escudo activo.")
+        lines.append(f"🔒 Ahora estás protegido de robos durante **{fmt_minutes_es(total_left)}**.")
+    else:
+        lines.append(f"🔒 Estás protegido de robos durante **{fmt_minutes_es(added)}**.")
+    lines.append(f"⏰ Expira <t:{ts}:t> (<t:{ts}:R>){role_note}")
+    lines.append(f"📦 Escudos restantes: **{max(0, remaining_before - count)}**")
+    title = "🛡️ ¡Escudo Anti-Robos Activado!" if count == 1 else f"🛡️ ¡{count} Escudos Activados!"
+    return discord.Embed(title=title, color=0x3498DB, description="\n".join(lines))
 
 
 async def expire_shield_roles():
@@ -3559,8 +3608,11 @@ async def missions(interaction: discord.Interaction):
 
 
 @tree.command(name="use", description="Usa un objeto o reclama un rol de tu inventario")
-@app_commands.describe(item="ID del objeto a usar o rol a reclamar")
-async def use(interaction: discord.Interaction, item: str):
+@app_commands.describe(
+    item="ID del objeto a usar o rol a reclamar",
+    cantidad="Cuántos usar (escudos: el tiempo de cada uno se suma). Por defecto 1",
+)
+async def use(interaction: discord.Interaction, item: str, cantidad: app_commands.Range[int, 1, 1000] = 1):
     item = resolve_shop_item(item) or normalize_shop_item_id(item)
     if item not in SHOP_ITEMS:
         ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
@@ -3580,6 +3632,15 @@ async def use(interaction: discord.Interaction, item: str):
         return
 
     item_data = SHOP_ITEMS[item]
+
+    if cantidad > 1 and item != "anti_rob":
+        await interaction.response.send_message(
+            "❌ La cantidad solo se puede usar con el **Escudo Anti-Robos** (cada escudo suma su tiempo).", ephemeral=True)
+        return
+    if item == "anti_rob" and cantidad > qty:
+        await interaction.response.send_message(
+            f"❌ Quieres usar **{cantidad}** escudos pero solo tienes **{qty}**.", ephemeral=True)
+        return
 
     if item_data["category"] == "rol":
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
@@ -3631,7 +3692,7 @@ async def use(interaction: discord.Interaction, item: str):
 
     elif item == "anti_rob":
         await interaction.response.defer()
-        embed = await activate_anti_rob(interaction.user, interaction.guild, qty)
+        embed = await activate_anti_rob(interaction.user, interaction.guild, qty, cantidad)
         await interaction.followup.send(embed=embed)
 
 
@@ -4071,6 +4132,7 @@ async def help_cmd(interaction: discord.Interaction):
             "`/mines cantidad minas` — Buscaminas con retiro a tiempo\n"
             "`/hilo cantidad` o `,hilo cantidad` — Hi-Lo: mayor, menor o igual\n"
             "`/añadir rol` · `/quitar rol` — (admins) Roles propios en la tienda\n"
+            "`/botinfo` — En cuántos servidores está el bot\n"
             "`/clan ...` o `,clan ...` — Clanes con banco y misiones\n"
             "`/prestar` `/devolver` `/misprestamos` — Presta roles y mira tus cobros\n"
             "`/rolmercado publicar|ver|comprar|retirar` — Vende o alquila roles\n"
@@ -5377,9 +5439,8 @@ async def ftorneo_slash(interaction: discord.Interaction, apuesta: str = "0"):
 
 @tree.command(name="addlevel", description="[ADMIN] Sube niveles al luchador de un usuario")
 @app_commands.describe(usuario="El usuario objetivo", fighter_id="ID del luchador (ej: novato)", niveles="Cantidad de niveles a subir")
-@app_commands.default_permissions(administrator=True)
 async def addlevel_slash(interaction: discord.Interaction, usuario: discord.Member, fighter_id: str, niveles: int):
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_member(interaction.user):
         await interaction.response.send_message("❌ Solo los administradores pueden usar este comando.", ephemeral=True)
         return
     fid = fighter_id.lower().strip()
@@ -6484,6 +6545,9 @@ async def on_message(message: discord.Message):
     if cmd == "blacklist":
         await blacklist_handle_prefix(message, args)
         return
+    if cmd in ("dueño", "dueno"):
+        await owner_handle_prefix(message, args)
+        return
     if not await enter_message(message, cmd):
         return
 
@@ -7079,7 +7143,7 @@ async def on_message(message: discord.Message):
 
     # ,addmoney <@usuario> <cantidad> — solo administradores
     elif cmd == "addmoney":
-        if not message.author.guild_permissions.administrator:
+        if not is_admin_member(message.author):
             await message.channel.send("❌ Solo los administradores pueden usar este comando.")
             return
         if len(args) < 2:
@@ -7110,7 +7174,7 @@ async def on_message(message: discord.Message):
 
     # ,removemoney <@usuario> <cantidad> — solo administradores
     elif cmd == "removemoney":
-        if not message.author.guild_permissions.administrator:
+        if not is_admin_member(message.author):
             await message.channel.send("❌ Solo los administradores pueden usar este comando.")
             return
         target = message.mentions[0] if message.mentions else None
@@ -7261,7 +7325,7 @@ async def on_message(message: discord.Message):
 
     # ,addlevel @usuario <fighter_id> <niveles> — solo admins
     elif cmd == "addlevel":
-        if not message.author.guild_permissions.administrator:
+        if not is_admin_member(message.author):
             await message.channel.send("❌ Solo los administradores pueden usar este comando.")
             return
         target = message.mentions[0] if message.mentions else message.author
@@ -7378,7 +7442,7 @@ async def on_message(message: discord.Message):
 
     # ,reset-money [@usuario] — todos en sí mismos, admins en cualquiera
     elif cmd in ("reset-money", "resetmoney", "resetbal"):
-        is_admin = message.author.guild_permissions.administrator
+        is_admin = is_admin_member(message.author)
         target = message.mentions[0] if message.mentions else None
         if target and not is_admin:
             await message.channel.send("❌ Solo los administradores pueden resetear el saldo de otros usuarios.")
@@ -7782,9 +7846,15 @@ async def on_message(message: discord.Message):
         await get_or_create_user(user_id, message.author.name)
         if not args:
             ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
-            await message.channel.send(f"❌ Uso: `,use <item_id>`\nIDs: {ids}")
+            await message.channel.send(f"❌ Uso: `,use <item_id> [cantidad]`\nIDs: {ids}")
             return
-        item = resolve_shop_item(" ".join(args)) or normalize_shop_item_id(args[0])
+        use_count, item_args = 1, args
+        if len(args) > 1 and args[-1].isdigit():
+            use_count, item_args = int(args[-1]), args[:-1]
+            if not 1 <= use_count <= 1000:
+                await message.channel.send("❌ La cantidad debe estar entre 1 y 1000.")
+                return
+        item = resolve_shop_item(" ".join(item_args)) or normalize_shop_item_id(item_args[0])
         if item not in SHOP_ITEMS:
             ids = ", ".join(f"`{k}`" for k in SHOP_ITEMS.keys())
             await message.channel.send(f"❌ Objeto no encontrado. IDs válidos:\n{ids}")
@@ -7796,6 +7866,12 @@ async def on_message(message: discord.Message):
             await message.channel.send(embed=embed)
             return
         item_data = SHOP_ITEMS[item]
+        if use_count > 1 and item != "anti_rob":
+            await message.channel.send("❌ La cantidad solo se puede usar con el **Escudo Anti-Robos** (cada escudo suma su tiempo).")
+            return
+        if item == "anti_rob" and use_count > qty:
+            await message.channel.send(f"❌ Quieres usar **{use_count}** escudos pero solo tienes **{qty}**.")
+            return
         if item_data["category"] == "rol":
             if message.guild is None or not isinstance(message.author, discord.Member):
                 await message.channel.send(
@@ -7838,7 +7914,7 @@ async def on_message(message: discord.Message):
             embed.set_footer(text=f"Tienes {qty} en tu inventario")
             await message.channel.send(embed=embed)
         elif item == "anti_rob":
-            embed = await activate_anti_rob(message.author, message.guild, qty)
+            embed = await activate_anti_rob(message.author, message.guild, qty, use_count)
             await message.channel.send(embed=embed)
         else:
             embed = discord.Embed(title="❌ No se puede usar", color=0xFF4444)
@@ -8915,6 +8991,7 @@ CLAN_MISSIONS = {                 # misiones semanales del clan; el premio va al
 WEEKEND_DOUBLE_COLLECT = True     # sabados y domingos (UTC) los roles pagan doble
 COLLECT_EVENT_MULTIPLIER = 2
 COLLECT_EVENT_MULTIPLIER_KEY = "collect_event_multiplier"
+COLLECT_EVENT_ITEMS_KEY = "collect_event_items"      # roles incluidos en el evento manual (sin esta clave = todos)
 MANUAL_EVENT_MAX_MULTIPLIER = 50   # tope de los eventos manuales (/evento); el de fin de semana usa COLLECT_EVENT_MULTIPLIER (x2)
 
 # ----- mines
@@ -9322,10 +9399,10 @@ async def _jail_interaction_check(interaction: discord.Interaction) -> bool:
         _last_channel[uid] = interaction.channel
         is_command = interaction.type is discord.InteractionType.application_command
         name = (interaction.data or {}).get("name")
-        if name == "blacklist":
+        if name in ("blacklist", "dueño"):
             return True   # es global; el propio comando comprueba que seas el dueño
         if interaction.guild_id is None:
-            if is_command and name in ("help", "guía"):
+            if is_command and name in ("help", "guía", "botinfo"):
                 return True   # no usan la economía
             if is_command:
                 await interaction.response.send_message(
@@ -9403,7 +9480,23 @@ def _configured_collect_multiplier() -> int:
         return 2
 
 
-async def _collect_multiplier(db, now: datetime) -> int:
+async def _manual_event_items(db) -> list | None:
+    """Roles incluidos en el evento manual (None = todos los roles)."""
+    async with db.execute("SELECT value FROM bot_settings WHERE key=?", (COLLECT_EVENT_ITEMS_KEY,)) as cur:
+        row = await cur.fetchone()
+    if not row:
+        return None
+    try:
+        items = _json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    return [str(i) for i in items] if isinstance(items, list) else None
+
+
+async def _collect_multiplier(db, now: datetime, item_id: str | None = None) -> int:
+    """Multiplicador del collect. Con item_id, el de ese rol; sin él, el más alto que hay ahora mismo."""
+    weekend = _configured_collect_multiplier() if WEEKEND_DOUBLE_COLLECT and now.weekday() >= 5 else 1
+    manual = 1
     async with db.execute("SELECT value FROM bot_settings WHERE key='double_collect_until'") as cur:
         row = await cur.fetchone()
     if row:
@@ -9418,12 +9511,10 @@ async def _collect_multiplier(db, now: datetime) -> int:
             except (TypeError, ValueError):
                 multiplier = _configured_collect_multiplier()
             multiplier = max(1, min(MANUAL_EVENT_MAX_MULTIPLIER, multiplier))
-            if WEEKEND_DOUBLE_COLLECT and now.weekday() >= 5:
-                multiplier = max(multiplier, _configured_collect_multiplier())   # nunca por debajo del de fin de semana
-            return multiplier
-    if WEEKEND_DOUBLE_COLLECT and now.weekday() >= 5:
-        return _configured_collect_multiplier()
-    return 1
+            items = await _manual_event_items(db)
+            if item_id is None or items is None or item_id in items:
+                manual = multiplier
+    return max(manual, weekend)
 
 
 async def collect_event_info(now: datetime | None = None) -> tuple[int, str]:
@@ -9439,8 +9530,16 @@ async def collect_event_info(now: datetime | None = None) -> tuple[int, str]:
             "SELECT value FROM bot_settings WHERE key=?", (COLLECT_EVENT_MULTIPLIER_KEY,)
         ) as cur:
             multiplier_row = await cur.fetchone()
+        manual_items = await _manual_event_items(db)
+    scope_text = ""
+    if manual_items is not None and row:
+        until_scope = _event_datetime(row[0])
+        if until_scope and until_scope > now:
+            scope_text = ", ".join(SHOP_ITEMS[i]["name"] for i in manual_items if i in SHOP_ITEMS) or "ningún rol"
     lines = []
-    if mult > 1:
+    if mult > 1 and scope_text:
+        lines.append(f"🎉 **¡Evento activo!** Hay roles que pagan hasta **x{mult}** en `/collect`.")
+    elif mult > 1:
         lines.append(f"🎉 **¡Evento activo!** Los roles pagan **x{mult}** en `/collect`.")
     else:
         lines.append("😴 No hay ningún evento activo ahora mismo.")
@@ -9455,6 +9554,8 @@ async def collect_event_info(now: datetime | None = None) -> tuple[int, str]:
                 f"⏳ Evento manual x{manual_multiplier} termina "
                 f"<t:{_loan_ts(until.isoformat())}:R>."
             )
+            if scope_text:
+                lines.append(f"🎯 Solo para: {scope_text}")
     if WEEKEND_DOUBLE_COLLECT:
         if now.weekday() >= 5:
             end = datetime.fromisoformat(week_key(now)) + timedelta(days=7)
@@ -9476,7 +9577,8 @@ async def manual_collect_event_active() -> bool:
     return until is not None and until > datetime.utcnow()
 
 
-async def save_manual_collect_event(multiplier: int, until: datetime):
+async def save_manual_collect_event(multiplier: int, until: datetime, items: list | None = None):
+    """items = roles incluidos (None = todos los roles)."""
     multiplier = int(multiplier)
     if not 1 <= multiplier <= MANUAL_EVENT_MAX_MULTIPLIER:
         raise ValueError(f"El multiplicador debe estar entre x1 y x{MANUAL_EVENT_MAX_MULTIPLIER}.")
@@ -9492,6 +9594,18 @@ async def save_manual_collect_event(multiplier: int, until: datetime):
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, value),
             )
+        if items is None:
+            await db.execute("DELETE FROM bot_settings WHERE key=?", (COLLECT_EVENT_ITEMS_KEY,))
+        else:
+            valid = [i for i in items if i in ROLE_ITEMS]
+            if not valid:
+                await db.rollback()
+                raise ValueError("Elige al menos un rol para el evento.")
+            await db.execute(
+                "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (COLLECT_EVENT_ITEMS_KEY, _json.dumps(valid)),
+            )
         await db.commit()
 
 
@@ -9503,8 +9617,8 @@ async def cancel_manual_collect_event() -> bool:
         ) as cur:
             row = await cur.fetchone()
         await db.execute(
-            "DELETE FROM bot_settings WHERE key IN ('double_collect_until', ?)",
-            (COLLECT_EVENT_MULTIPLIER_KEY,),
+            "DELETE FROM bot_settings WHERE key IN ('double_collect_until', ?, ?)",
+            (COLLECT_EVENT_MULTIPLIER_KEY, COLLECT_EVENT_ITEMS_KEY),
         )
         await db.commit()
     until = _event_datetime(row[0]) if row else None
@@ -9512,8 +9626,7 @@ async def cancel_manual_collect_event() -> bool:
 
 
 def interaction_is_admin(interaction: discord.Interaction) -> bool:
-    permissions = getattr(interaction.user, "guild_permissions", None)
-    return bool(permissions and permissions.administrator)
+    return is_admin_member(interaction.user)
 
 
 _EVENT_MULTIPLIERS = (2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 30, 35, 40, 45, 50)
@@ -9534,6 +9647,51 @@ def _event_multiplier_emoji(multiplier: int) -> str:
     return "🏆" if multiplier >= 50 else "👑"
 
 
+def _split_item_emoji(name: str) -> tuple[str | None, str]:
+    """'🎩 Rol: VIP' -> ('🎩', 'Rol: VIP') para mostrarlo como en el menú de la tienda."""
+    first, _, rest = name.partition(" ")
+    if rest and not any(ch.isalnum() for ch in first):
+        return first, rest
+    return None, name
+
+
+class CollectEventItemsSelect(discord.ui.Select):
+    """El menú de la tienda (emoji + nombre — precio) para elegir qué roles reciben el evento."""
+
+    def __init__(self, selected: list | None = None):
+        options = [
+            discord.SelectOption(
+                label="Todos los roles — todos cobran el evento", value="all", emoji="🌐", default=selected is None
+            )
+        ]
+        for item_id in ROLE_ITEMS:
+            item = SHOP_ITEMS[item_id]
+            emoji, label = _split_item_emoji(item["name"])
+            options.append(
+                discord.SelectOption(
+                    label=f"{label} — {item['price']:,} 🪙"[:100],
+                    value=item_id,
+                    emoji=emoji,
+                    default=selected is not None and item_id in selected,
+                )
+            )
+        options = options[:25]
+        super().__init__(
+            placeholder="Elige qué roles reciben el evento",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view: CollectEventPanelView = self.view
+        chosen = list(self.values)
+        view.items = None if "all" in chosen else chosen
+        view.sync_defaults()
+        await interaction.response.edit_message(embed=view.make_embed(), view=view)
+
+
 class CollectEventMultiplierSelect(discord.ui.Select):
     def __init__(self, selected: int = 2):
         super().__init__(
@@ -9549,7 +9707,7 @@ class CollectEventMultiplierSelect(discord.ui.Select):
                 )
                 for multiplier in _EVENT_MULTIPLIERS
             ],
-            row=0,
+            row=1,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -9574,7 +9732,7 @@ class CollectEventDurationSelect(discord.ui.Select):
                 )
                 for days in _EVENT_DURATIONS
             ],
-            row=1,
+            row=2,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -9637,7 +9795,7 @@ class CollectEventCustomDurationButton(discord.ui.Button):
             label="Días personalizados",
             emoji="✏️",
             style=discord.ButtonStyle.secondary,
-            row=2,
+            row=3,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -9650,7 +9808,7 @@ class CollectEventActivateButton(discord.ui.Button):
             label="Activar evento",
             emoji="🎉",
             style=discord.ButtonStyle.success,
-            row=2,
+            row=3,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -9665,12 +9823,17 @@ class CollectEventActivateButton(discord.ui.Button):
             )
             return
         until = datetime.utcnow() + timedelta(days=view.duration_days)
-        await save_manual_collect_event(view.multiplier, until)
+        try:
+            await save_manual_collect_event(view.multiplier, until, view.items)
+        except ValueError as exc:
+            await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+            return
         view.done = True
         embed = discord.Embed(
             title="🎉 Evento de collect activado",
             description=(
                 f"Los roles pagan **x{view.multiplier}** durante **{view.duration_days} día(s)**.\n"
+                f"🎯 Roles: {view.items_text()}\n"
                 f"Termina <t:{_loan_ts(until.isoformat())}:F> "
                 f"(<t:{_loan_ts(until.isoformat())}:R>)."
             ),
@@ -9685,9 +9848,11 @@ class CollectEventPanelView(GuildView):
         self.owner_id = owner_id
         self.multiplier = 2
         self.duration_days = 1
+        self.items: list | None = None   # None = todos los roles
         self.current_status = current_status
         self.done = False
         self.message: discord.InteractionMessage | None = None
+        self.add_item(CollectEventItemsSelect(self.items))
         self.add_item(CollectEventMultiplierSelect(self.multiplier))
         self.add_item(CollectEventDurationSelect(self.duration_days))
         self.add_item(CollectEventCustomDurationButton())
@@ -9696,24 +9861,35 @@ class CollectEventPanelView(GuildView):
     def sync_defaults(self):
         """Marca en cada menú la opción elegida para que se vea al cerrarlo."""
         for child in self.children:
-            if isinstance(child, CollectEventMultiplierSelect):
+            if isinstance(child, CollectEventItemsSelect):
+                for option in child.options:
+                    option.default = (
+                        option.value == "all" if self.items is None else option.value in self.items
+                    )
+            elif isinstance(child, CollectEventMultiplierSelect):
                 for option in child.options:
                     option.default = option.value == str(self.multiplier)
             elif isinstance(child, CollectEventDurationSelect):
                 for option in child.options:
                     option.default = option.value == str(self.duration_days)
 
+    def items_text(self) -> str:
+        if self.items is None:
+            return "Todos los roles"
+        return ", ".join(SHOP_ITEMS[i]["name"] for i in self.items if i in SHOP_ITEMS) or "ninguno"
+
     def make_embed(self) -> discord.Embed:
         embed = discord.Embed(
             title="🎉 Configurar evento de collect",
             description=(
-                f"Elige el multiplicador (hasta **x{MANUAL_EVENT_MAX_MULTIPLIER}**) y la duración. "
+                f"Elige los roles, el multiplicador (hasta **x{MANUAL_EVENT_MAX_MULTIPLIER}**) y la duración. "
                 "El evento se aplica a las ganancias de `/collect`."
             ),
             color=0x9B59B6,
         )
         embed.add_field(name="Multiplicador elegido", value=f"**x{self.multiplier}**", inline=True)
         embed.add_field(name="Duración elegida", value=f"**{self.duration_days} día(s)**", inline=True)
+        embed.add_field(name="Roles del evento", value=self.items_text()[:1024], inline=False)
         if self.current_status:
             embed.add_field(name="Estado actual", value=self.current_status[:1024], inline=False)
         embed.set_footer(text=f"Hasta x{MANUAL_EVENT_MAX_MULTIPLIER} · Duración: 1 a 365 días · Solo el administrador que abrió el panel puede usarlo")
@@ -9762,7 +9938,6 @@ tree.add_command(cancelar_group)
 
 
 @cancelar_group.command(name="evento", description="[ADMIN] Termina el evento manual de collect")
-@app_commands.default_permissions(administrator=True)
 async def cancelar_evento_command(interaction: discord.Interaction):
     if not interaction_is_admin(interaction):
         await interaction.response.send_message(
@@ -9789,13 +9964,12 @@ async def cancelar_evento_command(interaction: discord.Interaction):
     horas="Horas que dura el evento (0 para terminarlo)",
     multiplicador=f"Multiplicador del evento (2-{MANUAL_EVENT_MAX_MULTIPLIER}, por defecto 2)",
 )
-@app_commands.default_permissions(administrator=True)
 async def doblecollect_command(
     interaction: discord.Interaction,
     horas: app_commands.Range[int, 0, 168],
     multiplicador: app_commands.Range[int, 2, MANUAL_EVENT_MAX_MULTIPLIER] = 2,
 ):
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_member(interaction.user):
         await interaction.response.send_message("❌ Solo los administradores pueden usar este comando.", ephemeral=True)
         return
     if horas == 0:
@@ -10245,6 +10419,7 @@ async def build_misprestamos_embed(user_id: str) -> discord.Embed:
     now = datetime.utcnow()
     async with aiosqlite.connect(DB_PATH) as db:
         mult = await _collect_multiplier(db, now)
+        mult_by_item = {rid: await _collect_multiplier(db, now, rid) for rid in ROLE_ITEMS}
         async with db.execute(
             """
             SELECT rl.item_id, rl.expires_at, rl.lender_percent, rl.price, rl.earned,
@@ -10287,7 +10462,7 @@ async def build_misprestamos_embed(user_id: str) -> discord.Embed:
             if price > 0 and pct == 0:
                 lines.append(f"{name} → **{borrower_name}** · alquilado por **{price:,}** 🪙 (ya cobrado) · termina <t:{ts}:R>")
                 continue
-            next_collect, remaining, share = _loan_projection(item_id, expires_at, last_collect, pct, now, mult)
+            next_collect, remaining, share = _loan_projection(item_id, expires_at, last_collect, pct, now, mult_by_item.get(item_id, mult))
             pending = remaining * share
             total_pending += pending
             total_earned += earned
@@ -10306,7 +10481,7 @@ async def build_misprestamos_embed(user_id: str) -> discord.Embed:
             name = SHOP_ITEMS.get(item_id, {}).get("name", item_id)
             ts = _loan_ts(expires_at)
             item = SHOP_ITEMS.get(item_id)
-            mine = item["collect_bonus"] * mult * (100 - pct) // 100 if item else 0
+            mine = item["collect_bonus"] * mult_by_item.get(item_id, mult) * (100 - pct) // 100 if item else 0
             kind = "alquilado" if price > 0 and pct == 0 else f"prestado ({pct}% para su dueño)"
             lines.append(f"{name} ← **{lender_name}** · {kind}\n   💰 Ganas **{mine:,}** 🪙 por collect · termina <t:{ts}:R>")
         embed.add_field(name="📥 Roles que tienes prestados", value="\n".join(lines)[:1024], inline=False)
@@ -10818,9 +10993,8 @@ async def top_command(interaction: discord.Interaction):
 
 @tree.command(name="topcanal", description="[ADMIN] Elige el canal donde se anuncian los ganadores del top semanal")
 @app_commands.describe(canal="Canal de anuncios (por defecto, este canal)")
-@app_commands.default_permissions(administrator=True)
 async def topcanal_command(interaction: discord.Interaction, canal: _LoanOptional[discord.TextChannel] = None):
-    if not interaction.user.guild_permissions.administrator:
+    if not is_admin_member(interaction.user):
         await interaction.response.send_message("❌ Solo los administradores pueden usar este comando.", ephemeral=True)
         return
     target = canal or interaction.channel
@@ -11266,6 +11440,44 @@ async def clan_disolver(interaction: discord.Interaction, confirmar: bool):
     await _clan_reply(interaction, await clan_disband(str(interaction.user.id)))
 
 
+async def clan_remove_money(clan_name: str, amount_text: str) -> tuple[bool, str]:
+    """Quita dinero del banco de un clan (solo para el dueño del bot). Si pide más de lo que hay, quita todo."""
+    clan = await clan_by_name(clan_name)
+    if not clan:
+        return False, "No encontré ese clan en este servidor."
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute("SELECT bank FROM clans WHERE id=?", (clan["id"],)) as cur:
+                bank = (await cur.fetchone())[0]
+            amount = parse_amount_or_all(amount_text, bank)
+            if amount is None or amount <= 0:
+                await db.rollback()
+                return False, "Escribe una cantidad válida (`all`, `5m`, `500k`...)."
+            removed = min(amount, bank)
+            await db.execute("UPDATE clans SET bank = bank - ? WHERE id=?", (removed, clan["id"]))
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+    note = f" (pediste {amount:,}, pero el banco solo tenía {bank:,})" if amount > bank else ""
+    return True, (f"🏦 Se quitaron **{removed:,}** 🪙 del banco del clan **{clan['name']}**{note}.\n"
+                  f"Antes: **{bank:,}** 🪙 → Ahora: **{bank - removed:,}** 🪙")
+
+
+@clan_group.command(name="removemoney", description="[Dueño del bot] Quita dinero del banco de un clan")
+@app_commands.describe(clan="Clan al que le quitas dinero", cantidad="Cantidad (acepta all, 5m, 500k)")
+async def clan_removemoney(interaction: discord.Interaction, clan: str, cantidad: str):
+    if not await blacklist_authorized(interaction.user):
+        await interaction.response.send_message(
+            f"❌ Solo **{BLACKLIST_OWNER_USERNAME}** puede usar este comando.", ephemeral=True)
+        return
+    await _clan_reply(interaction, await clan_remove_money(clan, cantidad))
+
+
+clan_removemoney.autocomplete("clan")(clan_name_autocomplete)
+
+
 async def clan_handle_prefix(message: discord.Message, args: list[str]):
     """Permite usar todos los subcomandos de /clan con el prefijo de texto ','."""
     if message.guild is None:
@@ -11326,6 +11538,16 @@ async def clan_handle_prefix(message: discord.Message, args: list[str]):
             return await message.guild.fetch_member(target_id)
         except (discord.NotFound, discord.HTTPException):
             return None
+
+    if subcommand == "removemoney":
+        if not await blacklist_authorized(message.author):
+            await message.channel.send(f"❌ Solo **{BLACKLIST_OWNER_USERNAME}** puede usar este comando.")
+            return
+        if len(params) < 2:
+            await message.channel.send("Uso: `,clan removemoney <nombre del clan> <cantidad|all>`.")
+            return
+        await send_result(await clan_remove_money(" ".join(params[:-1]), params[-1]))
+        return
 
     if subcommand == "crear":
         if not params:
@@ -11594,6 +11816,9 @@ async def features_handle_prefix(message: discord.Message, cmd: str, args: list)
         return True
     if await shop_handle_prefix(message, cmd, args):
         return True
+    if cmd == "botinfo":
+        await botinfo_handle_prefix(message)
+        return True
 
     if cmd == "top":
         await message.channel.send(embed=await build_top_embed(uid))
@@ -11824,7 +12049,7 @@ BLACKLIST_OWNER_USERNAME = "jose_antonio972"
 BLACKLIST_BLOCKED_TEXT = "🚫 Estás en la **blacklist**: ya no puedes usar la economía del bot."
 _blacklist_ids: set = set()
 BLACKLIST_EXEMPT_COMMANDS = {   # no son economía: siguen funcionando para todos
-    "help", "guía", "guia", "blacklist", "ban", "unban", "kick", "mute", "unmute",
+    "help", "guía", "guia", "botinfo", "blacklist", "dueño", "dueno", "ban", "unban", "kick", "mute", "unmute",
     "clear", "lock", "unlock", "addrole", "removerole",
 }
 BLACKLIST_EXEMPT_PREFIX = BLACKLIST_EXEMPT_COMMANDS | {"ayuda"}
@@ -12295,7 +12520,7 @@ async def shop_add_role(
     emoji: str | None = None,
 ) -> tuple[bool, discord.Embed]:
     """Añade (o actualiza) un rol de Discord como objeto de la tienda de este servidor."""
-    if not member.guild_permissions.administrator:
+    if not is_admin_member(member):
         return False, _shop_err("Solo los administradores del servidor pueden añadir roles a la tienda.")
     if role.is_default() or role.managed:
         return False, _shop_err("No puedo vender @everyone ni roles de bots o integraciones.")
@@ -12388,7 +12613,7 @@ async def shop_add_role(
 
 
 async def shop_remove_role(guild: discord.Guild, member: discord.Member, text: str) -> tuple[bool, discord.Embed]:
-    if not member.guild_permissions.administrator:
+    if not is_admin_member(member):
         return False, _shop_err("Solo los administradores del servidor pueden quitar roles de la tienda.")
     await enter_guild(guild.id)
     gid = str(guild.id)
@@ -12437,11 +12662,9 @@ async def custom_item_autocomplete(interaction: discord.Interaction, current: st
 
 anadir_group = app_commands.Group(
     name="añadir", description="Añade objetos a la tienda de este servidor", guild_only=True,
-    default_permissions=discord.Permissions(administrator=True),
 )
 quitar_group = app_commands.Group(
     name="quitar", description="Quita objetos de la tienda de este servidor", guild_only=True,
-    default_permissions=discord.Permissions(administrator=True),
 )
 tree.add_command(anadir_group)
 tree.add_command(quitar_group)
@@ -12502,6 +12725,159 @@ async def shop_handle_prefix(message: discord.Message, cmd: str, args: list) -> 
                                     int(rest[2]), " ".join(rest[3:]) or None)
     await message.channel.send(embed=embed)
     return True
+
+
+# =====================================================================
+#  MODO DUEÑO: /dueño  (solo jose_antonio972)
+#  Con el modo activo, el dueño puede usar los comandos de economía que piden
+#  administrador, aunque no tenga ese permiso. NO incluye ban, mute ni el resto
+#  de moderación: eso sigue pidiendo permisos reales de Discord.
+# =====================================================================
+_owner_mode_ids: set = set()
+OWNER_UNLOCKED_COMMANDS = (
+    "`/addmoney` · `/removemoney` · `/resetmoney` (a otros)\n"
+    "`/addlevel` · `/evento` (panel) · `/cancelar evento` · `/doblecollect`\n"
+    "`/topcanal` · `/añadir rol` · `/quitar rol` (y sus versiones con `,`)"
+)
+
+
+def is_admin_member(member) -> bool:
+    """Administrador real, o dueño del bot con el modo dueño activado. Solo para comandos de economía."""
+    permissions = getattr(member, "guild_permissions", None)
+    if permissions is not None and permissions.administrator:
+        return True
+    return str(getattr(member, "id", "")) in _owner_mode_ids
+
+
+async def load_owner_mode():
+    raw = await setting_get("owner_mode_ids", scope="global")
+    _owner_mode_ids.clear()
+    _owner_mode_ids.update(x for x in (raw or "").split(",") if x)
+
+
+async def owner_mode_set(user_id: str, enabled: bool):
+    ids = set(_owner_mode_ids)
+    if enabled:
+        ids.add(user_id)
+    else:
+        ids.discard(user_id)
+    _owner_mode_ids.clear()
+    _owner_mode_ids.update(ids)
+    if ids:
+        await setting_set("owner_mode_ids", ",".join(sorted(ids)), scope="global")
+    else:
+        await setting_del("owner_mode_ids", scope="global")
+
+
+def owner_mode_embed(enabled: bool, changed: bool = True) -> discord.Embed:
+    if enabled:
+        embed = discord.Embed(title="👑 Modo dueño activado" if changed else "👑 Modo dueño: activado", color=0x2ECC71)
+        embed.description = (
+            "Ahora puedes usar, en **todos los servidores** y aunque no seas administrador:\n"
+            f"{OWNER_UNLOCKED_COMMANDS}\n\n"
+            "⛔ **No incluye** `/ban`, `/unban`, `/mute`, `/unmute` ni el resto de moderación: "
+            "esos siguen pidiendo tus permisos reales."
+        )
+    else:
+        embed = discord.Embed(title="👑 Modo dueño desactivado" if changed else "👑 Modo dueño: desactivado", color=0x95A5A6)
+        embed.description = "Vuelves a tener solo los permisos que tengas en cada servidor. Usa `/dueño` para activarlo de nuevo."
+    return embed
+
+
+async def owner_mode_toggle(user, mode: str | None) -> discord.Embed:
+    """mode: 'on', 'off', 'status' o None (alterna)."""
+    if not await blacklist_authorized(user):
+        return _err_embed("Sin permiso", f"Solo **{BLACKLIST_OWNER_USERNAME}** puede usar este comando.")
+    uid = str(user.id)
+    active = uid in _owner_mode_ids
+    if mode == "status":
+        return owner_mode_embed(active, changed=False)
+    enable = True if mode == "on" else False if mode == "off" else not active
+    await owner_mode_set(uid, enable)
+    return owner_mode_embed(enable)
+
+
+@tree.command(name="dueño", description="Modo dueño: usa los comandos de economía de admin sin ser administrador")
+@app_commands.describe(modo="Activar, desactivar o ver el estado (vacío = alterna)")
+@app_commands.choices(modo=[
+    app_commands.Choice(name="Activar", value="on"),
+    app_commands.Choice(name="Desactivar", value="off"),
+    app_commands.Choice(name="Ver estado", value="status"),
+])
+async def dueno_command(interaction: discord.Interaction, modo: _Optional[str] = None):
+    await interaction.response.send_message(embed=await owner_mode_toggle(interaction.user, modo), ephemeral=True)
+
+
+async def owner_handle_prefix(message: discord.Message, args: list):
+    word = (args[0].lower() if args else "")
+    mode = {"on": "on", "activar": "on", "off": "off", "desactivar": "off",
+            "estado": "status", "status": "status"}.get(word)
+    await message.channel.send(embed=await owner_mode_toggle(message.author, mode))
+
+
+# =====================================================================
+#  /botinfo: en cuántos servidores está el bot
+#  El conteo lo ve cualquiera; los NOMBRES de los servidores solo el dueño del bot
+#  (para no mostrar otras comunidades a desconocidos). Pon True para que todos los vean.
+# =====================================================================
+BOTINFO_NAMES_PUBLIC = False
+BOTINFO_MAX_LISTED = 40
+_BOT_START = datetime.utcnow()
+
+
+def _escape_md(text: str) -> str:
+    return re.sub(r"([*_`~|>\\\[\]])", r"\\\1", text or "")
+
+
+async def build_botinfo_embed(show_names: bool) -> discord.Embed:
+    guilds = sorted(client.guilds, key=lambda g: g.member_count or 0, reverse=True)
+    total_members = sum(g.member_count or 0 for g in guilds)
+    embed = discord.Embed(title="🤖 Información del bot", color=0x5865F2)
+    embed.add_field(name="🌐 Servidores", value=f"**{len(guilds):,}**", inline=True)
+    embed.add_field(name="👥 Usuarios", value=f"**{total_members:,}**", inline=True)
+    latency = getattr(client, "latency", None)
+    if isinstance(latency, (int, float)) and _loan_math.isfinite(latency):
+        embed.add_field(name="🏓 Latencia", value=f"**{round(latency * 1000)} ms**", inline=True)
+    embed.add_field(name="⏱️ Encendido hace", value=f"**{_fmt_dur((datetime.utcnow() - _BOT_START).total_seconds())}**", inline=True)
+    if show_names:
+        lines, size = [], 0
+        for guild in guilds[:BOTINFO_MAX_LISTED]:
+            line = f"• **{_escape_md(guild.name)}** — {(guild.member_count or 0):,} miembros"
+            if size + len(line) + 1 > 3500:
+                break
+            lines.append(line)
+            size += len(line) + 1
+        hidden = len(guilds) - len(lines)
+        if hidden > 0:
+            lines.append(f"…y {hidden:,} servidor(es) más")
+        embed.description = "**📋 Servidores**\n" + ("\n".join(lines) if lines else "El bot no está en ningún servidor.")
+    else:
+        embed.set_footer(text="Los nombres de los servidores solo los ve el dueño del bot.")
+    return embed
+
+
+async def _botinfo_can_see_names(user) -> bool:
+    return BOTINFO_NAMES_PUBLIC or await blacklist_authorized(user)
+
+
+@tree.command(name="botinfo", description="Mira en cuántos servidores está el bot")
+async def botinfo_command(interaction: discord.Interaction):
+    show = await _botinfo_can_see_names(interaction.user)
+    await interaction.response.send_message(embed=await build_botinfo_embed(show), ephemeral=show and not BOTINFO_NAMES_PUBLIC)
+
+
+async def botinfo_handle_prefix(message: discord.Message):
+    show = await _botinfo_can_see_names(message.author)
+    if show and not BOTINFO_NAMES_PUBLIC and message.guild is not None:
+        # la lista con nombres va por mensaje privado para no mostrarla en el canal
+        try:
+            await message.author.send(embed=await build_botinfo_embed(True))
+            note = "📬 Te envié la lista de servidores por mensaje privado."
+        except discord.HTTPException:
+            note = "⚠️ No pude enviarte el mensaje privado (tienes los DMs cerrados)."
+        await message.channel.send(note, embed=await build_botinfo_embed(False))
+        return
+    await message.channel.send(embed=await build_botinfo_embed(show))
 
 
 # =====================================================================
