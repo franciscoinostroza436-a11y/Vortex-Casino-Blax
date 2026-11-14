@@ -1036,6 +1036,7 @@ async def collect_available_role_earnings(
             return [], [], [], {}, {}, 1
 
         multiplier = 1   # el más alto de los roles que se cobran (para el aviso)
+        personal_multiplier = await owner_multiplier_for(user_id, now)   # /multiplicador: solo para el dueño
 
         async with db.execute(
             "SELECT item_id, last_collect FROM role_collects WHERE user_id=?",
@@ -1055,7 +1056,7 @@ async def collect_available_role_earnings(
         if ready_roles:
             total_bonus = 0
             for role_id in ready_roles:
-                role_multiplier = await _collect_multiplier(db, now, role_id)
+                role_multiplier = max(await _collect_multiplier(db, now, role_id), personal_multiplier)
                 multiplier = max(multiplier, role_multiplier)
                 base = SHOP_ITEMS[role_id]["collect_bonus"] * role_multiplier
                 if role_id in borrowed_info:
@@ -1390,7 +1391,7 @@ async def collect(interaction: discord.Interaction):
 
     total_bonus = sum(payouts[r] for r in ready_roles)
 
-    event_note = f" · 🎉 evento x{multiplier}" if multiplier > 1 else ""
+    event_note = await collect_multiplier_note(user_id, multiplier)
     new_balance = await get_balance(user_id)
     embed = discord.Embed(title="💰 ¡Ganancias Recogidas!", color=0x00FF88)
     lines = "\n".join(
@@ -6623,7 +6624,7 @@ async def on_message(message: discord.Message):
 
         total_bonus = sum(payouts[r] for r in ready_roles)
 
-        event_note = f" · 🎉 evento x{multiplier}" if multiplier > 1 else ""
+        event_note = await collect_multiplier_note(user_id, multiplier)
         new_balance = await get_balance(user_id)
         embed = discord.Embed(title="💰 ¡Ganancias Recogidas!", color=0x00FF88)
         lines = "\n".join(
@@ -11819,6 +11820,9 @@ async def features_handle_prefix(message: discord.Message, cmd: str, args: list)
     if cmd == "botinfo":
         await botinfo_handle_prefix(message)
         return True
+    if cmd in ("multiplicador", "multiplier"):
+        await owner_multiplier_handle_prefix(message, args)
+        return True
 
     if cmd == "top":
         await message.channel.send(embed=await build_top_embed(uid))
@@ -12878,6 +12882,177 @@ async def botinfo_handle_prefix(message: discord.Message):
         await message.channel.send(note, embed=await build_botinfo_embed(False))
         return
     await message.channel.send(embed=await build_botinfo_embed(show))
+
+
+# =====================================================================
+#  /multiplicador: multiplicador de collect PERSONAL
+#  Solo lo puede activar el dueño del bot (jose_antonio972) y solo se aplica a SUS collects,
+#  en todos los servidores. Funciona como /evento (multiplicador + días) pero para una sola persona.
+# =====================================================================
+OWNER_MULTIPLIER_KEY = "owner_multiplier"
+
+
+async def owner_multiplier_state() -> dict | None:
+    raw = await setting_get(OWNER_MULTIPLIER_KEY, scope="global")
+    if not raw:
+        return None
+    try:
+        data = _json.loads(raw)
+        return {
+            "user": str(data["user"]),
+            "multiplier": int(data["multiplier"]),
+            "until": datetime.fromisoformat(data["until"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+async def owner_multiplier_for(user_id: str, now: datetime | None = None) -> int:
+    """Multiplicador personal activo de ese usuario (1 si no tiene o si no es la persona que lo activó)."""
+    state = await owner_multiplier_state()
+    now = now or datetime.utcnow()
+    if state and state["user"] == str(user_id) and state["until"] > now:
+        return max(1, min(MANUAL_EVENT_MAX_MULTIPLIER, state["multiplier"]))
+    return 1
+
+
+async def owner_multiplier_save(user_id: str, multiplier: int, until: datetime):
+    if not 2 <= int(multiplier) <= MANUAL_EVENT_MAX_MULTIPLIER:
+        raise ValueError(f"El multiplicador debe estar entre x2 y x{MANUAL_EVENT_MAX_MULTIPLIER}.")
+    await setting_set(
+        OWNER_MULTIPLIER_KEY,
+        _json.dumps({"user": str(user_id), "multiplier": int(multiplier), "until": until.isoformat()}),
+        scope="global",
+    )
+
+
+async def owner_multiplier_cancel() -> bool:
+    active = await owner_multiplier_state() is not None
+    await setting_del(OWNER_MULTIPLIER_KEY, scope="global")
+    return active
+
+
+async def owner_multiplier_status_text() -> str:
+    state = await owner_multiplier_state()
+    if state and state["until"] > datetime.utcnow():
+        ts = _loan_ts(state["until"].isoformat())
+        return (f"👑 **Activo: x{state['multiplier']}** en tus collects, hasta <t:{ts}:f> (<t:{ts}:R>).\n"
+                "Se aplica en todos los servidores, solo para ti.")
+    return "Sin multiplicador personal activo."
+
+
+async def collect_multiplier_note(user_id: str, multiplier: int) -> str:
+    """Texto que se añade al /collect cuando hay un multiplicador (evento o personal)."""
+    if multiplier <= 1:
+        return ""
+    personal = await owner_multiplier_for(user_id)
+    if personal > 1 and personal >= multiplier:
+        return f" · 👑 multiplicador personal x{multiplier}"
+    return f" · 🎉 evento x{multiplier}"
+
+
+class OwnerMultiplierPanelView(GuildView):
+    def __init__(self, user_id: str, status: str):
+        super().__init__(timeout=180)
+        self.user_id = user_id
+        self.multiplier = 2
+        self.duration_days = 1
+        self.status = status
+        self.message: discord.Message | None = None
+        self.add_item(CollectEventMultiplierSelect(self.multiplier))   # mismos menús que /evento
+        self.add_item(CollectEventDurationSelect(self.duration_days))
+        self.add_item(OwnerMultiplierActivateButton())
+        self.add_item(OwnerMultiplierCancelButton())
+
+    def sync_defaults(self):
+        for child in self.children:
+            if isinstance(child, CollectEventMultiplierSelect):
+                for option in child.options:
+                    option.default = option.value == str(self.multiplier)
+            elif isinstance(child, CollectEventDurationSelect):
+                for option in child.options:
+                    option.default = option.value == str(self.duration_days)
+
+    def make_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="👑 Multiplicador personal de collect",
+            description=(f"Elige el multiplicador (hasta **x{MANUAL_EVENT_MAX_MULTIPLIER}**) y la duración. "
+                         "Solo se aplica a **tus** collects."),
+            color=0xF1C40F,
+        )
+        embed.add_field(name="Multiplicador elegido", value=f"**x{self.multiplier}**", inline=True)
+        embed.add_field(name="Duración elegida", value=f"**{self.duration_days} día(s)**", inline=True)
+        embed.add_field(name="Estado actual", value=self.status[:1024], inline=False)
+        embed.set_footer(text="Los demás jugadores no se ven afectados · funciona en todos los servidores")
+        return embed
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("❌ Este panel no es tuyo.", ephemeral=True)
+            return False
+        return True
+
+
+class OwnerMultiplierActivateButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Activar multiplicador", emoji="✅", style=discord.ButtonStyle.success, row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: OwnerMultiplierPanelView = self.view
+        if not await blacklist_authorized(interaction.user):
+            await interaction.response.send_message("❌ No tienes permiso.", ephemeral=True)
+            return
+        await owner_multiplier_save(view.user_id, view.multiplier, datetime.utcnow() + timedelta(days=view.duration_days))
+        view.status = await owner_multiplier_status_text()
+        await interaction.response.edit_message(embed=view.make_embed(), view=view)
+
+
+class OwnerMultiplierCancelButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Desactivar", emoji="🛑", style=discord.ButtonStyle.danger, row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: OwnerMultiplierPanelView = self.view
+        await owner_multiplier_cancel()
+        view.status = await owner_multiplier_status_text()
+        await interaction.response.edit_message(embed=view.make_embed(), view=view)
+
+
+@tree.command(name="multiplicador", description="[Dueño del bot] Multiplica tus collects (solo funciona para ti)")
+async def multiplicador_command(interaction: discord.Interaction):
+    if not await blacklist_authorized(interaction.user):
+        await interaction.response.send_message(
+            f"❌ Solo **{BLACKLIST_OWNER_USERNAME}** puede usar este comando.", ephemeral=True)
+        return
+    view = OwnerMultiplierPanelView(str(interaction.user.id), await owner_multiplier_status_text())
+    await interaction.response.send_message(embed=view.make_embed(), view=view, ephemeral=True)
+    view.message = await interaction.original_response()
+
+
+async def owner_multiplier_handle_prefix(message: discord.Message, args: list):
+    """,multiplicador            -> estado
+       ,multiplicador <x> <días> -> activar (ej: ,multiplicador 10 3)
+       ,multiplicador off        -> desactivar"""
+    if not await blacklist_authorized(message.author):
+        await message.channel.send(f"❌ Solo **{BLACKLIST_OWNER_USERNAME}** puede usar este comando.")
+        return
+    if not args:
+        await message.channel.send(await owner_multiplier_status_text())
+        return
+    if args[0].lower() in ("off", "desactivar", "cancelar", "quitar"):
+        await owner_multiplier_cancel()
+        await message.channel.send("🛑 Multiplicador personal desactivado.")
+        return
+    if len(args) < 2 or not args[0].isdigit() or not args[1].isdigit():
+        await message.channel.send("❌ Uso: `,multiplicador <x> <días>` — ej: `,multiplicador 10 3` · `,multiplicador off`")
+        return
+    multiplier, days = int(args[0]), int(args[1])
+    if not 2 <= multiplier <= MANUAL_EVENT_MAX_MULTIPLIER or not 1 <= days <= 365:
+        await message.channel.send(f"❌ El multiplicador va de x2 a x{MANUAL_EVENT_MAX_MULTIPLIER} y los días de 1 a 365.")
+        return
+    await owner_multiplier_save(str(message.author.id), multiplier, datetime.utcnow() + timedelta(days=days))
+    await message.channel.send(f"👑 Multiplicador personal **x{multiplier}** activado por **{days}** día(s).\n"
+                               + await owner_multiplier_status_text())
 
 
 # =====================================================================
