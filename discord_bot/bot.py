@@ -865,6 +865,8 @@ async def log_bet(user_id: str, game: str, amount_bet: int, net: int):
             (user_id, game, amount_bet, net, datetime.utcnow().isoformat())
         )
         await db.commit()
+    if net >= GG_MIN_WIN:
+        asyncio.create_task(celebrate(user_id, f"ganó **{net:,}** 🪙 en **{game}**", f"Apuesta: {amount_bet:,} 🪙"))
 
 
 async def get_bank(user_id: str) -> int:
@@ -1037,6 +1039,7 @@ async def collect_available_role_earnings(
 
         multiplier = 1   # el más alto de los roles que se cobran (para el aviso)
         personal_multiplier = await owner_multiplier_for(user_id, now)   # /multiplicador: solo para el dueño
+        prestige_pct = 100 + PRESTIGE_BONUS_PCT * await prestige_level_db(db, user_id)
 
         async with db.execute(
             "SELECT item_id, last_collect FROM role_collects WHERE user_id=?",
@@ -1058,7 +1061,7 @@ async def collect_available_role_earnings(
             for role_id in ready_roles:
                 role_multiplier = max(await _collect_multiplier(db, now, role_id), personal_multiplier)
                 multiplier = max(multiplier, role_multiplier)
-                base = SHOP_ITEMS[role_id]["collect_bonus"] * role_multiplier
+                base = SHOP_ITEMS[role_id]["collect_bonus"] * role_multiplier * prestige_pct // 100
                 if role_id in borrowed_info:
                     lender_id, pct = borrowed_info[role_id]
                     lender_share = base * pct // 100
@@ -1266,6 +1269,7 @@ async def lottery_loop():
 async def on_ready():
     global _background_started
     await init_global_db()
+    await init_extras3_global()
     await load_blacklist()
     await load_owner_mode()
     await load_guild_map()
@@ -1284,6 +1288,8 @@ async def on_ready():
         asyncio.create_task(_loan_loop())
         asyncio.create_task(role_loan_loop())
         asyncio.create_task(weekly_loop())
+        asyncio.create_task(extras_loop())
+        asyncio.create_task(backup_loop())
         asyncio.create_task(dashboard_start())
     print(f"Bot conectado como {client.user} (ID público: {client.user.id})")
 
@@ -1803,6 +1809,9 @@ async def rob(interaction: discord.Interaction, usuario: discord.Member):
             f"¡Le robaste **{stolen:,}** 🪙 a **{usuario.mention}**!\n\n"
             f"Tu saldo: **{robber_balance:,}** 🪙"
         )
+        bounty = await bounty_claim(robber_id, victim_id)
+        if bounty:
+            embed.add_field(name="🎯 Recompensa cobrada", value=f"**+{bounty:,}** 🪙", inline=False)
     else:
         fine = max(1, int(victim_balance * ROB_FINE_PCT / 100))
         robber_balance = await get_balance(robber_id)
@@ -1836,6 +1845,7 @@ async def addmoney(interaction: discord.Interaction, usuario: discord.Member, ca
     new_balance = await get_balance(target_id)
     embed = discord.Embed(title="✅ Dinero Añadido", color=0x00FF88)
     embed.description = f"Se añadieron **{cantidad:,}** 🪙 a {usuario.mention}.\nNuevo saldo: **{new_balance:,}** 🪙"
+    await admin_log("addmoney", interaction.user, f"{usuario} (`{usuario.id}`)", f"+{cantidad:,} 🪙", interaction.guild)
     await interaction.response.send_message(embed=embed)
 
 
@@ -1853,6 +1863,8 @@ async def removemoney(interaction: discord.Interaction, usuario: discord.Member,
     if isinstance(result, str):
         await interaction.response.send_message(result, ephemeral=True)
     else:
+        await admin_log("removemoney", interaction.user, f"{usuario} (`{usuario.id}`)",
+                        f"quitó {cantidad}" + (" + banco" if banco else ""), interaction.guild)
         await interaction.response.send_message(embed=result)
 
 
@@ -1868,6 +1880,8 @@ async def resetmoney_slash(interaction: discord.Interaction, usuario: discord.Me
     await get_or_create_user(target_id, target.name)
     cur_bal = await get_balance(target_id)
     await update_balance(target_id, -cur_bal)
+    if target.id != interaction.user.id:
+        await admin_log("resetmoney", interaction.user, f"{target} (`{target.id}`)", f"saldo anterior: {cur_bal:,} 🪙", interaction.guild)
     embed = discord.Embed(title="🔄 Saldo Reseteado", color=0xFF8800)
     if target.id == interaction.user.id:
         embed.description = f"Tu saldo de cartera ha sido reseteado a **0** 🪙."
@@ -4134,6 +4148,11 @@ async def help_cmd(interaction: discord.Interaction):
             "`/hilo cantidad` o `,hilo cantidad` — Hi-Lo: mayor, menor o igual\n"
             "`/añadir rol` · `/quitar rol` — (admins) Roles propios en la tienda\n"
             "`/botinfo` — En cuántos servidores está el bot\n"
+            "`/perfil` · `/temporada` · `/prestigio` — Tu tarjeta, ranking mensual y bonus permanente\n"
+            "`/negocio` · `/bolsa` — Negocios que producen y acciones que suben y bajan\n"
+            "`/diversion` — Trivia, rasca y gana, bingo, pesca, minería y mochila\n"
+            "`/recompensa` · `/subasta` · `/clan atraco` — Precio a una cabeza, subastas de roles y atracos en grupo\n"
+            "`/avisos` — Recordatorio de collect por DM y canal de ¡GG!\n"
             "`/clan ...` o `,clan ...` — Clanes con banco y misiones\n"
             "`/prestar` `/devolver` `/misprestamos` — Presta roles y mira tus cobros\n"
             "`/rolmercado publicar|ver|comprar|retirar` — Vende o alquila roles\n"
@@ -6992,6 +7011,9 @@ async def on_message(message: discord.Message):
                 f"¡Le robaste **{stolen:,}** 🪙 a **{target.mention}**!\n\n"
                 f"Tu saldo: **{robber_balance:,}** 🪙"
             )
+            bounty = await bounty_claim(user_id, victim_id)
+            if bounty:
+                embed.add_field(name="🎯 Recompensa cobrada", value=f"**+{bounty:,}** 🪙", inline=False)
         else:
             fine = max(1, int(victim_balance * ROB_FINE_PCT / 100))
             robber_balance = await get_balance(user_id)
@@ -7164,6 +7186,7 @@ async def on_message(message: discord.Message):
             return
         await get_or_create_user(str(target.id), target.name)
         await update_balance(str(target.id), amount)
+        await admin_log("addmoney", message.author, f"{target} (`{target.id}`)", f"+{amount:,} 🪙", message.guild)
         new_bal = await get_balance(str(target.id))
         embed = discord.Embed(title="💰 Dinero Añadido", color=0x00FF88)
         embed.description = (
@@ -7185,6 +7208,9 @@ async def on_message(message: discord.Message):
             return
         include_bank = any(a.lower() in ("banco", "bank") for a in amount_args[1:])
         result = await perform_removemoney(target, amount_args[0], include_bank)
+        if not isinstance(result, str):
+            await admin_log("removemoney", message.author, f"{target} (`{target.id}`)",
+                            f"quitó {amount_args[0]}" + (" + banco" if include_bank else ""), message.guild)
         if isinstance(result, str):
             await message.channel.send(result)
         else:
@@ -7454,6 +7480,8 @@ async def on_message(message: discord.Message):
         await get_or_create_user(target_id, target.name)
         cur_bal = await get_balance(target_id)
         await update_balance(target_id, -cur_bal)
+        if target.id != message.author.id:
+            await admin_log("resetmoney", message.author, f"{target} (`{target.id}`)", f"saldo anterior: {cur_bal:,} 🪙", message.guild)
         embed = discord.Embed(title="🔄 Saldo Reseteado", color=0xFF8800)
         if target.id == message.author.id:
             embed.description = f"Tu saldo de cartera ha sido reseteado a **0** 🪙."
@@ -8964,8 +8992,9 @@ JAIL_BLOCKED_COMMANDS = {         # comandos slash bloqueados mientras estas pre
     "rob", "slots", "roulette", "ruleta-en-vivo", "blackjack", "crash", "mines", "hilo",
     "coinflip", "duel", "bet", "fight", "ftorneo",
 }
+JAIL_BLOCKED_SUBCOMMANDS = {"diversion rasca", "diversion bingo", "clan atraco"}
 JAIL_BLOCKED_PREFIX = {           # lo mismo para los comandos con coma
-    "rob", "slots", "slot", "tragamonedas", "roulette", "blackjack", "bj", "crash", "mines", "hilo",
+    "rob", "slots", "slot", "tragamonedas", "roulette", "blackjack", "bj", "crash", "mines", "hilo", "rasca", "bingo", "atraco",
     "coinflip", "cf", "duel", "bet", "fight", "ftorneo", "lroulette", "liveroulette", "ruleta",
 }
 
@@ -9252,7 +9281,7 @@ async def _announce_achievements(user_id: str, keys: list[str]):
     await _notify_user(user_id, f"<@{user_id}> 🏅 **¡Logro desbloqueado!**\n" + "\n".join(lines))
 
 
-_PLAY_ACTIONS = {"slots_played", "roulette_played", "crash_played", "mines_played", "hilo_played"}
+_PLAY_ACTIONS = {"slots_played", "roulette_played", "crash_played", "mines_played", "hilo_played", "rasca_played"}
 
 
 async def feature_hook(user_id: str, action: str, n: int = 1):
@@ -9422,7 +9451,8 @@ async def _jail_interaction_check(interaction: discord.Interaction) -> bool:
             if blocked:
                 await interaction.response.send_message(blocked, ephemeral=True)
                 return False
-        if is_command and name in JAIL_BLOCKED_COMMANDS:
+        sub_name = (((interaction.data or {}).get("options") or [{}])[0] or {}).get("name")
+        if is_command and (name in JAIL_BLOCKED_COMMANDS or f"{name} {sub_name}" in JAIL_BLOCKED_SUBCOMMANDS):
             remaining = await jail_remaining(uid)
             if remaining is not None:
                 await interaction.response.send_message(embed=jail_embed(remaining), ephemeral=True)
@@ -10043,6 +10073,11 @@ async def role_is_committed(user_id: str, item_id: str) -> bool:
                 return True
         async with db.execute(
             "SELECT 1 FROM role_listings WHERE seller_id=? AND item_id=?", (user_id, item_id)
+        ) as cur:
+            if await cur.fetchone():
+                return True
+        async with db.execute(
+            "SELECT 1 FROM auctions WHERE seller_id=? AND item_id=? AND status='open'", (user_id, item_id)
         ) as cur:
             return await cur.fetchone() is not None
 
@@ -10872,13 +10907,20 @@ async def compute_networths() -> dict[str, tuple[str, int]]:
             rows = await cur.fetchall()
         async with db.execute("SELECT user_id, item_id, quantity FROM inventory WHERE quantity > 0") as cur:
             inventory = await cur.fetchall()
+        async with db.execute("SELECT p.user_id, SUM(p.shares * s.price) FROM portfolio p JOIN stocks s ON s.symbol = p.symbol GROUP BY p.user_id") as cur:
+            stock_value = dict(await cur.fetchall())
+        async with db.execute("SELECT user_id, biz_id FROM businesses") as cur:
+            biz_rows = await cur.fetchall()
     items_value: dict[str, int] = {}
     for user_id, item_id, qty in inventory:
         item = SHOP_ITEMS.get(item_id)
         if item:
             items_value[user_id] = items_value.get(user_id, 0) + qty * (item["price"] // 2)
+    for uid, biz_id in biz_rows:
+        if biz_id in BUSINESSES:
+            items_value[uid] = items_value.get(uid, 0) + BUSINESSES[biz_id]["price"] // 2
     return {
-        uid: (name or uid, balance + bank - debt + items_value.get(uid, 0))
+        uid: (name or uid, balance + bank - debt + items_value.get(uid, 0) + (stock_value.get(uid) or 0))
         for uid, name, balance, bank, debt in rows
     }
 
@@ -11823,6 +11865,8 @@ async def features_handle_prefix(message: discord.Message, cmd: str, args: list)
     if cmd in ("multiplicador", "multiplier"):
         await owner_multiplier_handle_prefix(message, args)
         return True
+    if await extras_handle_prefix(message, cmd, args):
+        return True
 
     if cmd == "top":
         await message.channel.send(embed=await build_top_embed(uid))
@@ -12016,6 +12060,7 @@ async def _init_guild_tables():
     await loan_init_table()
     await init_role_loans_table()
     await init_extras_tables()
+    await init_extras3_tables()
     await load_custom_items()
 
 
@@ -12613,6 +12658,8 @@ async def shop_add_role(
         "Los jugadores lo compran con `/buy` y reclaman el rol de Discord con `/use`."
     )
     embed.set_footer(text=f"Objetos en la tienda: {len(SHOP_ITEMS)}/{SHOP_MAX_ITEMS}")
+    await admin_log("añadir rol" if not existing_id else "actualizar rol", member, f"{full_name} ↔ {role.name} (`{role.id}`)",
+                    f"precio {price:,} · +{bonus:,} cada {int(hours)}h", guild)
     return True, embed
 
 
@@ -12649,6 +12696,7 @@ async def shop_remove_role(guild: discord.Guild, member: discord.Member, text: s
             await db.rollback()
             raise
     removed = custom.pop(item_id)
+    await admin_log("quitar rol", member, removed["name"], f"ID {item_id}", guild)
     return True, discord.Embed(title="🗑️ Rol quitado de la tienda", color=0x00FF88,
                                description=f"**{removed['name']}** ya no está en la tienda.")
 
@@ -13056,6 +13104,2176 @@ async def owner_multiplier_handle_prefix(message: discord.Message, args: list):
 
 
 # =====================================================================
+#  EXTRAS V3 (1/3): respaldos · registro de admin · recordatorio de collect · celebración GG
+# =====================================================================
+import io as _io
+import zipfile as _zipfile
+import shutil as _shutil
+
+BACKUP_DIR = "discord_bot/backups"
+BACKUP_KEEP_DAYS = 7                 # cuántos días de respaldos se guardan
+BACKUP_CHECK_SECONDS = 3600          # cada cuánto revisa si ya hizo el respaldo de hoy
+GG_MIN_WIN = 100_000_000             # ganancia mínima para que el bot celebre con un "¡GG!"
+REMINDER_CHECK_SECONDS = 60
+EXTRAS_TICK_SECONDS = 30             # cada cuánto corre la tarea de fondo (bolsa, subastas, impuesto, avisos...)
+
+
+async def init_extras3_global():
+    async with aiosqlite.connect(GLOBAL_DB_PATH) as db:
+        await db.execute(
+            """CREATE TABLE IF NOT EXISTS admin_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, guild_id TEXT, guild_name TEXT,
+                actor_id TEXT NOT NULL, actor_name TEXT, action TEXT NOT NULL, target TEXT, details TEXT)"""
+        )
+        await db.commit()
+
+
+async def init_extras3_tables():
+    """Tablas nuevas de cada servidor (negocios, bolsa, recompensas, botín, subastas...)."""
+    statements = (
+        """CREATE TABLE IF NOT EXISTS businesses (
+            user_id TEXT NOT NULL, biz_id TEXT NOT NULL, level INTEGER NOT NULL DEFAULT 1, last_collect TEXT NOT NULL,
+            PRIMARY KEY (user_id, biz_id))""",
+        """CREATE TABLE IF NOT EXISTS stocks (
+            symbol TEXT PRIMARY KEY, price INTEGER NOT NULL, prev_price INTEGER NOT NULL, updated_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS portfolio (
+            user_id TEXT NOT NULL, symbol TEXT NOT NULL, shares INTEGER NOT NULL DEFAULT 0, cost INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, symbol))""",
+        """CREATE TABLE IF NOT EXISTS bounties (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, target_id TEXT NOT NULL, placer_id TEXT NOT NULL,
+            amount INTEGER NOT NULL, created_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS loot (
+            user_id TEXT NOT NULL, item TEXT NOT NULL, qty INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (user_id, item))""",
+        """CREATE TABLE IF NOT EXISTS activity_cd (
+            user_id TEXT NOT NULL, kind TEXT NOT NULL, last_at TEXT NOT NULL, PRIMARY KEY (user_id, kind))""",
+        """CREATE TABLE IF NOT EXISTS auctions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, seller_id TEXT NOT NULL, item_id TEXT NOT NULL,
+            start_price INTEGER NOT NULL, current_bid INTEGER NOT NULL DEFAULT 0, bidder_id TEXT,
+            ends_at TEXT NOT NULL, channel_id TEXT, message_id TEXT, status TEXT NOT NULL DEFAULT 'open')""",
+        """CREATE TABLE IF NOT EXISTS collect_reminders (user_id TEXT PRIMARY KEY, notified_at TEXT)""",
+        """CREATE TABLE IF NOT EXISTS season_snapshot (
+            season_key TEXT NOT NULL, user_id TEXT NOT NULL, networth INTEGER NOT NULL, PRIMARY KEY (season_key, user_id))""",
+        """CREATE TABLE IF NOT EXISTS season_titles (
+            user_id TEXT NOT NULL, season_key TEXT NOT NULL, title TEXT NOT NULL, PRIMARY KEY (user_id, season_key))""",
+    )
+    async with aiosqlite.connect(DB_PATH) as db:
+        for sql in statements:
+            await db.execute(sql)
+        await db.commit()
+
+
+async def activity_cooldown(user_id: str, kind: str, seconds: int) -> int:
+    """Si ya pasó el enfriamiento lo reinicia y devuelve 0; si no, devuelve los segundos que faltan."""
+    now = datetime.utcnow()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT last_at FROM activity_cd WHERE user_id=? AND kind=?", (user_id, kind)) as cur:
+            row = await cur.fetchone()
+        if row:
+            try:
+                left = seconds - (now - datetime.fromisoformat(row[0])).total_seconds()
+            except ValueError:
+                left = 0
+            if left > 0:
+                await db.rollback()
+                return int(left) + 1
+        await db.execute(
+            "INSERT INTO activity_cd (user_id, kind, last_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id, kind) DO UPDATE SET last_at=excluded.last_at",
+            (user_id, kind, now.isoformat()),
+        )
+        await db.commit()
+    return 0
+
+
+# ------------------------------------------------------------------ registro de acciones de admin
+async def owner_user_id() -> str | None:
+    env_ids = [x for x in re.split(r"[\s,;]+", os.environ.get("BLACKLIST_OWNER_IDS", "")) if x]
+    pinned = await setting_get("blacklist_owner_id", scope="global")
+    return pinned or (env_ids[0] if env_ids else None)
+
+
+async def admin_log(action: str, actor, target: str, details: str, guild=None):
+    """Anota la acción de un admin y se la manda por DM al dueño del bot (si no la hizo él mismo)."""
+    try:
+        actor_id = str(actor.id)
+        actor_name = getattr(actor, "name", actor_id)
+        guild_id = str(guild.id) if guild is not None else (_current_guild.get() or "")
+        guild_name = getattr(guild, "name", "") if guild is not None else ""
+        async with aiosqlite.connect(GLOBAL_DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO admin_log (ts, guild_id, guild_name, actor_id, actor_name, action, target, details) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (datetime.utcnow().isoformat(), guild_id, guild_name, actor_id, actor_name, action, target, details),
+            )
+            await db.commit()
+        owner = await owner_user_id()
+        if owner and owner != actor_id:
+            embed = discord.Embed(title=f"📝 Admin: {action}", color=0xE67E22)
+            embed.add_field(name="Quién", value=f"{actor_name} (`{actor_id}`)", inline=True)
+            embed.add_field(name="Servidor", value=f"{guild_name or '—'} (`{guild_id or '—'}`)", inline=True)
+            embed.add_field(name="Objetivo", value=target or "—", inline=False)
+            embed.add_field(name="Detalle", value=(details or "—")[:1000], inline=False)
+            await _dm_user(owner, "🛡️ Registro de acciones de admin", embed)
+    except Exception as exc:
+        print(f"No pude registrar la acción de admin: {exc}")
+
+
+# ------------------------------------------------------------------ respaldos automáticos
+def _backup_sources() -> list:
+    sources = []
+    if os.path.exists(GLOBAL_DB_PATH):
+        sources.append(("global", GLOBAL_DB_PATH))
+    for guild_id, path in _guild_paths.items():
+        if os.path.exists(path):
+            sources.append((f"servidor_{guild_id}", path))
+    return sources
+
+
+def _do_backup(folder: str) -> int:
+    os.makedirs(folder, exist_ok=True)
+    count = 0
+    for label, path in _backup_sources():
+        _backup_sqlite(path, os.path.join(folder, f"{label}.db"))
+        count += 1
+    return count
+
+
+def _prune_backups():
+    if not os.path.isdir(BACKUP_DIR):
+        return
+    days = sorted(d for d in os.listdir(BACKUP_DIR) if os.path.isdir(os.path.join(BACKUP_DIR, d)))
+    for old in days[:-BACKUP_KEEP_DAYS] if BACKUP_KEEP_DAYS > 0 else days:
+        _shutil.rmtree(os.path.join(BACKUP_DIR, old), ignore_errors=True)
+
+
+async def create_backup(force: bool = False) -> str | None:
+    """Hace el respaldo de hoy (una carpeta por día). Devuelve la carpeta, o None si ya existía."""
+    folder = os.path.join(BACKUP_DIR, datetime.utcnow().strftime("%Y-%m-%d"))
+    if os.path.isdir(folder) and os.listdir(folder) and not force:
+        return None
+    await asyncio.to_thread(_do_backup, folder)
+    await asyncio.to_thread(_prune_backups)
+    return folder
+
+
+def backups_list() -> list:
+    out = []
+    if os.path.isdir(BACKUP_DIR):
+        for day in sorted(os.listdir(BACKUP_DIR), reverse=True):
+            folder = os.path.join(BACKUP_DIR, day)
+            if os.path.isdir(folder):
+                files = [f for f in os.listdir(folder) if f.endswith(".db")]
+                out.append((day, sum(os.path.getsize(os.path.join(folder, f)) for f in files), len(files)))
+    return out
+
+
+def backup_zip_bytes(day: str) -> bytes:
+    folder = os.path.join(BACKUP_DIR, day)
+    buffer = _io.BytesIO()
+    with _zipfile.ZipFile(buffer, "w", _zipfile.ZIP_DEFLATED) as archive:
+        for name in sorted(os.listdir(folder)):
+            if name.endswith(".db"):
+                archive.write(os.path.join(folder, name), arcname=name)
+    return buffer.getvalue()
+
+
+async def backup_loop():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            folder = await create_backup()
+            if folder:
+                print(f"Respaldo diario creado en {folder}")
+        except Exception as exc:
+            print(f"Error en el respaldo diario: {exc}")
+        await asyncio.sleep(BACKUP_CHECK_SECONDS)
+
+
+respaldo_group = app_commands.Group(name="respaldo", description="[Dueño del bot] Respaldos de las bases de datos")
+tree.add_command(respaldo_group)
+
+
+async def _owner_gate(interaction: discord.Interaction) -> bool:
+    if await blacklist_authorized(interaction.user):
+        return True
+    await interaction.response.send_message(
+        f"❌ Solo **{BLACKLIST_OWNER_USERNAME}** puede usar este comando.", ephemeral=True)
+    return False
+
+
+@respaldo_group.command(name="ahora", description="Hace un respaldo de todas las bases de datos ahora mismo")
+async def respaldo_ahora(interaction: discord.Interaction):
+    if not await _owner_gate(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    folder = await create_backup(force=True)
+    await interaction.followup.send(f"✅ Respaldo creado: `{folder}` ({len(_backup_sources())} bases de datos).", ephemeral=True)
+
+
+@respaldo_group.command(name="lista", description="Muestra los respaldos guardados")
+async def respaldo_lista(interaction: discord.Interaction):
+    if not await _owner_gate(interaction):
+        return
+    rows = backups_list()
+    text = "\n".join(f"• `{day}` — {n} base(s) — {size / 1024:,.0f} KB" for day, size, n in rows) or "Todavía no hay respaldos."
+    await interaction.response.send_message(f"💾 **Respaldos** (se guardan {BACKUP_KEEP_DAYS} días):\n{text}", ephemeral=True)
+
+
+async def backup_day_autocomplete(interaction: discord.Interaction, current: str):
+    return [app_commands.Choice(name=f"{day} ({size / 1024:,.0f} KB)", value=day)
+            for day, size, _n in backups_list() if current in day][:25]
+
+
+@respaldo_group.command(name="descargar", description="Descarga un respaldo (todas las bases de datos en un .zip)")
+@app_commands.describe(fecha="Día del respaldo (por defecto, el más reciente)")
+async def respaldo_descargar(interaction: discord.Interaction, fecha: _Optional[str] = None):
+    if not await _owner_gate(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    if not backups_list():
+        await create_backup(force=True)
+    day = fecha or backups_list()[0][0]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) or not os.path.isdir(os.path.join(BACKUP_DIR, day)):
+        await interaction.followup.send("❌ No encontré ese respaldo. Mira `/respaldo lista`.", ephemeral=True)
+        return
+    data = await asyncio.to_thread(backup_zip_bytes, day)
+    name = f"respaldo_{day}.zip"
+    limit = getattr(interaction.guild, "filesize_limit", 8 * 1024 * 1024) or 8 * 1024 * 1024
+    try:
+        if len(data) <= limit:
+            await interaction.followup.send(f"💾 Respaldo del **{day}**", file=discord.File(_io.BytesIO(data), filename=name), ephemeral=True)
+        else:
+            await interaction.user.send(f"💾 Respaldo del **{day}**", file=discord.File(_io.BytesIO(data), filename=name))
+            await interaction.followup.send("📬 Pesa mucho para este canal: te lo envié por mensaje privado.", ephemeral=True)
+    except discord.HTTPException:
+        await interaction.followup.send(
+            f"❌ El archivo pesa {len(data) / 1024 / 1024:,.1f} MB y Discord no me deja enviarlo. "
+            f"Está en `{os.path.join(BACKUP_DIR, day)}` dentro del servidor donde corre el bot.", ephemeral=True)
+
+
+respaldo_descargar.autocomplete("fecha")(backup_day_autocomplete)
+
+
+# ------------------------------------------------------------------ recordatorio de collect
+async def collect_ready_roles(user_id: str, now: datetime | None = None) -> list:
+    """Roles que ya se pueden cobrar (sin cobrarlos)."""
+    now = now or datetime.utcnow()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT item_id FROM inventory WHERE user_id=? AND quantity > 0", (user_id,)) as cur:
+            owned = [r[0] for r in await cur.fetchall() if r[0] in ROLE_ITEMS]
+        async with db.execute(
+            "SELECT item_id FROM role_loans WHERE lender_id=? AND expires_at > ?", (user_id, now.isoformat())
+        ) as cur:
+            lent = {r[0] for r in await cur.fetchall()}
+        async with db.execute(
+            "SELECT item_id FROM role_loans WHERE borrower_id=? AND expires_at > ?", (user_id, now.isoformat())
+        ) as cur:
+            borrowed = [r[0] for r in await cur.fetchall()]
+        async with db.execute("SELECT item_id, last_collect FROM role_collects WHERE user_id=?", (user_id,)) as cur:
+            last = dict(await cur.fetchall())
+    roles = [r for r in owned if r not in lent] + [r for r in borrowed if r not in owned]
+    ready = []
+    for role_id in roles:
+        if role_id not in SHOP_ITEMS:
+            continue
+        cooldown = timedelta(hours=SHOP_ITEMS[role_id]["collect_hours"])
+        if not last.get(role_id) or now - datetime.fromisoformat(last[role_id]) >= cooldown:
+            ready.append(role_id)
+    return ready
+
+
+async def reminders_tick():
+    now = datetime.utcnow()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id, notified_at FROM collect_reminders") as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        return
+    guild = client.get_guild(int(_current_guild.get())) if _current_guild.get() else None
+    for user_id, notified_at in rows:
+        ready = await collect_ready_roles(user_id, now)
+        if not ready:
+            continue
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT MAX(last_collect) FROM role_collects WHERE user_id=?", (user_id,)) as cur:
+                last_collect = (await cur.fetchone())[0]
+        if notified_at and (not last_collect or notified_at > last_collect):
+            continue   # ya se le avisó desde su último cobro
+        names = ", ".join(SHOP_ITEMS[r]["name"] for r in ready)
+        await _dm_user(user_id, f"⏰ **Recordatorio:** en **{getattr(guild, 'name', 'tu servidor')}** ya puedes cobrar "
+                                f"{len(ready)} rol(es): {names}\nUsa `/collect` 💰")
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE collect_reminders SET notified_at=? WHERE user_id=?", (now.isoformat(), user_id))
+            await db.commit()
+
+
+async def reminder_set(user_id: str, username: str, enabled: bool) -> str:
+    await get_or_create_user(user_id, username)
+    async with aiosqlite.connect(DB_PATH) as db:
+        if enabled:
+            await db.execute("INSERT OR IGNORE INTO collect_reminders (user_id, notified_at) VALUES (?, NULL)", (user_id,))
+        else:
+            await db.execute("DELETE FROM collect_reminders WHERE user_id=?", (user_id,))
+        await db.commit()
+    return ("🔔 **Recordatorio activado.** Te escribiré por DM cuando tus roles se puedan cobrar en este servidor. "
+            "(Necesitas tener los mensajes privados abiertos.)") if enabled else "🔕 Recordatorio desactivado."
+
+
+# ------------------------------------------------------------------ celebración ¡GG!
+_gg_last: dict = {}
+
+
+async def celebrate(user_id: str, headline: str, detail: str = ""):
+    """Anuncia un logro enorme en el canal de anuncios del servidor (si hay uno configurado con /avisos gg)."""
+    channel_id = await setting_get("gg_channel")
+    if not channel_id:
+        return
+    if _time.time() - _gg_last.get(user_id, 0) < 30:
+        return
+    _gg_last[user_id] = _time.time()
+    channel = client.get_channel(int(channel_id))
+    if channel is None:
+        return
+    embed = discord.Embed(title="🎉 ¡GG!", description=f"<@{user_id}> {headline}" + (f"\n{detail}" if detail else ""),
+                          color=0xF1C40F)
+    try:
+        await channel.send(embed=embed)
+    except discord.HTTPException:
+        pass
+
+
+avisos_group = app_commands.Group(name="avisos", description="Recordatorios y anuncios del bot", guild_only=True)
+tree.add_command(avisos_group)
+
+
+@avisos_group.command(name="recordatorio", description="Recibe un DM cuando tus roles ya se puedan cobrar")
+@app_commands.describe(estado="Activar o desactivar el recordatorio")
+@app_commands.choices(estado=[app_commands.Choice(name="Activar", value="on"), app_commands.Choice(name="Desactivar", value="off")])
+async def avisos_recordatorio(interaction: discord.Interaction, estado: str):
+    await interaction.response.send_message(
+        await reminder_set(str(interaction.user.id), interaction.user.name, estado == "on"), ephemeral=True)
+
+
+@avisos_group.command(name="gg", description="[Admin] Elige el canal donde el bot celebra las ganancias enormes")
+@app_commands.describe(canal="Canal de anuncios (déjalo vacío para quitarlo)")
+async def avisos_gg(interaction: discord.Interaction, canal: _Optional[discord.TextChannel] = None):
+    if not is_admin_member(interaction.user):
+        await interaction.response.send_message("❌ Solo los administradores pueden usar este comando.", ephemeral=True)
+        return
+    if canal is None:
+        await setting_del("gg_channel")
+        await interaction.response.send_message("🔕 Celebraciones desactivadas en este servidor.")
+        return
+    await setting_set("gg_channel", str(canal.id))
+    await interaction.response.send_message(
+        f"🎉 Cuando alguien gane **{GG_MIN_WIN:,}** 🪙 o más (o consiga algo rarísimo), lo anunciaré en {canal.mention}.")
+
+
+# =====================================================================
+#  EXTRAS V3 (2/3): negocios · bolsa · impuesto · prestigio · recompensas · temporadas · /perfil
+# =====================================================================
+# ----- negocios
+BUSINESSES = {
+    "puesto": {"name": "🌮 Puesto de tacos",    "price": 500_000,       "income": 15_000},      # income = monedas por hora (nivel 1)
+    "tienda": {"name": "🏪 Tienda de barrio",   "price": 5_000_000,     "income": 150_000},
+    "cafe":   {"name": "☕ Cafetería",           "price": 25_000_000,    "income": 750_000},
+    "hotel":  {"name": "🏨 Hotel",              "price": 150_000_000,   "income": 4_500_000},
+    "banco":  {"name": "🏦 Mini banco",         "price": 1_000_000_000, "income": 30_000_000},
+    "casino": {"name": "🎰 Casino propio",      "price": 5_000_000_000, "income": 150_000_000},
+}
+BUSINESS_MAX_LEVEL = 10
+BUSINESS_MAX_HOURS = 24            # los negocios producen como máximo este tiempo sin cobrar
+BUSINESS_UPGRADE_PCT = 60          # mejorar de nivel L a L+1 cuesta (precio × este % × L)
+BUSINESS_LEVEL_BONUS_PCT = 50      # cada nivel extra suma este % del ingreso base
+
+# ----- bolsa
+STOCKS = {   # símbolo: (nombre, precio base, volatilidad por tick)
+    "LUCK": ("🍀 Lucky Corp", 800, 0.05),
+    "CHIP": ("🪙 Fichas S.A.", 2_500, 0.04),
+    "VRTX": ("🎰 Vortex Casino", 10_000, 0.035),
+    "ROLE": ("👑 Roles Inc.", 50_000, 0.03),
+    "BANK": ("🏦 Banco Central", 150_000, 0.02),
+    "GOLD": ("🥇 Oro Digital", 1_000_000, 0.045),
+}
+STOCK_TICK_SECONDS = 600           # cada cuánto se mueven los precios
+STOCK_FEE_PCT = 1                  # comisión al vender
+
+# ----- impuesto semanal a las fortunas (porcentaje MARGINAL por tramo, sobre cartera + banco)
+WEALTH_TAX_BRACKETS = ((1_000_000_000, 1), (10_000_000_000, 2), (100_000_000_000, 3), (1_000_000_000_000, 5))
+
+# ----- prestigio
+PRESTIGE_BASE = 1_000_000_000      # patrimonio para el primer prestigio (se duplica en cada nivel)
+PRESTIGE_MAX = 20
+PRESTIGE_BONUS_PCT = 10            # % extra por nivel en collect, negocios y work/slut/crime
+
+# ----- recompensas
+BOUNTY_MIN = 10_000
+BOUNTY_CANCEL_REFUND_PCT = 80
+
+# ----- temporadas (mensuales)
+SEASON_PRIZES = (2_000_000_000, 1_000_000_000, 500_000_000)
+_MONTHS_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre",
+              "noviembre", "diciembre"]
+
+
+# ------------------------------------------------------------------ prestigio
+async def prestige_level_db(db, user_id: str) -> int:
+    async with db.execute("SELECT value FROM user_stats WHERE user_id=? AND stat='prestige'", (user_id,)) as cur:
+        row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def prestige_level(user_id: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        return await prestige_level_db(db, user_id)
+
+
+async def apply_prestige(user_id: str, amount: int) -> int:
+    level = await prestige_level(user_id)
+    return amount * (100 + PRESTIGE_BONUS_PCT * level) // 100 if level else amount
+
+
+def prestige_requirement(level: int) -> int:
+    return PRESTIGE_BASE * (2 ** level)
+
+
+async def prestige_do(user_id: str, username: str, confirm: bool) -> tuple:
+    await get_or_create_user(user_id, username)
+    level = await prestige_level(user_id)
+    if level >= PRESTIGE_MAX:
+        return False, _err_embed("Prestigio máximo", f"Ya estás en el prestigio máximo (**{PRESTIGE_MAX}**).")
+    required = prestige_requirement(level)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT balance, COALESCE(bank,0) FROM users WHERE user_id=?", (user_id,)) as cur:
+            balance, bank = await cur.fetchone()
+        async with db.execute("SELECT COALESCE(SUM(remaining),0) FROM loans WHERE user_id=?", (user_id,)) as cur:
+            debt = (await cur.fetchone())[0]
+    total = balance + bank
+    info = discord.Embed(title=f"⭐ Prestigio {level} → {level + 1}", color=0xF1C40F)
+    info.description = (
+        f"Para subir necesitas **{required:,}** 🪙 entre cartera y banco (tienes **{total:,}**).\n"
+        f"🎁 Ganas **+{PRESTIGE_BONUS_PCT}%** permanente en collects, negocios y work/slut/crime "
+        f"(total: **+{PRESTIGE_BONUS_PCT * (level + 1)}%**).\n\n"
+        "⚠️ **Se reinicia:** tu cartera y tu banco (quedas con 1,000 🪙), tus negocios y tus acciones de la bolsa.\n"
+        "✅ **Se conserva:** roles, objetos, luchador, clan y logros.\n"
+        "Para confirmar usa `/prestigio confirmar:True`.")
+    if total < required:
+        return False, info
+    if debt > 0:
+        return False, _err_embed("Tienes deudas", f"Paga tu préstamo del banco (**{debt:,}** 🪙) antes de hacer prestigio.")
+    if not confirm:
+        return False, info
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        await db.execute("UPDATE users SET balance=1000, bank=0 WHERE user_id=?", (user_id,))
+        await db.execute("DELETE FROM portfolio WHERE user_id=?", (user_id,))
+        await db.execute("DELETE FROM businesses WHERE user_id=?", (user_id,))
+        await db.execute(
+            "INSERT INTO user_stats (user_id, stat, value) VALUES (?, 'prestige', 1) "
+            "ON CONFLICT(user_id, stat) DO UPDATE SET value = value + 1", (user_id,))
+        await db.commit()
+    await feature_hook(user_id, "prestige_up")
+    asyncio.create_task(celebrate(user_id, f"alcanzó el **Prestigio {level + 1}** ⭐"))
+    done = discord.Embed(title=f"⭐ ¡Prestigio {level + 1} alcanzado!", color=0x2ECC71,
+                         description=f"Empiezas de nuevo con **1,000** 🪙 y un bono permanente de **+{PRESTIGE_BONUS_PCT * (level + 1)}%**. ¡A por el siguiente!")
+    return True, done
+
+
+# ------------------------------------------------------------------ negocios
+def biz_income(biz_id: str, level: int) -> int:
+    return BUSINESSES[biz_id]["income"] * (100 + BUSINESS_LEVEL_BONUS_PCT * (level - 1)) // 100
+
+
+def biz_upgrade_cost(biz_id: str, level: int) -> int:
+    return BUSINESSES[biz_id]["price"] * BUSINESS_UPGRADE_PCT // 100 * level
+
+
+async def user_businesses(user_id: str) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT biz_id, level, last_collect FROM businesses WHERE user_id=?", (user_id,)) as cur:
+            return {r[0]: (r[1], r[2]) for r in await cur.fetchall() if r[0] in BUSINESSES}
+
+
+def biz_pending(biz_id: str, level: int, last_collect: str, now: datetime) -> int:
+    hours = min((now - datetime.fromisoformat(last_collect)).total_seconds() / 3600, BUSINESS_MAX_HOURS)
+    return int(biz_income(biz_id, level) * max(0.0, hours))
+
+
+async def business_buy(user_id: str, username: str, biz_id: str) -> tuple:
+    if biz_id not in BUSINESSES:
+        return False, "Ese negocio no existe."
+    await get_or_create_user(user_id, username)
+    price = BUSINESSES[biz_id]["price"]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT 1 FROM businesses WHERE user_id=? AND biz_id=?", (user_id, biz_id)) as cur:
+            if await cur.fetchone():
+                await db.rollback()
+                return False, "Ya tienes ese negocio. Mejóralo con `/negocio mejorar`."
+        cur = await db.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (price, user_id, price))
+        if cur.rowcount == 0:
+            await db.rollback()
+            return False, f"Cuesta **{price:,}** 🪙 y no te alcanza."
+        await db.execute("INSERT INTO businesses (user_id, biz_id, level, last_collect) VALUES (?, ?, 1, ?)",
+                         (user_id, biz_id, datetime.utcnow().isoformat()))
+        await db.commit()
+    return True, (f"✅ Compraste **{BUSINESSES[biz_id]['name']}** por **{price:,}** 🪙. "
+                  f"Produce **{biz_income(biz_id, 1):,}** 🪙 por hora. Cóbralo con `/negocio cobrar`.")
+
+
+async def business_upgrade(user_id: str, biz_id: str) -> tuple:
+    if biz_id not in BUSINESSES:
+        return False, "Ese negocio no existe."
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT level, last_collect FROM businesses WHERE user_id=? AND biz_id=?", (user_id, biz_id)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await db.rollback()
+            return False, "No tienes ese negocio. Cómpralo con `/negocio comprar`."
+        level = row[0]
+        if level >= BUSINESS_MAX_LEVEL:
+            await db.rollback()
+            return False, f"Ya está al nivel máximo (**{BUSINESS_MAX_LEVEL}**)."
+        cost = biz_upgrade_cost(biz_id, level)
+        # lo producido hasta ahora se paga con el nivel viejo para no perder nada
+        pending = biz_pending(biz_id, level, row[1], datetime.utcnow())
+        cur = await db.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (cost, user_id, cost))
+        if cur.rowcount == 0:
+            await db.rollback()
+            return False, f"Mejorarlo cuesta **{cost:,}** 🪙 y no te alcanza."
+        await db.execute("UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?", (pending, MAX_BALANCE, user_id))
+        await db.execute("UPDATE businesses SET level=?, last_collect=? WHERE user_id=? AND biz_id=?",
+                         (level + 1, datetime.utcnow().isoformat(), user_id, biz_id))
+        await db.commit()
+    return True, (f"⬆️ **{BUSINESSES[biz_id]['name']}** subió al nivel **{level + 1}** por **{cost:,}** 🪙. "
+                  f"Ahora produce **{biz_income(biz_id, level + 1):,}** 🪙/h." + (f" (Cobraste además {pending:,} 🪙 pendientes.)" if pending else ""))
+
+
+async def business_collect(user_id: str) -> tuple:
+    owned = await user_businesses(user_id)
+    if not owned:
+        return False, "No tienes negocios. Mira el catálogo con `/negocio ver`."
+    now = datetime.utcnow()
+    lines, total = [], 0
+    for biz_id, (level, last) in owned.items():
+        amount = await apply_prestige(user_id, biz_pending(biz_id, level, last, now))
+        total += amount
+        lines.append(f"{BUSINESSES[biz_id]['name']} (nv. {level}) → **{amount:,}** 🪙")
+    if total <= 0:
+        return False, "Tus negocios todavía no han producido nada. Vuelve en un rato."
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?", (total, MAX_BALANCE, user_id))
+        await db.execute("UPDATE businesses SET last_collect=? WHERE user_id=?", (now.isoformat(), user_id))
+        await db.commit()
+    return True, "💰 **Cobro de negocios**\n" + "\n".join(lines) + f"\n\nTotal: **{total:,}** 🪙"
+
+
+async def build_business_embed(user_id: str) -> discord.Embed:
+    owned = await user_businesses(user_id)
+    now = datetime.utcnow()
+    embed = discord.Embed(title="🏪 Negocios", color=0x2ECC71)
+    mine = []
+    for biz_id, (level, last) in owned.items():
+        mine.append(f"{BUSINESSES[biz_id]['name']} · nv. **{level}/{BUSINESS_MAX_LEVEL}** · {biz_income(biz_id, level):,} 🪙/h · "
+                    f"acumulado **{biz_pending(biz_id, level, last, now):,}** 🪙 · mejorar: {biz_upgrade_cost(biz_id, level):,}" if level < BUSINESS_MAX_LEVEL
+                    else f"{BUSINESSES[biz_id]['name']} · nv. **MAX** · {biz_income(biz_id, level):,} 🪙/h · acumulado **{biz_pending(biz_id, level, last, now):,}** 🪙")
+    embed.add_field(name="Tus negocios", value="\n".join(mine) or "Todavía no tienes ninguno.", inline=False)
+    shop = [f"`{biz_id}` {b['name']} — **{b['price']:,}** 🪙 · {b['income']:,} 🪙/h" for biz_id, b in BUSINESSES.items() if biz_id not in owned]
+    if shop:
+        embed.add_field(name="Disponibles", value="\n".join(shop), inline=False)
+    embed.set_footer(text=f"Producen hasta {BUSINESS_MAX_HOURS} h sin cobrar · /negocio comprar · mejorar · cobrar")
+    return embed
+
+
+async def business_autocomplete(interaction: discord.Interaction, current: str):
+    t = _plain(current)
+    return [app_commands.Choice(name=f"{b['name']} — {b['price']:,} 🪙"[:100], value=k)
+            for k, b in BUSINESSES.items() if not t or t in _plain(b["name"]) or t in k][:25]
+
+
+negocio_group = app_commands.Group(name="negocio", description="Compra negocios que te generan dinero y mejóralos", guild_only=True)
+tree.add_command(negocio_group)
+
+
+@negocio_group.command(name="ver", description="Mira tus negocios y el catálogo")
+async def negocio_ver(interaction: discord.Interaction):
+    await get_or_create_user(str(interaction.user.id), interaction.user.name)
+    await interaction.response.send_message(embed=await build_business_embed(str(interaction.user.id)))
+
+
+@negocio_group.command(name="comprar", description="Compra un negocio")
+@app_commands.describe(negocio="Negocio a comprar")
+async def negocio_comprar(interaction: discord.Interaction, negocio: str):
+    ok, text = await business_buy(str(interaction.user.id), interaction.user.name, negocio)
+    await interaction.response.send_message(text if ok else f"❌ {text}", ephemeral=not ok)
+
+
+@negocio_group.command(name="mejorar", description="Sube de nivel un negocio (produce más)")
+@app_commands.describe(negocio="Negocio a mejorar")
+async def negocio_mejorar(interaction: discord.Interaction, negocio: str):
+    ok, text = await business_upgrade(str(interaction.user.id), negocio)
+    await interaction.response.send_message(text if ok else f"❌ {text}", ephemeral=not ok)
+
+
+@negocio_group.command(name="cobrar", description="Cobra lo que han producido tus negocios")
+async def negocio_cobrar(interaction: discord.Interaction):
+    await get_or_create_user(str(interaction.user.id), interaction.user.name)
+    ok, text = await business_collect(str(interaction.user.id))
+    await interaction.response.send_message(text if ok else f"❌ {text}", ephemeral=not ok)
+
+
+negocio_comprar.autocomplete("negocio")(business_autocomplete)
+negocio_mejorar.autocomplete("negocio")(business_autocomplete)
+
+
+# ------------------------------------------------------------------ bolsa
+async def stocks_seed():
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        for symbol, (_name, base, _vol) in STOCKS.items():
+            await db.execute("INSERT OR IGNORE INTO stocks (symbol, price, prev_price, updated_at) VALUES (?, ?, ?, ?)",
+                             (symbol, base, base, now))
+        await db.commit()
+
+
+def stock_next_price(symbol: str, price: int) -> int:
+    _name, base, vol = STOCKS[symbol]
+    change = random.gauss(0, vol) + 0.05 * (base - price) / base       # vuelve poco a poco hacia su precio base
+    if random.random() < 0.03:                                          # noticia: sube o baja de golpe
+        change += random.choice((-1, 1)) * random.uniform(0.10, 0.25)
+    return int(min(base * 5, max(max(1, base * 0.2), price * (1 + change))))
+
+
+async def stocks_tick():
+    await stocks_seed()
+    now = datetime.utcnow()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT symbol, price, updated_at FROM stocks") as cur:
+            rows = await cur.fetchall()
+        for symbol, price, updated in rows:
+            if symbol not in STOCKS:
+                continue
+            if (now - datetime.fromisoformat(updated)).total_seconds() >= STOCK_TICK_SECONDS:
+                await db.execute("UPDATE stocks SET prev_price=?, price=?, updated_at=? WHERE symbol=?",
+                                 (price, stock_next_price(symbol, price), now.isoformat(), symbol))
+        await db.commit()
+
+
+async def stock_prices() -> dict:
+    await stocks_seed()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT symbol, price, prev_price FROM stocks") as cur:
+            return {r[0]: (r[1], r[2]) for r in await cur.fetchall() if r[0] in STOCKS}
+
+
+async def build_stocks_embed() -> discord.Embed:
+    prices = await stock_prices()
+    embed = discord.Embed(title="📈 Bolsa de valores", color=0x3498DB)
+    lines = []
+    for symbol, (name, base, _vol) in STOCKS.items():
+        price, prev = prices[symbol]
+        pct = (price - prev) / prev * 100 if prev else 0
+        arrow = "🟢▲" if pct > 0.05 else ("🔴▼" if pct < -0.05 else "⚪▬")
+        lines.append(f"`{symbol}` {name} — **{price:,}** 🪙 {arrow} {pct:+.1f}%")
+    embed.description = "\n".join(lines)
+    embed.set_footer(text=f"Los precios cambian cada {STOCK_TICK_SECONDS // 60} min · comisión de venta {STOCK_FEE_PCT}% · /bolsa comprar · vender · portafolio")
+    return embed
+
+
+async def build_portfolio_embed(user_id: str, username: str) -> discord.Embed:
+    prices = await stock_prices()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT symbol, shares, cost FROM portfolio WHERE user_id=? AND shares > 0", (user_id,)) as cur:
+            rows = await cur.fetchall()
+    embed = discord.Embed(title=f"💼 Portafolio de {username}", color=0x3498DB)
+    total_value = total_cost = 0
+    lines = []
+    for symbol, shares, cost in rows:
+        if symbol not in prices:
+            continue
+        value = shares * prices[symbol][0]
+        total_value += value
+        total_cost += cost
+        lines.append(f"`{symbol}` {shares:,} acciones · valor **{value:,}** 🪙 · {value - cost:+,}")
+    embed.description = "\n".join(lines) or "No tienes acciones. Compra con `/bolsa comprar`."
+    if lines:
+        embed.set_footer(text=f"Valor total {total_value:,} 🪙 · ganancia/pérdida {total_value - total_cost:+,} 🪙")
+    return embed
+
+
+async def stock_buy(user_id: str, username: str, symbol: str, shares_text: str) -> tuple:
+    symbol = symbol.upper().strip()
+    if symbol not in STOCKS:
+        return False, "Esa empresa no existe. Mira `/bolsa ver`."
+    await get_or_create_user(user_id, username)
+    price = (await stock_prices())[symbol][0]
+    balance = await get_balance(user_id)
+    shares = balance // price if shares_text.strip().lower() in ALL_WORDS else loan_parse_amount(shares_text)
+    if shares is None or shares <= 0:
+        return False, "Escribe cuántas acciones quieres (`10`, `all`)."
+    cost = price * shares
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (cost, user_id, cost))
+        if cur.rowcount == 0:
+            await db.rollback()
+            return False, f"**{shares:,}** acciones de `{symbol}` cuestan **{cost:,}** 🪙 y no te alcanza."
+        await db.execute(
+            "INSERT INTO portfolio (user_id, symbol, shares, cost) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id, symbol) DO UPDATE SET shares = shares + excluded.shares, cost = cost + excluded.cost",
+            (user_id, symbol, shares, cost))
+        await db.commit()
+    return True, f"📈 Compraste **{shares:,}** acciones de `{symbol}` a **{price:,}** 🪙 (total **{cost:,}** 🪙)."
+
+
+async def stock_sell(user_id: str, username: str, symbol: str, shares_text: str) -> tuple:
+    symbol = symbol.upper().strip()
+    if symbol not in STOCKS:
+        return False, "Esa empresa no existe. Mira `/bolsa ver`."
+    await get_or_create_user(user_id, username)
+    price = (await stock_prices())[symbol][0]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT shares, cost FROM portfolio WHERE user_id=? AND symbol=?", (user_id, symbol)) as cur:
+            row = await cur.fetchone()
+        owned, cost_total = row if row else (0, 0)
+        shares = owned if shares_text.strip().lower() in ALL_WORDS else loan_parse_amount(shares_text)
+        if shares is None or shares <= 0 or shares > owned:
+            await db.rollback()
+            return False, f"Tienes **{owned:,}** acciones de `{symbol}`."
+        gross = price * shares
+        fee = gross * STOCK_FEE_PCT // 100
+        net = gross - fee
+        cost_removed = cost_total * shares // owned
+        await db.execute("UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?", (net, MAX_BALANCE, user_id))
+        await db.execute("UPDATE portfolio SET shares = shares - ?, cost = cost - ? WHERE user_id=? AND symbol=?",
+                         (shares, cost_removed, user_id, symbol))
+        await db.execute("DELETE FROM portfolio WHERE user_id=? AND symbol=? AND shares <= 0", (user_id, symbol))
+        await db.commit()
+    profit = net - cost_removed
+    return True, (f"📉 Vendiste **{shares:,}** acciones de `{symbol}` a **{price:,}** 🪙 → recibes **{net:,}** 🪙 "
+                  f"(comisión {fee:,}). {'🟢 Ganancia' if profit >= 0 else '🔴 Pérdida'}: **{profit:+,}** 🪙.")
+
+
+async def stock_autocomplete(interaction: discord.Interaction, current: str):
+    t = current.lower()
+    return [app_commands.Choice(name=f"{s} — {n}"[:100], value=s) for s, (n, _b, _v) in STOCKS.items()
+            if not t or t in s.lower() or t in n.lower()][:25]
+
+
+bolsa_group = app_commands.Group(name="bolsa", description="Compra y vende acciones: compra barato, vende caro", guild_only=True)
+tree.add_command(bolsa_group)
+
+
+@bolsa_group.command(name="ver", description="Mira los precios de las acciones")
+async def bolsa_ver(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=await build_stocks_embed())
+
+
+@bolsa_group.command(name="comprar", description="Compra acciones")
+@app_commands.describe(empresa="Empresa", cantidad="Cuántas acciones (acepta all = todas las que alcances)")
+async def bolsa_comprar(interaction: discord.Interaction, empresa: str, cantidad: str):
+    ok, text = await stock_buy(str(interaction.user.id), interaction.user.name, empresa, cantidad)
+    await interaction.response.send_message(text if ok else f"❌ {text}", ephemeral=not ok)
+
+
+@bolsa_group.command(name="vender", description="Vende tus acciones")
+@app_commands.describe(empresa="Empresa", cantidad="Cuántas acciones (all = todas)")
+async def bolsa_vender(interaction: discord.Interaction, empresa: str, cantidad: str):
+    ok, text = await stock_sell(str(interaction.user.id), interaction.user.name, empresa, cantidad)
+    await interaction.response.send_message(text if ok else f"❌ {text}", ephemeral=not ok)
+
+
+@bolsa_group.command(name="portafolio", description="Mira tus acciones, su valor y tu ganancia")
+async def bolsa_portafolio(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=await build_portfolio_embed(str(interaction.user.id), interaction.user.display_name), ephemeral=True)
+
+
+bolsa_comprar.autocomplete("empresa")(stock_autocomplete)
+bolsa_vender.autocomplete("empresa")(stock_autocomplete)
+
+
+# ------------------------------------------------------------------ impuesto semanal a las fortunas
+def wealth_tax_amount(total: int) -> int:
+    tax = 0
+    brackets = list(WEALTH_TAX_BRACKETS)
+    for i, (threshold, pct) in enumerate(brackets):
+        upper = brackets[i + 1][0] if i + 1 < len(brackets) else None
+        if total <= threshold:
+            break
+        taxable = (min(total, upper) if upper else total) - threshold
+        tax += taxable * pct // 100
+    return tax
+
+
+async def wealth_tax_run() -> tuple:
+    """Cobra el impuesto a todos los que superan el primer tramo. Devuelve (pagadores, total)."""
+    first = WEALTH_TAX_BRACKETS[0][0]
+    payers, total_paid = 0, 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT user_id, balance, COALESCE(bank,0) FROM users WHERE balance + COALESCE(bank,0) > ?", (first,)) as cur:
+            rows = await cur.fetchall()
+        for user_id, balance, bank in rows:
+            tax = wealth_tax_amount(balance + bank)
+            from_wallet = min(tax, balance)
+            from_bank = min(tax - from_wallet, bank)
+            if from_wallet + from_bank <= 0:
+                continue
+            await db.execute("UPDATE users SET balance = balance - ?, bank = COALESCE(bank,0) - ? WHERE user_id=?",
+                             (from_wallet, from_bank, user_id))
+            payers += 1
+            total_paid += from_wallet + from_bank
+        await db.commit()
+    return payers, total_paid
+
+
+async def wealth_tax_check():
+    wk = week_key()
+    last = await setting_get("wealth_tax_week")
+    if last is None:
+        await setting_set("wealth_tax_week", wk)    # al instalarlo no se cobra de golpe
+        return
+    if last == wk:
+        return
+    await setting_set("wealth_tax_week", wk)
+    payers, total = await wealth_tax_run()
+    channel_id = await setting_get("top_channel")
+    if payers and channel_id:
+        channel = client.get_channel(int(channel_id))
+        if channel is not None:
+            try:
+                await channel.send(embed=discord.Embed(
+                    title="💸 Impuesto semanal a las fortunas", color=0xE67E22,
+                    description=f"**{payers}** jugador(es) pagaron **{total:,}** 🪙 en total.\n"
+                                f"Se cobra solo a quien supera **{WEALTH_TAX_BRACKETS[0][0]:,}** 🪙 (cartera + banco)."))
+            except discord.HTTPException:
+                pass
+
+
+# ------------------------------------------------------------------ recompensas
+async def bounty_place(placer_id: str, placer_name: str, target_id: str, target_name: str, amount_text: str) -> tuple:
+    if placer_id == target_id:
+        return False, "No puedes ponerte una recompensa a ti mismo."
+    await get_or_create_user(placer_id, placer_name)
+    await get_or_create_user(target_id, target_name)
+    balance = await get_balance(placer_id)
+    amount = parse_amount_or_all(amount_text, balance)
+    if amount is None or amount < BOUNTY_MIN:
+        return False, f"La recompensa mínima es **{BOUNTY_MIN:,}** 🪙."
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (amount, placer_id, amount))
+        if cur.rowcount == 0:
+            await db.rollback()
+            return False, f"No tienes **{amount:,}** 🪙."
+        await db.execute("INSERT INTO bounties (target_id, placer_id, amount, created_at) VALUES (?, ?, ?, ?)",
+                         (target_id, placer_id, amount, datetime.utcnow().isoformat()))
+        async with db.execute("SELECT SUM(amount) FROM bounties WHERE target_id=?", (target_id,)) as cur:
+            total = (await cur.fetchone())[0]
+        await db.commit()
+    return True, f"🎯 Pusiste **{amount:,}** 🪙 de recompensa por **{target_name}**. Total sobre su cabeza: **{total:,}** 🪙. Se la lleva quien le robe con `/rob`."
+
+
+async def bounty_claim(robber_id: str, victim_id: str) -> int:
+    """Quien roba con éxito a alguien con recompensa se la lleva completa."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT COALESCE(SUM(amount),0) FROM bounties WHERE target_id=?", (victim_id,)) as cur:
+            total = (await cur.fetchone())[0]
+        if total <= 0:
+            await db.rollback()
+            return 0
+        await db.execute("DELETE FROM bounties WHERE target_id=?", (victim_id,))
+        await db.execute("UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?", (total, MAX_BALANCE, robber_id))
+        await db.commit()
+    await feature_hook(robber_id, "bounty_claimed")
+    return total
+
+
+async def bounty_cancel(placer_id: str, bounty_id: int) -> tuple:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT amount FROM bounties WHERE id=? AND placer_id=?", (bounty_id, placer_id)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await db.rollback()
+            return False, "No encontré esa recompensa (o no es tuya)."
+        refund = row[0] * BOUNTY_CANCEL_REFUND_PCT // 100
+        await db.execute("DELETE FROM bounties WHERE id=?", (bounty_id,))
+        await db.execute("UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?", (refund, MAX_BALANCE, placer_id))
+        await db.commit()
+    return True, f"↩️ Recompensa cancelada. Te devolví **{refund:,}** 🪙 ({BOUNTY_CANCEL_REFUND_PCT}%)."
+
+
+async def build_bounty_embed(user_id: str) -> discord.Embed:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT b.target_id, COALESCE(u.username, b.target_id), SUM(b.amount) FROM bounties b "
+            "LEFT JOIN users u ON u.user_id = b.target_id GROUP BY b.target_id ORDER BY SUM(b.amount) DESC LIMIT 10") as cur:
+            top = await cur.fetchall()
+        async with db.execute("SELECT id, target_id, amount FROM bounties WHERE placer_id=? ORDER BY id DESC LIMIT 10", (user_id,)) as cur:
+            mine = await cur.fetchall()
+    embed = discord.Embed(title="🎯 Recompensas", color=0xE74C3C)
+    embed.description = "\n".join(f"• <@{tid}> (**{name}**) — **{total:,}** 🪙" for tid, name, total in top) or "No hay recompensas activas."
+    if mine:
+        embed.add_field(name="Las que pusiste (para cancelar: /recompensa cancelar)",
+                        value="\n".join(f"`#{i}` <@{t}> — {a:,} 🪙" for i, t, a in mine), inline=False)
+    embed.set_footer(text="Se cobra robando con éxito a esa persona (/rob)")
+    return embed
+
+
+recompensa_group = app_commands.Group(name="recompensa", description="Pon precio a la cabeza de alguien: quien lo robe se lleva el dinero", guild_only=True)
+tree.add_command(recompensa_group)
+
+
+@recompensa_group.command(name="poner", description="Pon una recompensa por un jugador")
+@app_commands.describe(usuario="Jugador al que le pones precio", cantidad="Monedas de recompensa (acepta 5m, 500k)")
+async def recompensa_poner(interaction: discord.Interaction, usuario: discord.Member, cantidad: str):
+    if usuario.bot:
+        await interaction.response.send_message("❌ No puedes poner recompensa a un bot.", ephemeral=True)
+        return
+    ok, text = await bounty_place(str(interaction.user.id), interaction.user.name, str(usuario.id), usuario.display_name, cantidad)
+    await interaction.response.send_message(text if ok else f"❌ {text}", ephemeral=not ok)
+
+
+@recompensa_group.command(name="lista", description="Mira las recompensas activas")
+async def recompensa_lista(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=await build_bounty_embed(str(interaction.user.id)))
+
+
+@recompensa_group.command(name="cancelar", description="Cancela una recompensa tuya (recuperas el 80%)")
+@app_commands.describe(numero="Número de la recompensa (míralo en /recompensa lista)")
+async def recompensa_cancelar(interaction: discord.Interaction, numero: int):
+    ok, text = await bounty_cancel(str(interaction.user.id), numero)
+    await interaction.response.send_message(text if ok else f"❌ {text}", ephemeral=not ok)
+
+
+# ------------------------------------------------------------------ temporadas mensuales
+def season_key(dt: datetime | None = None) -> str:
+    return (dt or datetime.utcnow()).strftime("%Y-%m")
+
+
+def next_month_start(dt: datetime | None = None) -> datetime:
+    dt = dt or datetime.utcnow()
+    return datetime(dt.year + (dt.month == 12), dt.month % 12 + 1, 1)
+
+
+def season_label(key: str) -> str:
+    year, month = key.split("-")
+    return f"{_MONTHS_ES[int(month) - 1].capitalize()} {year}"
+
+
+async def season_snapshot_ensure(key: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM season_snapshot WHERE season_key=? LIMIT 1", (key,)) as cur:
+            if await cur.fetchone():
+                return
+    worths = await compute_networths()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executemany("INSERT OR IGNORE INTO season_snapshot (season_key, user_id, networth) VALUES (?, ?, ?)",
+                             [(key, uid, worth) for uid, (_n, worth) in worths.items()])
+        await db.commit()
+
+
+async def season_standings(key: str) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id, networth FROM season_snapshot WHERE season_key=?", (key,)) as cur:
+            base = dict(await cur.fetchall())
+    if not base:
+        return []
+    worths = await compute_networths()
+    out = [(uid, name, worth - base.get(uid, 1000)) for uid, (name, worth) in worths.items()]
+    out.sort(key=lambda x: x[2], reverse=True)
+    return out
+
+
+async def season_rollover_check():
+    current = season_key()
+    last = await setting_get("season_key")
+    if last is None:
+        await setting_set("season_key", current)
+        await season_snapshot_ensure(current)
+        return
+    if last == current:
+        await season_snapshot_ensure(current)
+        return
+    standings = await season_standings(last)
+    winners = [(u, n, g) for u, n, g in standings[:len(SEASON_PRIZES)] if g > 0]
+    medals = ("🥇", "🥈", "🥉")
+    titles = ("Campeón", "Subcampeón", "Tercer lugar")
+    lines = []
+    for i, (uid, name, gain) in enumerate(winners):
+        await update_balance(uid, SEASON_PRIZES[i])
+        title = f"{medals[i]} {titles[i]} de {season_label(last)}"
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT OR REPLACE INTO season_titles (user_id, season_key, title) VALUES (?, ?, ?)", (uid, last, title))
+            await db.commit()
+        lines.append(f"{medals[i]} <@{uid}> — {gain:+,} 🪙 · premio **{SEASON_PRIZES[i]:,}** 🪙 · título «{title}»")
+        await _dm_user(uid, f"🏆 Terminó la temporada de **{season_label(last)}** y quedaste #{i + 1}. Ganaste **{SEASON_PRIZES[i]:,}** 🪙 y el título «{title}».")
+    await setting_set("season_key", current)
+    await season_snapshot_ensure(current)
+    channel_id = await setting_get("top_channel")
+    if lines and channel_id:
+        channel = client.get_channel(int(channel_id))
+        if channel is not None:
+            try:
+                await channel.send(embed=discord.Embed(title=f"🏆 ¡Terminó la temporada de {season_label(last)}!",
+                                                       description="\n".join(lines), color=0xFFD700))
+            except discord.HTTPException:
+                pass
+
+
+async def build_season_embed(viewer_id: str | None = None) -> discord.Embed:
+    key = season_key()
+    await season_snapshot_ensure(key)
+    standings = await season_standings(key)
+    medals = ["🥇", "🥈", "🥉"]
+    embed = discord.Embed(title=f"🏆 Temporada de {season_label(key)}", color=0xFFD700)
+    lines = []
+    for i, (uid, name, gain) in enumerate(standings[:10]):
+        if gain <= 0:
+            break
+        lines.append(f"{medals[i] if i < 3 else f'**#{i + 1}**'} **{name}** — {gain:+,} 🪙")
+    embed.description = "\n".join(lines) or "Nadie ha ganado monedas esta temporada todavía."
+    embed.add_field(name="🎁 Premios + título", value="\n".join(f"{medals[i]} {p:,} 🪙" for i, p in enumerate(SEASON_PRIZES)), inline=True)
+    embed.add_field(name="⏳ Termina", value=f"<t:{_loan_ts(next_month_start().isoformat())}:R>", inline=True)
+    if viewer_id:
+        for i, (uid, _n, gain) in enumerate(standings):
+            if uid == viewer_id:
+                embed.set_footer(text=f"Tu posición: #{i + 1} · {gain:+,} 🪙 esta temporada")
+                break
+    return embed
+
+
+@tree.command(name="temporada", description="Ranking mensual con premios y títulos para los 3 primeros")
+async def temporada_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+    await interaction.followup.send(embed=await build_season_embed(str(interaction.user.id)))
+
+
+# ------------------------------------------------------------------ prestigio (comando)
+@tree.command(name="prestigio", description="Reinicia tu dinero a cambio de un bonus permanente")
+@app_commands.describe(confirmar="Pon True para confirmar el prestigio")
+async def prestigio_command(interaction: discord.Interaction, confirmar: bool = False):
+    ok, embed = await prestige_do(str(interaction.user.id), interaction.user.name, confirmar)
+    await interaction.response.send_message(embed=embed, ephemeral=not ok)
+
+
+# ------------------------------------------------------------------ /perfil
+async def build_profile_embed(member) -> discord.Embed:
+    user_id = str(member.id)
+    await get_or_create_user(user_id, member.name)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT balance, COALESCE(bank,0) FROM users WHERE user_id=?", (user_id,)) as cur:
+            balance, bank = await cur.fetchone()
+        async with db.execute("SELECT COUNT(*) FROM achievements WHERE user_id=?", (user_id,)) as cur:
+            ach_count = (await cur.fetchone())[0]
+        async with db.execute("SELECT key FROM achievements WHERE user_id=? ORDER BY unlocked_at DESC LIMIT 3", (user_id,)) as cur:
+            ach_last = [r[0] for r in await cur.fetchall()]
+        async with db.execute("SELECT title FROM season_titles WHERE user_id=? ORDER BY season_key DESC LIMIT 3", (user_id,)) as cur:
+            titles = [r[0] for r in await cur.fetchall()]
+        async with db.execute("SELECT fighter_id FROM fighters WHERE user_id=?", (user_id,)) as cur:
+            frow = await cur.fetchone()
+    level = await prestige_level(user_id)
+    prices = await stock_prices()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT symbol, shares FROM portfolio WHERE user_id=? AND shares > 0", (user_id,)) as cur:
+            portfolio_value = sum(s * prices[sym][0] for sym, s in await cur.fetchall() if sym in prices)
+    businesses = await user_businesses(user_id)
+    income = sum(biz_income(b, lv) for b, (lv, _l) in businesses.items())
+    clan = await clan_of(user_id)
+    embed = discord.Embed(title=f"🪪 Perfil de {member.display_name}" + (f"  ⭐{level}" if level else ""), color=0x9B59B6)
+    avatar = getattr(getattr(member, "display_avatar", None), "url", None)
+    if avatar:
+        embed.set_thumbnail(url=avatar)
+    embed.add_field(name="💰 Cartera", value=f"{balance:,} 🪙", inline=True)
+    embed.add_field(name="🏦 Banco", value=f"{bank:,} 🪙", inline=True)
+    embed.add_field(name="📊 Total", value=f"{balance + bank:,} 🪙", inline=True)
+    if level:
+        embed.add_field(name="⭐ Prestigio", value=f"Nivel **{level}** (+{PRESTIGE_BONUS_PCT * level}% en ganancias)", inline=True)
+    embed.add_field(name="🛡️ Clan", value=(f"**{clan['name']}**" + (" 👑" if clan["owner_id"] == user_id else "")) if clan else "Sin clan", inline=True)
+    fighter = FIGHTERS.get(frow[0], {}).get("name") if frow and frow[0] else None
+    embed.add_field(name="🥊 Luchador", value=fighter or "Sin luchador", inline=True)
+    embed.add_field(name="🏪 Negocios", value=f"{len(businesses)} · {income:,} 🪙/h" if businesses else "Ninguno", inline=True)
+    if portfolio_value:
+        embed.add_field(name="📈 Acciones", value=f"{portfolio_value:,} 🪙", inline=True)
+    badges = " ".join(ACHIEVEMENTS[k]["name"].split(" ")[0] for k in ach_last if k in ACHIEVEMENTS)
+    embed.add_field(name="🏅 Logros", value=f"{ach_count}/{len(ACHIEVEMENTS)} {badges}", inline=True)
+    if titles:
+        embed.add_field(name="🏆 Títulos", value="\n".join(titles), inline=False)
+    remaining = await jail_remaining(user_id)
+    if remaining is not None:
+        embed.add_field(name="🔒 Cárcel", value=f"Le faltan {_fmt_dur(remaining.total_seconds())}", inline=False)
+    tax = wealth_tax_amount(balance + bank)
+    if tax:
+        embed.set_footer(text=f"Impuesto semanal estimado a tu fortuna: {tax:,} 🪙")
+    return embed
+
+
+@tree.command(name="perfil", description="Tarjeta con tu dinero, clan, luchador, logros y más")
+@app_commands.describe(usuario="Jugador (opcional)")
+async def perfil_command(interaction: discord.Interaction, usuario: _LoanOptional[discord.Member] = None):
+    await interaction.response.defer()
+    await interaction.followup.send(embed=await build_profile_embed(usuario or interaction.user))
+
+
+# =====================================================================
+#  EXTRAS V3 (3/3): trivia · rasca y gana · bingo · pesca y minería · atraco en grupo · subastas
+# =====================================================================
+TRIVIA_PRIZE_MIN = 25_000
+TRIVIA_PRIZE_MAX = 150_000
+TRIVIA_SECONDS = 20
+TRIVIA_COOLDOWN_SECONDS = 120
+FISH_COOLDOWN_SECONDS = 120
+MINE_COOLDOWN_SECONDS = 120
+BINGO_MIN_PRICE = 1_000
+BINGO_LOBBY_SECONDS = 45
+BINGO_DRAW_SECONDS = 3
+BINGO_FEE_PCT = 5
+HEIST_MIN_PLAYERS = 2
+HEIST_MAX_PLAYERS = 6
+HEIST_LOBBY_SECONDS = 45
+HEIST_COOLDOWN_HOURS = 6
+HEIST_REWARD_MIN = 20_000_000
+HEIST_REWARD_MAX = 60_000_000
+HEIST_FINE_PCT = 10
+AUCTION_FEE_PCT = 5
+AUCTION_MIN_STEP_PCT = 5
+AUCTION_ANTISNIPE_SECONDS = 60
+
+TRIVIA_QUESTIONS = [
+    ("¿Cuál es el planeta más grande del sistema solar?", ["Júpiter", "Saturno", "Neptuno", "Marte"], 0),
+    ("¿Cuántos jugadores de campo tiene un equipo de fútbol en la cancha?", ["11", "9", "10", "12"], 0),
+    ("¿En qué continente está Egipto?", ["África", "Asia", "Europa", "Oceanía"], 0),
+    ("¿Cuál es el océano más grande del mundo?", ["Pacífico", "Atlántico", "Índico", "Ártico"], 0),
+    ("¿Quién pintó la Mona Lisa?", ["Leonardo da Vinci", "Miguel Ángel", "Picasso", "Van Gogh"], 0),
+    ("¿Qué metal es líquido a temperatura ambiente?", ["Mercurio", "Plomo", "Aluminio", "Cobre"], 0),
+    ("¿Cuántos lados tiene un hexágono?", ["6", "5", "7", "8"], 0),
+    ("¿Cuál es la capital de Japón?", ["Tokio", "Kioto", "Osaka", "Seúl"], 0),
+    ("¿En qué año llegó el ser humano a la Luna por primera vez?", ["1969", "1959", "1975", "1981"], 0),
+    ("¿Cuál es el animal terrestre más rápido?", ["Guepardo", "León", "Caballo", "Antílope"], 0),
+    ("¿Cuántos colores tiene el arcoíris?", ["7", "6", "8", "5"], 0),
+    ("¿Qué gas necesitamos respirar para vivir?", ["Oxígeno", "Nitrógeno", "Helio", "Hidrógeno"], 0),
+    ("¿Cuál es la capital de Argentina?", ["Buenos Aires", "Córdoba", "Rosario", "Montevideo"], 0),
+    ("¿Cuántos huesos tiene un cuerpo humano adulto?", ["206", "180", "250", "300"], 0),
+    ("¿Quién escribió «Don Quijote de la Mancha»?", ["Miguel de Cervantes", "Lope de Vega", "Gabriel García Márquez", "Pablo Neruda"], 0),
+    ("¿Qué río atraviesa la ciudad de París?", ["El Sena", "El Támesis", "El Rin", "El Danubio"], 0),
+    ("¿Cuál es el país más grande del mundo por superficie?", ["Rusia", "Canadá", "China", "Estados Unidos"], 0),
+    ("¿Cuántos minutos hay en una hora y media?", ["90", "80", "100", "75"], 0),
+    ("¿Qué planeta es conocido como el planeta rojo?", ["Marte", "Venus", "Mercurio", "Júpiter"], 0),
+    ("¿Cuál es el símbolo químico del oro?", ["Au", "Ag", "Or", "Go"], 0),
+    ("¿En qué deporte se usa una raqueta y una pelota amarilla sobre una red?", ["Tenis", "Béisbol", "Golf", "Críquet"], 0),
+    ("¿Cuántas cartas tiene una baraja inglesa sin comodines?", ["52", "48", "40", "54"], 0),
+    ("En el blackjack, ¿cuánto vale la figura K?", ["10", "11", "13", "12"], 0),
+    ("¿Cuál es el número más alto de una ruleta europea?", ["36", "37", "38", "40"], 0),
+    ("¿Cuál es la capital de España?", ["Madrid", "Barcelona", "Sevilla", "Valencia"], 0),
+    ("¿Quién creó el videojuego Minecraft?", ["Markus «Notch» Persson", "Hideo Kojima", "Shigeru Miyamoto", "Gabe Newell"], 0),
+    ("¿Cómo se llama el hermano de Mario en los videojuegos?", ["Luigi", "Wario", "Yoshi", "Toad"], 0),
+    ("¿Qué personaje de videojuegos es un erizo azul muy veloz?", ["Sonic", "Knuckles", "Tails", "Shadow"], 0),
+    ("¿Cuántos jugadores de un equipo de baloncesto juegan a la vez en la cancha?", ["5", "6", "7", "11"], 0),
+    ("¿Cuál es el hueso más largo del cuerpo humano?", ["Fémur", "Húmero", "Tibia", "Columna"], 0),
+    ("¿Qué instrumento musical tiene 88 teclas?", ["Piano", "Órgano", "Acordeón", "Guitarra"], 0),
+    ("¿En qué país está la Torre Eiffel?", ["Francia", "Italia", "Bélgica", "Suiza"], 0),
+    ("¿Cuánto es 12 × 12?", ["144", "124", "122", "154"], 0),
+    ("¿Qué planeta es famoso por sus anillos?", ["Saturno", "Marte", "Venus", "Mercurio"], 0),
+    ("¿Cuál es el idioma oficial de Brasil?", ["Portugués", "Español", "Inglés", "Francés"], 0),
+    ("¿Cuántos días tiene un año bisiesto?", ["366", "365", "364", "367"], 0),
+    ("¿Qué órgano bombea la sangre por el cuerpo?", ["El corazón", "El hígado", "El pulmón", "El riñón"], 0),
+    ("¿Cuál es el mamífero más grande del mundo?", ["Ballena azul", "Elefante", "Tiburón ballena", "Jirafa"], 0),
+    ("¿Cuál es el ingrediente principal del guacamole?", ["Aguacate", "Tomate", "Pepino", "Limón"], 0),
+]
+
+_RASCA_PRIZES = (("🍒", 2, 0.12), ("🍋", 3, 0.07), ("🔔", 5, 0.04), ("💎", 10, 0.015), ("7️⃣", 25, 0.004), ("👑", 100, 0.0005))
+_RASCA_FILLERS = ("💣", "🍀")
+
+LOOT_TABLES = {   # tipo: [(clave, nombre, valor, peso)]
+    "pesca": [("bota", "🥾 Bota vieja", 500, 30), ("sardina", "🐟 Sardina", 3_000, 25), ("trucha", "🐠 Trucha", 12_000, 18),
+              ("salmon", "🍣 Salmón", 40_000, 12), ("pulpo", "🐙 Pulpo", 120_000, 8),
+              ("cofre", "🧰 Cofre del tesoro", 1_500_000, 1.8), ("perla", "🦪 Perla negra", 25_000_000, 0.2)],
+    "mineria": [("piedra", "🪨 Piedra", 500, 30), ("carbon", "⚫ Carbón", 3_000, 25), ("hierro", "🔩 Hierro", 12_000, 18),
+                ("pepita", "🟡 Pepita de oro", 40_000, 12), ("rubi", "♦️ Rubí", 120_000, 8),
+                ("diamante", "💎 Diamante", 1_500_000, 1.8), ("cristal", "🔮 Cristal ancestral", 25_000_000, 0.2)],
+}
+LOOT_ITEMS = {key: (name, value) for table in LOOT_TABLES.values() for key, name, value, _w in table}
+
+_trivia_active: dict = {}
+_bingo_active: dict = {}
+_heist_active: dict = {}
+
+
+def _rarity(weight: float) -> str:
+    return "🌟 **LEGENDARIO**" if weight < 1 else ("💜 **Épico**" if weight < 3 else ("💙 Raro" if weight < 10 else "⚪ Común"))
+
+
+# ------------------------------------------------------------------ trivia
+class TriviaButton(discord.ui.Button):
+    def __init__(self, index: int, text: str):
+        super().__init__(label=f"{'ABCD'[index]}) {text}"[:80], style=discord.ButtonStyle.primary, row=index // 2)
+        self.index = index
+
+    async def callback(self, interaction: discord.Interaction):
+        view: TriviaView = self.view
+        uid = str(interaction.user.id)
+        if view.closed:
+            await interaction.response.send_message("⏰ Esta pregunta ya terminó.", ephemeral=True)
+            return
+        if uid in view.answers:
+            await interaction.response.send_message("Ya respondiste esta pregunta.", ephemeral=True)
+            return
+        view.answers[uid] = (self.index, _time.time())
+        await interaction.response.send_message("✅ Respuesta guardada. ¡Suerte!", ephemeral=True)
+
+
+class TriviaView(GuildView):
+    def __init__(self, channel_id: int, question: str, options: list, correct: int):
+        super().__init__(timeout=None)
+        self.channel_id, self.question, self.options, self.correct = channel_id, question, options, correct
+        self.answers: dict = {}
+        self.closed = False
+        self.message = None
+        self.prize = random.randint(TRIVIA_PRIZE_MIN, max(TRIVIA_PRIZE_MIN, TRIVIA_PRIZE_MAX))
+        for i, option in enumerate(options):
+            self.add_item(TriviaButton(i, option))
+
+    def make_embed(self, result: str | None = None) -> discord.Embed:
+        embed = discord.Embed(title="🧠 Trivia", color=0x3498DB if result is None else 0x2ECC71)
+        embed.description = f"**{self.question}**\n\n" + (result or
+            f"⏳ Tienes **{TRIVIA_SECONDS}** segundos.\n🎁 Premio: **{self.prize:,}** 🪙 por respuesta correcta (¡**x2** para el más rápido!)")
+        return embed
+
+    async def run(self):
+        await asyncio.sleep(TRIVIA_SECONDS)
+        self.closed = True
+        _trivia_active.pop(self.channel_id, None)
+        winners = sorted(((t, uid) for uid, (idx, t) in self.answers.items() if idx == self.correct))
+        lines = []
+        for rank, (_t, uid) in enumerate(winners):
+            prize = self.prize * (2 if rank == 0 else 1)
+            await update_balance(uid, prize)
+            await feature_hook(uid, "trivia_won")
+            lines.append(f"{'⚡' if rank == 0 else '✅'} <@{uid}> +**{prize:,}** 🪙")
+        correct_text = self.options[self.correct]
+        result = f"✔️ Respuesta correcta: **{'ABCD'[self.correct]}) {correct_text}**\n\n" + ("\n".join(lines[:15]) or "Nadie acertó. 😅")
+        for child in self.children:
+            child.disabled = True
+        self.stop()
+        if self.message is not None:
+            try:
+                await self.message.edit(embed=self.make_embed(result), view=self)
+            except discord.HTTPException:
+                pass
+
+
+async def trivia_prepare(user_id: str, username: str, channel_id: int) -> tuple:
+    await get_or_create_user(user_id, username)
+    if channel_id in _trivia_active:
+        return "Ya hay una trivia en marcha en este canal.", None
+    left = await activity_cooldown(user_id, "trivia", TRIVIA_COOLDOWN_SECONDS)
+    if left:
+        return f"Espera **{_fmt_secs(left)}** para empezar otra trivia.", None
+    question, options, correct = random.choice(TRIVIA_QUESTIONS)
+    order = list(range(4))
+    random.shuffle(order)
+    view = TriviaView(channel_id, question, [options[i] for i in order], order.index(correct))
+    _trivia_active[channel_id] = view
+    return None, view
+
+
+# ------------------------------------------------------------------ rasca y gana
+def rasca_generate() -> tuple:
+    """Devuelve (9 casillas, símbolo ganador o None, multiplicador). RTP ≈ 95%."""
+    roll, cumulative, win = random.random(), 0.0, None
+    for symbol, mult, chance in _RASCA_PRIZES:
+        cumulative += chance
+        if roll < cumulative:
+            win = (symbol, mult)
+            break
+    symbols = [s for s, _m, _c in _RASCA_PRIZES] + list(_RASCA_FILLERS)
+    if win:
+        cells = [win[0]] * 3 + random.sample([s for s in symbols if s != win[0]] * 2, 6)
+    else:
+        cells = random.sample(symbols * 2, 9)      # ningún símbolo aparece 3 veces
+    random.shuffle(cells)
+    return cells, (win[0] if win else None), (win[1] if win else 0)
+
+
+class RascaCell(discord.ui.Button):
+    def __init__(self, idx: int):
+        super().__init__(emoji="🪙", style=discord.ButtonStyle.secondary, row=idx // 3)
+        self.idx = idx
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.scratch(interaction, self.idx)
+
+
+class RascaAllButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Rascar todo", emoji="✨", style=discord.ButtonStyle.success, row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.scratch(interaction, None)
+
+
+class RascaView(GuildView):
+    def __init__(self, user_id: str, bet: int):
+        super().__init__(timeout=120)
+        self.user_id, self.bet = user_id, bet
+        self.cells, self.win, self.mult = rasca_generate()
+        self.revealed: set = set()
+        self.finished = False
+        self.message = None
+        self.tiles = [RascaCell(i) for i in range(9)]
+        for tile in self.tiles:
+            self.add_item(tile)
+        self.add_item(RascaAllButton())
+
+    def make_embed(self, result: str | None = None) -> discord.Embed:
+        embed = discord.Embed(title="🎟️ Rasca y gana", color=0xF1C40F if result is None else (0x2ECC71 if self.win else 0xED4245))
+        embed.description = (result or f"💵 Apuesta: **{self.bet:,}** 🪙\nRasca las casillas: **3 símbolos iguales** ganan.\n"
+                             "Premios: 🍒x2 🍋x3 🔔x5 💎x10 7️⃣x25 👑x100")
+        return embed
+
+    async def scratch(self, interaction: discord.Interaction, idx: int | None):
+        if self.finished:
+            await interaction.response.defer()
+            return
+        targets = range(9) if idx is None else [idx]
+        for i in targets:
+            self.revealed.add(i)
+            tile = self.tiles[i]
+            tile.emoji, tile.disabled = self.cells[i], True
+            tile.style = discord.ButtonStyle.success if self.win and self.cells[i] == self.win else discord.ButtonStyle.secondary
+        if len(self.revealed) >= 9:
+            await self._settle(interaction)
+            return
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    async def _settle(self, interaction: discord.Interaction | None):
+        self.finished = True
+        payout = int(self.bet * self.mult) if self.win else 0
+        if payout:
+            await update_balance(self.user_id, payout)
+        await log_bet(self.user_id, "🎟️ Rasca y gana", self.bet, payout - self.bet)
+        if self.win and self.mult >= 25:
+            asyncio.create_task(celebrate(self.user_id, f"sacó **3 {self.win}** en el rasca y gana (x{self.mult})", f"Premio: {payout:,} 🪙"))
+        for tile in self.tiles:
+            tile.disabled = True
+        self.children[-1].disabled = True
+        self.stop()
+        result = (f"🎉 ¡**3 {self.win}**! Ganaste **{payout:,}** 🪙 (x{self.mult})" if self.win
+                  else f"😅 Sin premio esta vez. Perdiste **{self.bet:,}** 🪙")
+        if interaction is not None:
+            await interaction.response.edit_message(embed=self.make_embed(result), view=self)
+        elif self.message is not None:
+            try:
+                await self.message.edit(embed=self.make_embed(result), view=self)
+            except discord.HTTPException:
+                pass
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("❌ Este cartón no es tuyo.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        if not self.finished:
+            for i in range(9):
+                self.tiles[i].emoji = self.cells[i]
+            await self._settle(None)
+
+
+async def rasca_create(user_id: str, username: str, bet_text: str) -> tuple:
+    await get_or_create_user(user_id, username)
+    balance = await get_balance(user_id)
+    bet = parse_amount_or_all(bet_text, balance)
+    if bet is None or bet <= 0:
+        return "Escribe una apuesta válida (`all`, `5m`, `500k`...).", None
+    if bet > balance:
+        return f"Tienes **{balance:,}** 🪙 y quieres apostar **{bet:,}** 🪙.", None
+    await update_balance(user_id, -bet)
+    await track_mission(user_id, "rasca_played")
+    return None, RascaView(user_id, bet)
+
+
+# ------------------------------------------------------------------ bingo
+class BingoJoinButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Comprar cartón", emoji="🎟️", style=discord.ButtonStyle.success, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.join(interaction)
+
+
+class BingoCardButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Mi cartón", emoji="🔢", style=discord.ButtonStyle.secondary, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: BingoView = self.view
+        card = view.players.get(str(interaction.user.id))
+        if card is None:
+            await interaction.response.send_message("No tienes cartón. Compra uno mientras el bingo está abierto.", ephemeral=True)
+            return
+        marks = " ".join(f"**{n}**✅" if n in view.drawn else f"{n}" for n in card)
+        await interaction.response.send_message(f"🔢 Tu cartón: {marks}", ephemeral=True)
+
+
+class BingoView(GuildView):
+    def __init__(self, channel_id: int, host_id: str, price: int):
+        super().__init__(timeout=None)
+        self.channel_id, self.host_id, self.price = channel_id, host_id, price
+        self.players: dict = {}
+        self.drawn: list = []
+        self.state = "lobby"
+        self.message = None
+        self.add_item(BingoJoinButton())
+        self.add_item(BingoCardButton())
+
+    def pot(self) -> int:
+        return self.price * len(self.players)
+
+    def make_embed(self, footer: str | None = None) -> discord.Embed:
+        embed = discord.Embed(title="🎱 Bingo", color=0x9B59B6)
+        lines = [f"🎟️ Cartón: **{self.price:,}** 🪙 · 👥 Jugadores: **{len(self.players)}** · 💰 Pozo: **{self.pot():,}** 🪙"]
+        if self.state == "lobby":
+            lines.append(f"Compra tu cartón: tiene 5 números del 1 al 30. Empieza en {BINGO_LOBBY_SECONDS}s. Gana quien complete su cartón primero.")
+        if self.drawn:
+            lines.append(f"\n🎱 Última bola: **{self.drawn[-1]}**\nSalieron ({len(self.drawn)}): " + ", ".join(str(n) for n in self.drawn[-12:]))
+        embed.description = "\n".join(lines)
+        if footer:
+            embed.set_footer(text=footer)
+        return embed
+
+    async def join(self, interaction: discord.Interaction):
+        uid = str(interaction.user.id)
+        if self.state != "lobby":
+            await interaction.response.send_message("El bingo ya empezó.", ephemeral=True)
+            return
+        if uid in self.players:
+            await interaction.response.send_message("Ya tienes cartón.", ephemeral=True)
+            return
+        await get_or_create_user(uid, interaction.user.name)
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (self.price, uid, self.price))
+            await db.commit()
+        if cur.rowcount == 0:
+            await interaction.response.send_message(f"❌ El cartón cuesta **{self.price:,}** 🪙 y no te alcanza.", ephemeral=True)
+            return
+        self.players[uid] = sorted(random.sample(range(1, 31), 5))
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    async def run(self):
+        await asyncio.sleep(BINGO_LOBBY_SECONDS)
+        if len(self.players) < 2:
+            for uid in self.players:
+                await update_balance(uid, self.price)
+            self.state = "cancelled"
+            _bingo_active.pop(self.channel_id, None)
+            self.stop()
+            if self.message is not None:
+                try:
+                    await self.message.edit(embed=discord.Embed(title="🎱 Bingo cancelado", color=0x95A5A6,
+                                            description="Hacen falta al menos 2 jugadores. Se devolvieron los cartones."), view=None)
+                except discord.HTTPException:
+                    pass
+            return
+        self.state = "playing"
+        self.remove_item(self.children[0])
+        balls = list(range(1, 31))
+        random.shuffle(balls)
+        winners: list = []
+        for ball in balls:
+            self.drawn.append(ball)
+            winners = [uid for uid, card in self.players.items() if all(n in self.drawn for n in card)]
+            if self.message is not None:
+                try:
+                    await self.message.edit(embed=self.make_embed(), view=self)
+                except discord.HTTPException:
+                    pass
+            if winners:
+                break
+            await asyncio.sleep(BINGO_DRAW_SECONDS)
+        prize = self.pot() * (100 - BINGO_FEE_PCT) // 100
+        share, extra = divmod(prize, len(winners))
+        for i, uid in enumerate(winners):
+            await update_balance(uid, share + (extra if i == 0 else 0))
+            await feature_hook(uid, "bingo_won")
+        self.state = "done"
+        _bingo_active.pop(self.channel_id, None)
+        self.stop()
+        if len(winners) == 1:
+            asyncio.create_task(celebrate(winners[0], f"ganó el **bingo** 🎱", f"Premio: {prize:,} 🪙"))
+        if self.message is not None:
+            embed = self.make_embed()
+            embed.title = "🎱 ¡BINGO!"
+            embed.color = 0x2ECC71
+            embed.description += "\n\n🏆 " + ", ".join(f"<@{u}>" for u in winners) + f" — **{share:,}** 🪙 cada uno"
+            try:
+                await self.message.edit(embed=embed, view=None)
+            except discord.HTTPException:
+                pass
+
+
+async def bingo_prepare(host_id: str, host_name: str, price_text: str, channel_id: int) -> tuple:
+    await get_or_create_user(host_id, host_name)
+    if channel_id in _bingo_active:
+        return "Ya hay un bingo en marcha en este canal.", None
+    price = loan_parse_amount(price_text) if price_text else BINGO_MIN_PRICE
+    if price is None or price < BINGO_MIN_PRICE:
+        return f"El cartón debe costar al menos **{BINGO_MIN_PRICE:,}** 🪙.", None
+    view = BingoView(channel_id, host_id, price)
+    _bingo_active[channel_id] = view
+    return None, view
+
+
+# ------------------------------------------------------------------ pesca y minería
+def loot_roll(kind: str) -> tuple:
+    table = LOOT_TABLES[kind]
+    key, name, value, weight = random.choices(table, weights=[w for *_x, w in table])[0]
+    return key, name, value, weight
+
+
+async def gather(user_id: str, username: str, kind: str) -> discord.Embed:
+    await get_or_create_user(user_id, username)
+    seconds = FISH_COOLDOWN_SECONDS if kind == "pesca" else MINE_COOLDOWN_SECONDS
+    left = await activity_cooldown(user_id, kind, seconds)
+    verb = "pescar" if kind == "pesca" else "minar"
+    if left:
+        return _err_embed("Aún no", f"Descansa **{_fmt_secs(left)}** antes de volver a {verb}.")
+    key, name, value, weight = loot_roll(kind)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO loot (user_id, item, qty) VALUES (?, ?, 1) "
+                         "ON CONFLICT(user_id, item) DO UPDATE SET qty = qty + 1", (user_id, key))
+        await db.commit()
+    await feature_hook(user_id, "fished" if kind == "pesca" else "mined")
+    if weight < 1:
+        asyncio.create_task(celebrate(user_id, f"consiguió **{name}** {'pescando' if kind == 'pesca' else 'minando'} 🌟", f"Vale {value:,} 🪙"))
+    embed = discord.Embed(title=("🎣 ¡Pescaste algo!" if kind == "pesca" else "⛏️ ¡Encontraste algo!"), color=0x1ABC9C,
+                          description=f"Conseguiste **{name}**\n{_rarity(weight)} · vale **{value:,}** 🪙\n\nGuárdalo en tu mochila (`/diversion mochila`) y véndelo cuando quieras.")
+    return embed
+
+
+async def backpack_items(user_id: str) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT item, qty FROM loot WHERE user_id=? AND qty > 0", (user_id,)) as cur:
+            return [(k, q) for k, q in await cur.fetchall() if k in LOOT_ITEMS]
+
+
+async def build_backpack_embed(user_id: str) -> discord.Embed:
+    items = await backpack_items(user_id)
+    embed = discord.Embed(title="🎒 Mochila", color=0xE67E22)
+    total = sum(LOOT_ITEMS[k][1] * q for k, q in items)
+    embed.description = "\n".join(f"{LOOT_ITEMS[k][0]} ×{q} — {LOOT_ITEMS[k][1] * q:,} 🪙" for k, q in items) or "Tu mochila está vacía. Usa `/diversion pescar` o `/diversion minar`."
+    if items:
+        embed.set_footer(text=f"Valor total: {total:,} 🪙")
+    return embed
+
+
+async def backpack_sell(user_id: str, key: str | None = None) -> tuple:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT item, qty FROM loot WHERE user_id=? AND qty > 0", (user_id,)) as cur:
+            rows = [(k, q) for k, q in await cur.fetchall() if k in LOOT_ITEMS and (key in (None, "todo", "all") or k == key)]
+        if not rows:
+            await db.rollback()
+            return False, "No tienes nada que vender."
+        total = sum(LOOT_ITEMS[k][1] * q for k, q in rows)
+        for k, _q in rows:
+            await db.execute("UPDATE loot SET qty=0 WHERE user_id=? AND item=?", (user_id, k))
+        await db.execute("UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?", (total, MAX_BALANCE, user_id))
+        await db.commit()
+    return True, f"💰 Vendiste {sum(q for _k, q in rows)} objeto(s) por **{total:,}** 🪙."
+
+
+class BackpackSellButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Vender todo", emoji="💰", style=discord.ButtonStyle.success)
+
+    async def callback(self, interaction: discord.Interaction):
+        ok, text = await backpack_sell(self.view.user_id)
+        await interaction.response.edit_message(embed=await build_backpack_embed(self.view.user_id), view=self.view)
+        await interaction.followup.send(text if ok else f"❌ {text}", ephemeral=True)
+
+
+class BackpackView(GuildView):
+    def __init__(self, user_id: str):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.add_item(BackpackSellButton())
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("❌ Esta mochila no es tuya.", ephemeral=True)
+            return False
+        return True
+
+
+async def loot_autocomplete(interaction: discord.Interaction, current: str):
+    items = await backpack_items(str(interaction.user.id))
+    return [app_commands.Choice(name=f"{LOOT_ITEMS[k][0]} ×{q}"[:100], value=k) for k, q in items if current.lower() in LOOT_ITEMS[k][0].lower()][:25]
+
+
+# ------------------------------------------------------------------ atraco en grupo (clan)
+def heist_success_chance(players: int) -> float:
+    return min(0.80, 0.35 + 0.08 * (players - 2))
+
+
+class HeistJoinButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Unirme al atraco", emoji="🦹", style=discord.ButtonStyle.danger)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: HeistView = self.view
+        uid = str(interaction.user.id)
+        clan = await clan_of(uid)
+        if not clan or clan["id"] != view.clan_id:
+            await interaction.response.send_message("❌ Solo los miembros del clan pueden unirse.", ephemeral=True)
+            return
+        if uid in view.players:
+            await interaction.response.send_message("Ya estás dentro.", ephemeral=True)
+            return
+        if view.started:
+            await interaction.response.send_message("El atraco ya empezó.", ephemeral=True)
+            return
+        if len(view.players) >= HEIST_MAX_PLAYERS:
+            await interaction.response.send_message(f"El equipo está lleno ({HEIST_MAX_PLAYERS}).", ephemeral=True)
+            return
+        if await jail_remaining(uid) is not None:
+            await interaction.response.send_message("🔒 Estás en la cárcel.", ephemeral=True)
+            return
+        view.players.append(uid)
+        await interaction.response.edit_message(embed=view.make_embed(), view=view)
+
+
+class HeistView(GuildView):
+    def __init__(self, clan_id: int, clan_name: str, leader_id: str):
+        super().__init__(timeout=None)
+        self.clan_id, self.clan_name = clan_id, clan_name
+        self.players: list = [leader_id]
+        self.started = False
+        self.message = None
+        self.add_item(HeistJoinButton())
+
+    def make_embed(self, result: str | None = None) -> discord.Embed:
+        embed = discord.Embed(title=f"🏦 Atraco del clan {self.clan_name}", color=0xE74C3C if result is None else 0x2ECC71)
+        crew = ", ".join(f"<@{u}>" for u in self.players)
+        embed.description = result or (
+            f"Se asaltará un banco. Únete (**{HEIST_MIN_PLAYERS}–{HEIST_MAX_PLAYERS}** del clan, {HEIST_LOBBY_SECONDS}s).\n"
+            f"👥 Equipo ({len(self.players)}): {crew}\n"
+            f"🎯 Probabilidad de éxito: **{int(heist_success_chance(max(2, len(self.players))) * 100)}%** (más gente, más probabilidad)\n"
+            f"💰 Si sale bien, cada uno gana entre **{HEIST_REWARD_MIN:,}** y **{HEIST_REWARD_MAX:,}** 🪙.\n"
+            f"🚔 Si sale mal: cárcel y multa del **{HEIST_FINE_PCT}%** de tu cartera.")
+        return embed
+
+    async def run(self):
+        await asyncio.sleep(HEIST_LOBBY_SECONDS)
+        self.started = True
+        _heist_active.pop(self.clan_id, None)
+        self.stop()
+        if len(self.players) < HEIST_MIN_PLAYERS:
+            await setting_del(f"heist_cd:{self.clan_id}")
+            text = f"❌ Atraco cancelado: hacían falta al menos **{HEIST_MIN_PLAYERS}** del clan."
+        elif random.random() < heist_success_chance(len(self.players)):
+            lines = []
+            for uid in self.players:
+                reward = random.randint(HEIST_REWARD_MIN, max(HEIST_REWARD_MIN, HEIST_REWARD_MAX))
+                await update_balance(uid, reward)
+                await feature_hook(uid, "heist_success")
+                lines.append(f"<@{uid}> +**{reward:,}** 🪙")
+            text = "🎉 **¡El atraco salió perfecto!**\n" + "\n".join(lines)
+        else:
+            lines = []
+            for uid in self.players:
+                fine = min(await get_balance(uid), await get_balance(uid) * HEIST_FINE_PCT // 100)
+                await update_balance(uid, -fine)
+                minutes = await jail_send(uid)
+                lines.append(f"<@{uid}> multa **{fine:,}** 🪙 · 🔒 {minutes} min")
+            text = "🚔 **¡La policía los atrapó!**\n" + "\n".join(lines)
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(embed=self.make_embed(text), view=self)
+            except discord.HTTPException:
+                pass
+
+
+async def heist_prepare(user_id: str, username: str) -> tuple:
+    await get_or_create_user(user_id, username)
+    clan = await clan_of(user_id)
+    if not clan:
+        return "Necesitas estar en un clan para organizar un atraco.", None
+    if clan["id"] in _heist_active:
+        return "Tu clan ya está organizando un atraco.", None
+    remaining = await jail_remaining(user_id)
+    if remaining is not None:
+        return f"Estás en la cárcel ({_fmt_dur(remaining.total_seconds())}).", None
+    cooldown = await setting_get(f"heist_cd:{clan['id']}")
+    if cooldown:
+        try:
+            left = (datetime.fromisoformat(cooldown) - datetime.utcnow()).total_seconds()
+        except ValueError:
+            left = 0
+        if left > 0:
+            return f"Tu clan debe esperar **{_fmt_dur(left)}** para otro atraco.", None
+    await setting_set(f"heist_cd:{clan['id']}", (datetime.utcnow() + timedelta(hours=HEIST_COOLDOWN_HOURS)).isoformat())
+    view = HeistView(clan["id"], clan["name"], user_id)
+    _heist_active[clan["id"]] = view
+    return None, view
+
+
+@clan_group.command(name="atraco", description="Organiza un atraco con tu clan (riesgo de cárcel, premio para todos)")
+async def clan_atraco(interaction: discord.Interaction):
+    error, view = await heist_prepare(str(interaction.user.id), interaction.user.name)
+    if error:
+        await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=view.make_embed(), view=view)
+    view.message = await interaction.original_response()
+    asyncio.create_task(view.run())
+
+
+# ------------------------------------------------------------------ subastas de roles
+async def auction_embed(row, status_text: str | None = None) -> discord.Embed:
+    auction_id, seller_id, item_id, start_price, current_bid, bidder_id, ends_at = row[:7]
+    item = SHOP_ITEMS.get(item_id, {"name": item_id})
+    embed = discord.Embed(title=f"🔨 Subasta #{auction_id}: {item['name']}", color=0xE67E22)
+    nxt = start_price if not bidder_id else current_bid + max(1, current_bid * AUCTION_MIN_STEP_PCT // 100)
+    embed.description = (
+        f"👤 Vende: <@{seller_id}>\n💵 Precio inicial: **{start_price:,}** 🪙\n"
+        f"🏷️ Puja actual: **{current_bid:,}** 🪙" + (f" de <@{bidder_id}>" if bidder_id else " (sin pujas)") + "\n"
+        f"➡️ Siguiente puja mínima: **{nxt:,}** 🪙\n⏳ Termina <t:{_loan_ts(ends_at)}:R>"
+        + (f"\n\n{status_text}" if status_text else ""))
+    embed.set_footer(text=f"Comisión {AUCTION_FEE_PCT}% al vendedor · si pujan en los últimos {AUCTION_ANTISNIPE_SECONDS}s se alarga · /subasta pujar")
+    return embed
+
+
+async def auction_get(auction_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT id, seller_id, item_id, start_price, current_bid, bidder_id, ends_at, channel_id, message_id, status "
+                              "FROM auctions WHERE id=?", (auction_id,)) as cur:
+            return await cur.fetchone()
+
+
+async def auction_create(seller_id: str, seller_name: str, item_id: str, start_price: int, minutes: int, channel_id) -> tuple:
+    if item_id not in ROLE_ITEMS:
+        return False, "Elige un rol de tu inventario.", None
+    if start_price < 1 or not 5 <= minutes <= 1440:
+        return False, "El precio debe ser mayor a 0 y la duración de 5 a 1440 minutos.", None
+    await get_or_create_user(seller_id, seller_name)
+    if await get_item_quantity(seller_id, item_id) <= 0:
+        return False, "No tienes ese rol.", None
+    if await role_is_committed(seller_id, item_id):
+        return False, "Ese rol ya está prestado, en el mercado o en otra subasta.", None
+    ends = datetime.utcnow() + timedelta(minutes=minutes)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("INSERT INTO auctions (seller_id, item_id, start_price, ends_at, channel_id) VALUES (?, ?, ?, ?, ?)",
+                               (seller_id, item_id, start_price, ends.isoformat(), str(channel_id)))
+        await db.commit()
+        return True, "", cur.lastrowid
+
+
+async def auction_bid(user_id: str, username: str, auction_id: int, amount: int) -> tuple:
+    await get_or_create_user(user_id, username)
+    now = datetime.utcnow()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT seller_id, item_id, start_price, current_bid, bidder_id, ends_at, status FROM auctions WHERE id=?", (auction_id,)) as cur:
+            row = await cur.fetchone()
+        if not row or row[6] != "open" or datetime.fromisoformat(row[5]) <= now:
+            await db.rollback()
+            return False, "Esa subasta ya terminó o no existe."
+        seller_id, item_id, start_price, current_bid, bidder_id, ends_at, _status = row
+        if user_id == seller_id:
+            await db.rollback()
+            return False, "No puedes pujar en tu propia subasta."
+        if bidder_id == user_id:
+            await db.rollback()
+            return False, "Ya tienes la puja más alta."
+        async with db.execute("SELECT quantity FROM inventory WHERE user_id=? AND item_id=?", (user_id, item_id)) as cur:
+            owned = await cur.fetchone()
+        async with db.execute("SELECT 1 FROM role_loans WHERE borrower_id=? AND item_id=?", (user_id, item_id)) as cur:
+            borrowing = await cur.fetchone()
+        if (owned and owned[0] > 0) or borrowing:
+            await db.rollback()
+            return False, "Ya tienes ese rol (propio o prestado)."
+        minimum = start_price if not bidder_id else current_bid + max(1, current_bid * AUCTION_MIN_STEP_PCT // 100)
+        if amount < minimum:
+            await db.rollback()
+            return False, f"La puja mínima ahora es **{minimum:,}** 🪙."
+        cur = await db.execute("UPDATE users SET balance = balance - ? WHERE user_id=? AND balance >= ?", (amount, user_id, amount))
+        if cur.rowcount == 0:
+            await db.rollback()
+            return False, f"No tienes **{amount:,}** 🪙."
+        if bidder_id:
+            await db.execute("UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?", (current_bid, MAX_BALANCE, bidder_id))
+        new_end = max(datetime.fromisoformat(ends_at), now + timedelta(seconds=AUCTION_ANTISNIPE_SECONDS))
+        await db.execute("UPDATE auctions SET current_bid=?, bidder_id=?, ends_at=? WHERE id=?",
+                         (amount, user_id, new_end.isoformat(), auction_id))
+        await db.commit()
+    if bidder_id:
+        await _dm_user(bidder_id, f"🔨 Te superaron en la subasta **#{auction_id}**. Te devolví **{current_bid:,}** 🪙.")
+    return True, f"✅ Pujaste **{amount:,}** 🪙 en la subasta #{auction_id}."
+
+
+async def auction_refresh_message(auction_id: int, status_text: str | None = None, view=None):
+    row = await auction_get(auction_id)
+    if not row or not row[7] or not row[8]:
+        return
+    channel = client.get_channel(int(row[7]))
+    if channel is None:
+        return
+    try:
+        message = await channel.fetch_message(int(row[8]))
+        await message.edit(embed=await auction_embed(row, status_text), view=view)
+    except discord.HTTPException:
+        pass
+
+
+async def auction_settle(row):
+    auction_id, seller_id, item_id, start_price, current_bid, bidder_id, ends_at, channel_id, message_id, _status = row
+    guild = client.get_guild(int(_current_guild.get())) if _current_guild.get() else None
+    item_name = SHOP_ITEMS.get(item_id, {}).get("name", item_id)
+    if not bidder_id:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE auctions SET status='closed' WHERE id=?", (auction_id,))
+            await db.commit()
+        await auction_refresh_message(auction_id, "🔚 Terminó sin pujas.")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT quantity FROM inventory WHERE user_id=? AND item_id=?", (seller_id, item_id)) as cur:
+            s = await cur.fetchone()
+        async with db.execute("SELECT quantity FROM inventory WHERE user_id=? AND item_id=?", (bidder_id, item_id)) as cur:
+            b = await cur.fetchone()
+        if not s or s[0] <= 0 or (b and b[0] > 0):
+            await db.execute("UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?", (current_bid, MAX_BALANCE, bidder_id))
+            await db.execute("UPDATE auctions SET status='cancelled' WHERE id=?", (auction_id,))
+            await db.commit()
+            await auction_refresh_message(auction_id, "⚠️ Subasta cancelada (el rol ya no estaba disponible). Se devolvió la puja.")
+            return
+        fee = current_bid * AUCTION_FEE_PCT // 100
+        await db.execute("UPDATE inventory SET quantity = quantity - 1 WHERE user_id=? AND item_id=?", (seller_id, item_id))
+        await db.execute("DELETE FROM inventory WHERE user_id=? AND item_id=? AND quantity <= 0", (seller_id, item_id))
+        await db.execute("INSERT INTO inventory (user_id, item_id, quantity) VALUES (?, ?, 1) "
+                         "ON CONFLICT(user_id, item_id) DO UPDATE SET quantity = quantity + 1", (bidder_id, item_id))
+        async with db.execute("SELECT last_collect FROM role_collects WHERE user_id=? AND item_id=?", (seller_id, item_id)) as cur:
+            crow = await cur.fetchone()
+        if crow:
+            await db.execute("INSERT INTO role_collects (user_id, item_id, last_collect) VALUES (?, ?, ?) "
+                             "ON CONFLICT(user_id, item_id) DO UPDATE SET last_collect = MAX(role_collects.last_collect, excluded.last_collect)",
+                             (bidder_id, item_id, crow[0]))
+        await db.execute("UPDATE users SET balance = MIN(balance + ?, ?) WHERE user_id=?", (current_bid - fee, MAX_BALANCE, seller_id))
+        await db.execute("UPDATE auctions SET status='sold' WHERE id=?", (auction_id,))
+        await db.commit()
+    if guild is not None:
+        member = await _fetch_member(guild, bidder_id)
+        if member is not None:
+            try:
+                await grant_shop_role(guild, member, item_id)
+            except (discord.HTTPException, aiosqlite.Error):
+                pass
+        await _remove_shop_role(str(guild.id), seller_id, item_id, "Rol vendido en una subasta")
+    await feature_hook(seller_id, "roles_market")
+    await auction_refresh_message(auction_id, f"🏆 ¡Vendido a <@{bidder_id}> por **{current_bid:,}** 🪙!")
+    await _dm_user(seller_id, f"🔨 Tu subasta **#{auction_id}** ({item_name}) se vendió por **{current_bid - fee:,}** 🪙 (tras la comisión).")
+    await _dm_user(bidder_id, f"🏆 ¡Ganaste la subasta **#{auction_id}**: **{item_name}**! Ya es tuyo (usa `/use` si no tienes el rol de Discord).")
+    if current_bid >= GG_MIN_WIN:
+        asyncio.create_task(celebrate(bidder_id, f"ganó la subasta de **{item_name}**", f"Puja: {current_bid:,} 🪙"))
+
+
+async def auctions_tick():
+    now = datetime.utcnow().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT id, seller_id, item_id, start_price, current_bid, bidder_id, ends_at, channel_id, message_id, status "
+                              "FROM auctions WHERE status='open' AND ends_at <= ?", (now,)) as cur:
+            rows = await cur.fetchall()
+    for row in rows:
+        try:
+            await auction_settle(row)
+        except Exception as exc:
+            print(f"Error cerrando la subasta {row[0]}: {exc}")
+
+
+class AuctionBidButton(discord.ui.Button):
+    def __init__(self, auction_id: int, pct: int):
+        super().__init__(label=f"Pujar +{pct}%", style=discord.ButtonStyle.primary)
+        self.auction_id, self.pct = auction_id, pct
+
+    async def callback(self, interaction: discord.Interaction):
+        row = await auction_get(self.auction_id)
+        if not row or row[9] != "open":
+            await interaction.response.send_message("Esa subasta ya terminó.", ephemeral=True)
+            return
+        base = row[4] if row[5] else row[3]
+        amount = max(base + max(1, base * self.pct // 100), row[3] if not row[5] else 0)
+        ok, text = await auction_bid(str(interaction.user.id), interaction.user.name, self.auction_id, amount)
+        if not ok:
+            await interaction.response.send_message(f"❌ {text}", ephemeral=True)
+            return
+        await interaction.response.edit_message(embed=await auction_embed(await auction_get(self.auction_id)), view=self.view)
+
+
+class AuctionView(GuildView):
+    def __init__(self, auction_id: int):
+        super().__init__(timeout=None)
+        for pct in (5, 10, 25):
+            self.add_item(AuctionBidButton(auction_id, pct))
+
+
+subasta_group = app_commands.Group(name="subasta", description="Subasta tus roles al mejor postor", guild_only=True)
+tree.add_command(subasta_group)
+
+
+@subasta_group.command(name="crear", description="Pon un rol de tu inventario en subasta")
+@app_commands.describe(rol="Rol de tu inventario", precio="Precio inicial (acepta 5m, 500k)", minutos="Duración en minutos (5-1440)")
+async def subasta_crear(interaction: discord.Interaction, rol: str, precio: str, minutos: app_commands.Range[int, 5, 1440] = 60):
+    item_id = resolve_shop_item(rol)
+    price = loan_parse_amount(precio)
+    if item_id is None or price is None:
+        await interaction.response.send_message("❌ Elige un rol de la lista y un precio válido.", ephemeral=True)
+        return
+    ok, text, auction_id = await auction_create(str(interaction.user.id), interaction.user.name, item_id, price, minutos, interaction.channel_id)
+    if not ok:
+        await interaction.response.send_message(f"❌ {text}", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=await auction_embed(await auction_get(auction_id)), view=AuctionView(auction_id))
+    message = await interaction.original_response()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE auctions SET message_id=? WHERE id=?", (str(message.id), auction_id))
+        await db.commit()
+
+
+@subasta_group.command(name="pujar", description="Puja en una subasta")
+@app_commands.describe(subasta="Subasta", cantidad="Tu puja (acepta 5m, 500k)")
+async def subasta_pujar(interaction: discord.Interaction, subasta: str, cantidad: str):
+    amount = loan_parse_amount(cantidad)
+    if not subasta.strip().lstrip("#").isdigit() or amount is None:
+        await interaction.response.send_message("❌ Elige una subasta de la lista y una puja válida.", ephemeral=True)
+        return
+    auction_id = int(subasta.strip().lstrip("#"))
+    ok, text = await auction_bid(str(interaction.user.id), interaction.user.name, auction_id, amount)
+    await interaction.response.send_message(text if ok else f"❌ {text}", ephemeral=not ok)
+    if ok:
+        await auction_refresh_message(auction_id, view=AuctionView(auction_id))
+
+
+@subasta_group.command(name="ver", description="Mira las subastas abiertas")
+async def subasta_ver(interaction: discord.Interaction):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT id, seller_id, item_id, start_price, current_bid, bidder_id, ends_at FROM auctions WHERE status='open' ORDER BY ends_at LIMIT 15") as cur:
+            rows = await cur.fetchall()
+    embed = discord.Embed(title="🔨 Subastas abiertas", color=0xE67E22)
+    embed.description = "\n".join(
+        f"`#{r[0]}` {SHOP_ITEMS.get(r[2], {'name': r[2]})['name']} — puja **{(r[4] or r[3]):,}** 🪙 · termina <t:{_loan_ts(r[6])}:R>" for r in rows) or "No hay subastas abiertas."
+    await interaction.response.send_message(embed=embed)
+
+
+async def open_auction_autocomplete(interaction: discord.Interaction, current: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT id, item_id, start_price, current_bid FROM auctions WHERE status='open' ORDER BY ends_at LIMIT 25") as cur:
+            rows = await cur.fetchall()
+    return [app_commands.Choice(name=f"#{i} {SHOP_ITEMS.get(it, {'name': it})['name']} · {(cb or sp):,} 🪙"[:100], value=str(i)) for i, it, sp, cb in rows]
+
+
+subasta_crear.autocomplete("rol")(prestar_role_autocomplete)
+subasta_pujar.autocomplete("subasta")(open_auction_autocomplete)
+
+
+# ------------------------------------------------------------------ /diversion
+diversion_group = app_commands.Group(name="diversion", description="Trivia, rasca y gana, bingo, pesca y minería", guild_only=True)
+tree.add_command(diversion_group)
+
+
+async def _send_view(interaction: discord.Interaction, view, with_run: bool = True):
+    await interaction.response.send_message(embed=view.make_embed(), view=view)
+    view.message = await interaction.original_response()
+    if with_run:
+        asyncio.create_task(view.run())
+
+
+@diversion_group.command(name="trivia", description="Una pregunta para todo el canal: el que acierte gana monedas")
+async def diversion_trivia(interaction: discord.Interaction):
+    error, view = await trivia_prepare(str(interaction.user.id), interaction.user.name, interaction.channel_id)
+    if error:
+        await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+        return
+    await _send_view(interaction, view)
+
+
+@diversion_group.command(name="rasca", description="Rasca y gana: 3 símbolos iguales ganan")
+@app_commands.describe(cantidad="Apuesta (acepta all, 5m, 500k)")
+async def diversion_rasca(interaction: discord.Interaction, cantidad: str):
+    error, view = await rasca_create(str(interaction.user.id), interaction.user.name, cantidad)
+    if error:
+        await interaction.response.send_message(embed=_err_embed("No se pudo empezar", error), ephemeral=True)
+        return
+    await _send_view(interaction, view, with_run=False)
+
+
+@diversion_group.command(name="bingo", description="Abre un bingo para todo el canal")
+@app_commands.describe(precio="Precio del cartón (acepta 5m, 500k)")
+async def diversion_bingo(interaction: discord.Interaction, precio: str = "1000"):
+    error, view = await bingo_prepare(str(interaction.user.id), interaction.user.name, precio, interaction.channel_id)
+    if error:
+        await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+        return
+    await _send_view(interaction, view)
+
+
+@diversion_group.command(name="pescar", description="Lanza la caña y mira qué pescas")
+async def diversion_pescar(interaction: discord.Interaction):
+    embed = await gather(str(interaction.user.id), interaction.user.name, "pesca")
+    await interaction.response.send_message(embed=embed)
+
+
+@diversion_group.command(name="minar", description="Pica piedra y mira qué encuentras")
+async def diversion_minar(interaction: discord.Interaction):
+    embed = await gather(str(interaction.user.id), interaction.user.name, "mineria")
+    await interaction.response.send_message(embed=embed)
+
+
+@diversion_group.command(name="mochila", description="Mira lo que pescaste y minaste, y véndelo")
+@app_commands.describe(vender="Qué vender (déjalo vacío para solo mirar; «todo» vende todo)")
+async def diversion_mochila(interaction: discord.Interaction, vender: _Optional[str] = None):
+    uid = str(interaction.user.id)
+    await get_or_create_user(uid, interaction.user.name)
+    if vender:
+        ok, text = await backpack_sell(uid, vender)
+        await interaction.response.send_message(text if ok else f"❌ {text}", ephemeral=not ok)
+        return
+    await interaction.response.send_message(embed=await build_backpack_embed(uid), view=BackpackView(uid), ephemeral=True)
+
+
+diversion_mochila.autocomplete("vender")(loot_autocomplete)
+
+
+# ------------------------------------------------------------------ tarea de fondo (por servidor)
+async def extras_tick():
+    for fn in (stocks_tick, wealth_tax_check, season_rollover_check, auctions_tick, reminders_tick):
+        try:
+            await fn()
+        except Exception as exc:
+            print(f"Error en {fn.__name__}: {exc}")
+
+
+async def extras_loop():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            await for_each_guild(extras_tick)
+        except Exception as exc:
+            print(f"Error en extras_loop: {exc}")
+        await asyncio.sleep(EXTRAS_TICK_SECONDS)
+
+
+# ------------------------------------------------------------------ versiones con prefijo (,perfil ,pescar ,trivia ...)
+async def extras_handle_prefix(message: discord.Message, cmd: str, args: list) -> bool:
+    uid, name, channel = str(message.author.id), message.author.name, message.channel
+    sub = args[0].lower() if args else ""
+    rest = args[1:]
+
+    async def reply(ok: bool, text: str):
+        await channel.send(text if ok else f"❌ {text}")
+
+    if cmd == "perfil":
+        target = message.mentions[0] if message.mentions else message.author
+        await channel.send(embed=await build_profile_embed(target))
+    elif cmd == "pescar":
+        await channel.send(embed=await gather(uid, name, "pesca"))
+    elif cmd == "minar":
+        await channel.send(embed=await gather(uid, name, "mineria"))
+    elif cmd == "mochila":
+        await get_or_create_user(uid, name)
+        if sub:
+            await reply(*await backpack_sell(uid, sub))
+        else:
+            await channel.send(embed=await build_backpack_embed(uid), view=BackpackView(uid))
+    elif cmd == "trivia":
+        error, view = await trivia_prepare(uid, name, channel.id)
+        if error:
+            await reply(False, error)
+        else:
+            view.message = await channel.send(embed=view.make_embed(), view=view)
+            asyncio.create_task(view.run())
+    elif cmd == "rasca":
+        error, view = await rasca_create(uid, name, args[0] if args else "")
+        if error:
+            await channel.send(embed=_err_embed("No se pudo empezar", error))
+        else:
+            view.message = await channel.send(embed=view.make_embed(), view=view)
+    elif cmd == "bingo":
+        error, view = await bingo_prepare(uid, name, args[0] if args else "1000", channel.id)
+        if error:
+            await reply(False, error)
+        else:
+            view.message = await channel.send(embed=view.make_embed(), view=view)
+            asyncio.create_task(view.run())
+    elif cmd == "atraco":
+        error, view = await heist_prepare(uid, name)
+        if error:
+            await reply(False, error)
+        else:
+            view.message = await channel.send(embed=view.make_embed(), view=view)
+            asyncio.create_task(view.run())
+    elif cmd == "negocio":
+        if sub in ("comprar", "buy") and rest:
+            await reply(*await business_buy(uid, name, rest[0].lower()))
+        elif sub in ("mejorar", "upgrade") and rest:
+            await reply(*await business_upgrade(uid, rest[0].lower()))
+        elif sub in ("cobrar", "collect"):
+            await get_or_create_user(uid, name)
+            await reply(*await business_collect(uid))
+        else:
+            await get_or_create_user(uid, name)
+            await channel.send(embed=await build_business_embed(uid))
+    elif cmd == "bolsa":
+        if sub in ("comprar", "buy") and len(rest) >= 2:
+            await reply(*await stock_buy(uid, name, rest[0], rest[1]))
+        elif sub in ("vender", "sell") and len(rest) >= 2:
+            await reply(*await stock_sell(uid, name, rest[0], rest[1]))
+        elif sub in ("portafolio", "cartera"):
+            await channel.send(embed=await build_portfolio_embed(uid, message.author.display_name))
+        else:
+            await channel.send(embed=await build_stocks_embed())
+    elif cmd == "prestigio":
+        ok, embed = await prestige_do(uid, name, sub in ("confirmar", "si", "sí", "true"))
+        await channel.send(embed=embed)
+    elif cmd == "temporada":
+        await channel.send(embed=await build_season_embed(uid))
+    elif cmd == "recompensa":
+        if sub in ("poner", "add") and message.mentions and len(rest) >= 2:
+            await reply(*await bounty_place(uid, name, str(message.mentions[0].id), message.mentions[0].display_name, rest[-1]))
+        elif sub in ("cancelar", "cancel") and rest and rest[0].lstrip("#").isdigit():
+            await reply(*await bounty_cancel(uid, int(rest[0].lstrip("#"))))
+        else:
+            await channel.send(embed=await build_bounty_embed(uid))
+    elif cmd == "recordatorio":
+        if sub in ("on", "activar", "si"):
+            await channel.send(await reminder_set(uid, name, True))
+        elif sub in ("off", "desactivar", "no"):
+            await channel.send(await reminder_set(uid, name, False))
+        else:
+            await channel.send("Uso: `,recordatorio on` o `,recordatorio off`")
+    elif cmd == "ggcanal":
+        if not is_admin_member(message.author):
+            await reply(False, "Solo los administradores pueden usar este comando.")
+        elif message.channel_mentions:
+            await setting_set("gg_channel", str(message.channel_mentions[0].id))
+            await channel.send(f"🎉 Celebraciones activadas en {message.channel_mentions[0].mention}.")
+        else:
+            await setting_del("gg_channel")
+            await channel.send("🔕 Celebraciones desactivadas.")
+    else:
+        return False
+    return True
+
+
+# =====================================================================
 #  PANEL WEB (dashboard) para configurar el bot, estilo UnbelievaBoat
 #  - Corre dentro del mismo proceso del bot (aiohttp).
 #  - Todo lo configurable vive en la base de datos (tabla bot_settings).
@@ -13172,8 +15390,24 @@ CONFIG_GROUPS_STATIC = [
         _f("FIGHTER_TOURNAMENT_PRIZE", "Premio del torneo sin apuesta", unit="🪙"),
         _f("FIGHTER_TOURNAMENT_RAKE_PERCENT", "Comisión del torneo con apuesta", hi=100, unit="%"),
     ]},
+    {"id": "extras", "icon": "✨", "title": "Extras", "desc": "Negocios, prestigio, trivia, pesca, atracos y más.", "fields": [
+        _f("GG_MIN_WIN", "Ganancia mínima para el ¡GG!", unit="🪙", help="Cuando alguien gana esto o más, el bot lo celebra en el canal de anuncios."),
+        _f("PRESTIGE_BASE", "Patrimonio para el primer prestigio", lo=1, unit="🪙", help="Se duplica en cada nivel."),
+        _f("PRESTIGE_BONUS_PCT", "Bonus por nivel de prestigio", hi=100, unit="%"),
+        _f("BUSINESS_MAX_HOURS", "Horas máximas que acumula un negocio", lo=1, hi=168, unit="horas"),
+        _f("STOCK_FEE_PCT", "Comisión de venta en la bolsa", hi=20, unit="%"),
+        _f("BOUNTY_MIN", "Recompensa mínima", lo=1, unit="🪙"),
+        _f("TRIVIA_PRIZE_MIN", "Trivia: premio mínimo", unit="🪙"),
+        _f("TRIVIA_PRIZE_MAX", "Trivia: premio máximo", unit="🪙"),
+        _f("FISH_COOLDOWN_SECONDS", "Pesca: enfriamiento", hi=86400, unit="seg"),
+        _f("MINE_COOLDOWN_SECONDS", "Minería: enfriamiento", hi=86400, unit="seg"),
+        _f("HEIST_REWARD_MIN", "Atraco: premio mínimo por persona", unit="🪙"),
+        _f("HEIST_REWARD_MAX", "Atraco: premio máximo por persona", unit="🪙"),
+        _f("AUCTION_FEE_PCT", "Comisión de las subastas", hi=100, unit="%"),
+    ]},
 ]
 CONFIG_PAIRS = [
+    ("TRIVIA_PRIZE_MIN", "TRIVIA_PRIZE_MAX"), ("HEIST_REWARD_MIN", "HEIST_REWARD_MAX"),
     ("WORK_MIN", "WORK_MAX"), ("SLUT_MIN", "SLUT_MAX"), ("SLUT_FINE_MIN", "SLUT_FINE_MAX"),
     ("CRIME_MIN", "CRIME_MAX"), ("CRIME_FINE_MIN", "CRIME_FINE_MAX"), ("ROB_STEAL_MIN_PCT", "ROB_STEAL_MAX_PCT"),
     ("LOAN_MIN", "LOAN_MAX"),
@@ -13482,7 +15716,7 @@ async def run_income_command(kind: str, user_id: str, username: str) -> discord.
                                  description=f"Espera **{_fmt_secs(left)}** para volver a intentarlo.")
 
     if kind == "work":
-        earned = random.randint(WORK_MIN, max(WORK_MIN, WORK_MAX))
+        earned = await apply_prestige(user_id, random.randint(WORK_MIN, max(WORK_MIN, WORK_MAX)))
         titulo, desc = random.choice([
             ("👨‍🍳 Cocinero", f"Preparaste platos toda la noche y ganaste **{earned:,}** 🪙."),
             ("🚗 Taxista", f"Llevaste pasajeros por toda la ciudad y ganaste **{earned:,}** 🪙."),
@@ -13501,7 +15735,7 @@ async def run_income_command(kind: str, user_id: str, username: str) -> discord.
         else (CRIME_CHANCE, CRIME_MIN, CRIME_MAX, CRIME_FINE_MIN, CRIME_FINE_MAX)
     )
     if random.random() < chance / 100:
-        earned = random.randint(lo, max(lo, hi))
+        earned = await apply_prestige(user_id, random.randint(lo, max(lo, hi)))
         if kind == "slut":
             text = random.choice([
                 f"💋 Una noche rentable. Ganaste **{earned:,}** 🪙.",
